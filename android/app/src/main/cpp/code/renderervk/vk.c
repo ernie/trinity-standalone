@@ -7168,11 +7168,9 @@ void vk_set_view_eyeproj( void )
 			Com_Memcpy( proj, tr.vrParms.monoVRProjection, sizeof( proj ) );
 		} else if ( tr.vrParms.valid && backEnd.viewParms.portalView != PV_NONE &&
 				( vr.virtual_screen || vr.weapon_zoomed ) ) {
-			// Portal cyclopean: plain aspect scale, no refdef-FOV override
+			// Portal cyclopean: no refdef-FOV override. The scope projection already matches the buffer.
 			Com_Memcpy( proj, backEnd.viewParms.projectionMatrix, sizeof( proj ) );
-			if ( vr.weapon_zoomed ) {
-				proj[5] *= (float)glConfig.vidWidth / (float)glConfig.vidHeight;
-			} else {
+			if ( !vr.weapon_zoomed ) {
 				proj[5] *= (float)glConfig.vidHeight / (float)glConfig.vidWidth;
 			}
 			proj[8] = 0.0f;
