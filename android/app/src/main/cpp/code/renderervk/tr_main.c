@@ -612,6 +612,7 @@ R_SetupFrustum
 
 Set up the culling frustum planes for the current view.
 Uses combined stereo FOV to ensure geometry visible to either eye isn't culled.
+Top and bottom are set separately, since the up and down angles may differ.
 =================
 */
 static void R_SetupFrustum( void )
@@ -619,13 +620,14 @@ static void R_SetupFrustum( void )
 	int i;
 	float xs, xc;
 	float ang;
-	float fovX, fovY;
+	float fovX, fovUp, fovDown;
 	float halfIpdWorldUnits = 0.0f;
 
 	// Use combined stereo horizontal FOV for culling (encompasses both eyes)
 	if (tr.vrParms.combinedFovX > 0) {
 		fovX = tr.vrParms.combinedFovX;
-		fovY = tr.viewParms.fovY;
+		fovUp = tr.vrParms.fovUp;
+		fovDown = tr.vrParms.fovDown;
 
 		// Convert half-IPD from meters to Quake world units
 		float worldscale = vr_worldscale ? vr_worldscale->value : 32.0f;
@@ -633,7 +635,7 @@ static void R_SetupFrustum( void )
 		halfIpdWorldUnits = tr.vrParms.halfIpdMeters * worldscale * scaler;
 	} else {
 		fovX = tr.viewParms.fovX;
-		fovY = tr.viewParms.fovY;
+		fovUp = fovDown = tr.viewParms.fovY * 0.5f;
 	}
 
 	ang = fovX / 180 * M_PI * 0.5f;
@@ -646,12 +648,18 @@ static void R_SetupFrustum( void )
 	VectorScale( tr.viewParms.or.axis[0], xs, tr.viewParms.frustum[1].normal );
 	VectorMA( tr.viewParms.frustum[1].normal, -xc, tr.viewParms.or.axis[1], tr.viewParms.frustum[1].normal );
 
-	ang = fovY / 180 * M_PI * 0.5f;
+	// Bottom plane (normal leans up)
+	ang = fovDown / 180 * M_PI;
 	xs = sinf( ang );
 	xc = cosf( ang );
 
 	VectorScale( tr.viewParms.or.axis[0], xs, tr.viewParms.frustum[2].normal );
 	VectorMA( tr.viewParms.frustum[2].normal, xc, tr.viewParms.or.axis[2], tr.viewParms.frustum[2].normal );
+
+	// Top plane (normal leans down)
+	ang = fovUp / 180 * M_PI;
+	xs = sinf( ang );
+	xc = cosf( ang );
 
 	VectorScale( tr.viewParms.or.axis[0], xs, tr.viewParms.frustum[3].normal );
 	VectorMA( tr.viewParms.frustum[3].normal, -xc, tr.viewParms.or.axis[2], tr.viewParms.frustum[3].normal );

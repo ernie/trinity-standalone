@@ -471,12 +471,20 @@ void VR_Renderer_BeginFrame(VR_Engine* engine, XrBool32 needsRecenter)
 	float combinedFovX = (fabsf(combinedAngleLeft) + fabsf(combinedAngleRight)) * 180.0f / M_PI;
 	// Canted displays: each eye's FOV is centered on its own yawed axis
 	combinedFovX += (fabsf(vr.eyeCantYaw[0]) + fabsf(vr.eyeCantYaw[1])) * 180.0f / M_PI;
+	// Up and down may differ, so each vertical plane gets its own angle
+	float fovUp = fov.angleUp / vr.weapon_zoomLevel * 180.0f / M_PI;
+	float fovDown = fabsf(fov.angleDown) / vr.weapon_zoomLevel * 180.0f / M_PI;
 	if (vr.weapon_zoomed)
 	{
 		// Cull to whichever is wider, the eyes or the scope's fixed frustum
 		float scopeFovX = 2.0f * projectionFov.angleRight * 180.0f / M_PI;
+		float scopeFovV = projectionFov.angleUp * 180.0f / M_PI;
 		if (scopeFovX > combinedFovX)
 			combinedFovX = scopeFovX;
+		if (scopeFovV > fovUp)
+			fovUp = scopeFovV;
+		if (scopeFovV > fovDown)
+			fovDown = scopeFovV;
 	}
 
 	// Calculate half-IPD in meters for frustum plane offset
@@ -489,7 +497,7 @@ void VR_Renderer_BeginFrame(VR_Engine* engine, XrBool32 needsRecenter)
 	}
 
 	re.SetVRHeadsetParms(vrMatrixProjection.m, vrMatrixMono.m, 0, // renderBuffer not used for VK
-						 vrMatrixEye[0].m, vrMatrixEye[1].m, combinedFovX, halfIpdMeters);
+						 vrMatrixEye[0].m, vrMatrixEye[1].m, combinedFovX, fovUp, fovDown, halfIpdMeters);
 }
 
 
