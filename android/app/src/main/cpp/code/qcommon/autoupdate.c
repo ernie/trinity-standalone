@@ -799,20 +799,18 @@ Console command: \updatecancel
 */
 void Update_Cancel_f( void )
 {
-	if ( updateState == UPDATE_DOWNLOADING ) {
-		if ( updateApkFile ) {
-			fclose( updateApkFile );
-			updateApkFile = NULL;
-		}
-		Update_CurlCleanup();
-		remove( UPDATE_APK_PATH );
-		Com_Printf( "Update: download cancelled\n" );
-	} else if ( updateState == UPDATE_CHECKING ) {
-		Update_CurlCleanup();
-		Com_Printf( "Update: check cancelled\n" );
-	}
+	if ( updateState != UPDATE_DOWNLOADING )
+		return;
 
-	Update_SetState( UPDATE_IDLE );
+	if ( updateApkFile ) {
+		fclose( updateApkFile );
+		updateApkFile = NULL;
+	}
+	Update_CurlCleanup();
+	remove( UPDATE_APK_PATH );
+	Com_Printf( "Update: download cancelled\n" );
+
+	Update_SetState( UPDATE_AVAILABLE );
 }
 
 
