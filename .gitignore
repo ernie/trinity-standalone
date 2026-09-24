@@ -63,12 +63,11 @@ android/app/src/main/assets/zzz-trinity-announcer.pk3
 # Local dev
 run.bat
 run-oxr.bat
-CLAUDE.md
+AGENTS.md
 .claude/
 ioq3quest.keystore
 lastrun.log
 
 # Claude Code
 .claude/
-CLAUDE.md
 docs/superpowers/

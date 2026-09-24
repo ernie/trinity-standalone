@@ -217,7 +217,7 @@ static void CL_TrinityLogin_f( void ) {
 	qcurl_easy_setopt( trinityLogin.curl, CURLOPT_WRITEDATA, &trinityLogin.response );
 	qcurl_easy_setopt( trinityLogin.curl, CURLOPT_TIMEOUT, 10L );
 	qcurl_easy_setopt( trinityLogin.curl, CURLOPT_FOLLOWLOCATION, 0L );
-	qcurl_easy_setopt( trinityLogin.curl, CURLOPT_CAINFO, "/sdcard/Trinity/cacert.pem" );
+	qcurl_easy_setopt( trinityLogin.curl, CURLOPT_CAINFO, va( "%s/cacert.pem", Com_TrinityHome() ) );
 
 	trinityLogin.multi = qcurl_multi_init();
 	if ( !trinityLogin.multi ) {

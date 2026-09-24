@@ -43,6 +43,12 @@ public class MainActivity extends SDLActivity // implements KeyEvent.Callback
 {
 	private static final String SUPPORTED_ASCII = "qwertyuiop[]asdfghjkl;'\\<zxcvbnm,./QWERTYUIOP{}ASDFGHJKL:\"|>ZXCVBNM<>?`1234567890-=~!@#$%^&*()_+";
 	private int permissionCount = 0;
+	private boolean nativeReady = false;
+
+	@Override
+	protected boolean isNativeReady() {
+		return nativeReady;
+	}
 	private static final int READ_EXTERNAL_STORAGE_PERMISSION_ID = 1;
 	private static final int WRITE_EXTERNAL_STORAGE_PERMISSION_ID = 2;
 	private static final int RECORD_AUDIO_PERMISSION_ID = 3;
@@ -50,8 +56,12 @@ public class MainActivity extends SDLActivity // implements KeyEvent.Callback
 	private static final String TAG = "Trinity";
 
 	// Quake3Quest may still be using LEGACY_HOME_DIR: the first launch reads from it and never writes there
-	private static final String HOME_DIR = "/sdcard/Trinity";
+	private static final String DEFAULT_HOME_DIR = "/sdcard/Trinity";
 	private static final String LEGACY_HOME_DIR = "/sdcard/ioquake3Quest";
+	// Steam Frame installs each get fresh app storage; Documents is shared by all of them and survives reinstalls
+	private static final String SHARED_HOME_DIR = "/sdcard/Documents/Trinity";
+
+	private String homeDir = DEFAULT_HOME_DIR;
 
 	private boolean hapticsEnabled = false;
 
@@ -69,6 +79,7 @@ public class MainActivity extends SDLActivity // implements KeyEvent.Callback
 		try {
 			checkPermissionsAndInitialize();
 		} catch (Exception e) {
+			Log.e(TAG, "Activity initialization failed", e);
 		}
 		super.onCreate(savedInstanceState);
 
@@ -119,9 +130,16 @@ public class MainActivity extends SDLActivity // implements KeyEvent.Callback
 	@Override
 	public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] results) {
 		if (requestCode == WRITE_EXTERNAL_STORAGE_PERMISSION_ID) {
+			if (ContextCompat.checkSelfPermission(this, Manifest.permission.WRITE_EXTERNAL_STORAGE)
+					!= PackageManager.PERMISSION_GRANTED) {
+				Log.w(TAG, "Storage permission denied; the game cannot read its data directory");
+				finish();
+				return;
+			}
 			try {
 				create();
 			} catch (Exception e) {
+				Log.e(TAG, "Activity initialization failed", e);
 			}
 		} else if (requestCode == RECORD_AUDIO_PERMISSION_ID) {
 			if (results.length > 0 && results[0] == PackageManager.PERMISSION_GRANTED) {
@@ -146,48 +164,57 @@ public class MainActivity extends SDLActivity // implements KeyEvent.Callback
 	@Override
 	protected void onResume() {
 		super.onResume();
+		startNativeIfReady();
+	}
+
+	private void startNativeIfReady() {
+		if (!nativeReady || !SDLActivity.mIsResumedCalled) return;
 		if (!SDLActivity.mIsSurfaceReady) {
 			Log.i(TAG, "Starting native thread without waiting for an Android surface");
 			SDLActivity.mIsSurfaceReady = true;
-			SDLActivity.handleNativeState();
 		}
+		SDLActivity.handleNativeState();
 	}
 
 	public void create() throws IOException {
+		if (nativeReady) return;
+		homeDir = new File(SHARED_HOME_DIR).isDirectory() ? SHARED_HOME_DIR : DEFAULT_HOME_DIR;
+		Log.i(TAG, "Game files: " + homeDir);
+
 		// Prepare base game directory
-		new File(HOME_DIR + "/baseq3").mkdirs();
+		new File(homeDir + "/baseq3").mkdirs();
 
 		migrateLegacyHome();
 
 		// Copy CA certificate bundle for HTTPS
-		copy_asset(HOME_DIR, "cacert.pem", true);
+		copy_asset(homeDir, "cacert.pem", true);
 
 		// Licenses belong where a user can read them, not only inside the APK
-		copy_asset(HOME_DIR, "THIRD-PARTY-NOTICES.txt", true);
+		copy_asset(homeDir, "THIRD-PARTY-NOTICES.txt", true);
 
 		// Copy the command line params file and autoexec
-		copy_asset(HOME_DIR, "commandline.txt", false);
-		copy_asset(HOME_DIR + "/baseq3", "autoexec.cfg", false);
+		copy_asset(homeDir, "commandline.txt", false);
+		copy_asset(homeDir + "/baseq3", "autoexec.cfg", false);
 		// Copy our special pak files and demo
-		copy_asset(HOME_DIR + "/baseq3", "pak0.pk3", false);
-		copy_asset(HOME_DIR + "/baseq3", "pak8t.pk3", true);
-		copy_asset(HOME_DIR + "/baseq3", "zzz-trinity-announcer.pk3", true);
+		copy_asset(homeDir + "/baseq3", "pak0.pk3", false);
+		copy_asset(homeDir + "/baseq3", "pak8t.pk3", true);
+		copy_asset(homeDir + "/baseq3", "zzz-trinity-announcer.pk3", true);
 		//Copy Omarlego's excellent replacement background
-		copy_asset(HOME_DIR + "/baseq3", "z_custom_background66.pk3", false);
+		copy_asset(homeDir + "/baseq3", "z_custom_background66.pk3", false);
 
 		// If Team Arena is installed then copy necessary stuff
-		if (new File(HOME_DIR + "/missionpack").exists()) {
-			copy_asset(HOME_DIR + "/missionpack", "pak3t.pk3", true);
+		if (new File(homeDir + "/missionpack").exists()) {
+			copy_asset(homeDir + "/missionpack", "pak3t.pk3", true);
 		}
 
 		//Read these from a file and pass through
 		commandLineParams = new String();
 
 		//See if user is trying to use command line params
-		if (new File(HOME_DIR + "/commandline.txt").exists()) {
+		if (new File(homeDir + "/commandline.txt").exists()) {
 			BufferedReader br;
 			try {
-				br = new BufferedReader(new FileReader(HOME_DIR + "/commandline.txt"));
+				br = new BufferedReader(new FileReader(homeDir + "/commandline.txt"));
 				String s;
 				StringBuilder sb = new StringBuilder(0);
 				while ((s = br.readLine()) != null)
@@ -204,11 +231,16 @@ public class MainActivity extends SDLActivity // implements KeyEvent.Callback
 			}
 		}
 
+		// The game files are wherever this launch found them, whatever an older commandline.txt says
+		commandLineParams += " +set fs_basepath " + homeDir + "/";
+
 		Log.d(TAG, "setting env");
 		try {
 			//commandLineParams += " +map q3dm7";
+			setenv("TRINITY_HOME", homeDir, true);
 			setenv("commandline", commandLineParams, true);
 		} catch (Exception e) {
+			Log.e(TAG, "Activity initialization failed", e);
 		}
 
 		for (Pair<String, String> serviceDetail : externalHapticsServiceDetails) {
@@ -223,12 +255,14 @@ public class MainActivity extends SDLActivity // implements KeyEvent.Callback
 
 		Log.d(TAG, "nativeCreate");
 		nativeCreate(this);
+		nativeReady = true;
 
 		// Request microphone permission for VOIP (non-blocking)
 		requestMicrophonePermission();
 
 		// Eye tracked foveated rendering needs the platform's eye tracking permission (non-blocking)
 		requestEyeTrackingPermission();
+		startNativeIfReady();
 	}
 
 	// Only ask for the names this device defines, so headsets without eye tracking never see a dialog
@@ -285,10 +319,10 @@ public class MainActivity extends SDLActivity // implements KeyEvent.Callback
 	}
 
 	private void migrateLegacyHome() {
-		if (new File(HOME_DIR, "baseq3/pak0.pk3").exists() || !new File(LEGACY_HOME_DIR, "baseq3/pak0.pk3").exists()) {
+		if (new File(homeDir, "baseq3/pak0.pk3").exists() || !new File(LEGACY_HOME_DIR, "baseq3/pak0.pk3").exists()) {
 			return;
 		}
-		Log.i(TAG, "Copying game files from " + LEGACY_HOME_DIR + " to " + HOME_DIR);
+		Log.i(TAG, "Copying game files from " + LEGACY_HOME_DIR + " to " + homeDir);
 		copyLegacyGameDir("baseq3");
 		copyLegacyGameDir("missionpack");
 	}
@@ -296,7 +330,7 @@ public class MainActivity extends SDLActivity // implements KeyEvent.Callback
 	// Every pak plus the configs. pakQ3Q.pk3 is retired and sorts after pak8t/pak3t, so it would override them.
 	private void copyLegacyGameDir(String game) {
 		File src = new File(LEGACY_HOME_DIR, game);
-		File dst = new File(HOME_DIR, game);
+		File dst = new File(homeDir, game);
 		if (!src.isDirectory()) {
 			return;
 		}

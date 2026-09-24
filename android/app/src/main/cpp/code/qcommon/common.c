@@ -733,6 +733,19 @@ int Com_FilterPath(char *filter, char *name, int casesensitive)
 
 /*
 ================
+Com_TrinityHome
+
+The folder the launcher found the game files in, which holds the CA bundle and downloaded updates too.
+================
+*/
+const char *Com_TrinityHome( void ) {
+	const char *home = getenv( "TRINITY_HOME" );
+
+	return ( home && *home ) ? home : "/sdcard/Trinity";
+}
+
+/*
+================
 Com_RealTime
 ================
 */
@@ -3151,10 +3164,13 @@ void Com_Frame( void ) {
 		// rendering, cgame stack frames are still on the call stack
 		// when longjmp fires: unloading the SO first corrupts state.
 		if ( com_deferredFlush ) {
+			// This is still Com_Error's cleanup, so an error inside it is a recursive error
+			com_deferredFlush = qfalse;
+			com_errorEntered = qtrue;
 			CL_FlushMemory();
 			VM_Forced_Unload_Done();
 			FS_PureServerSetLoadedPaks("", "");
-			com_deferredFlush = qfalse;
+			com_errorEntered = qfalse;
 		}
 		return;			// an ERR_DROP was thrown
 	}

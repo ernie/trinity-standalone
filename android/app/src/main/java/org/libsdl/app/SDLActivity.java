@@ -369,7 +369,7 @@ public class SDLActivity extends Activity {
 
         // Try a transition to resumed state
         if (mNextNativeState == NativeState.RESUMED) {
-            if (mIsSurfaceReady && mHasFocus && mIsResumedCalled) {
+            if (mIsSurfaceReady && mHasFocus && mIsResumedCalled && mSingleton.isNativeReady()) {
                 if (mSDLThread == null) {
                     // This is the entry point to the C app.
                     // Start up the C app thread and enable sensor input for the first time
@@ -385,6 +385,10 @@ public class SDLActivity extends Activity {
                 mCurrentNativeState = mNextNativeState;
             }
         }
+    }
+
+    protected boolean isNativeReady() {
+        return true;
     }
 
     /* The native thread has finished */
@@ -1624,17 +1628,23 @@ class SDLClipboardHandler_API11 implements
 
     SDLClipboardHandler_API11() {
        mClipMgr = (android.content.ClipboardManager) SDL.getContext().getSystemService(Context.CLIPBOARD_SERVICE);
-       mClipMgr.addPrimaryClipChangedListener(this);
+       // Steam Frame's Android container has no clipboard service
+       if (mClipMgr != null) {
+          mClipMgr.addPrimaryClipChangedListener(this);
+       }
     }
 
     @Override
     public boolean clipboardHasText() {
-       return mClipMgr.hasText();
+       return mClipMgr != null && mClipMgr.hasText();
     }
 
     @Override
     public String clipboardGetText() {
         CharSequence text;
+        if (mClipMgr == null) {
+           return null;
+        }
         text = mClipMgr.getText();
         if (text != null) {
            return text.toString();
@@ -1644,6 +1654,9 @@ class SDLClipboardHandler_API11 implements
 
     @Override
     public void clipboardSetText(String string) {
+       if (mClipMgr == null) {
+          return;
+       }
        mClipMgr.removePrimaryClipChangedListener(this);
        mClipMgr.setText(string);
        mClipMgr.addPrimaryClipChangedListener(this);

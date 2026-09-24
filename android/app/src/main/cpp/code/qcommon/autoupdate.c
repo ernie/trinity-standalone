@@ -64,12 +64,23 @@ extern CURLMsg *(*qcurl_multi_info_read)(CURLM *multi_handle, int *msgs_in_queue
 
 #define UPDATE_API_BUFSIZE		(256 * 1024)
 
-// APK download path
-#define UPDATE_DIR				"/sdcard/Trinity/.updates"
-#define UPDATE_APK_PATH			UPDATE_DIR "/trinity-standalone-update.apk"
-
 // from sys_android.c
 extern void Sys_InstallApk( const char *apkPath );
+
+// Downloads go beside the game files, wherever the launcher found them
+static const char *Update_Dir( void ) {
+	static char path[MAX_OSPATH];
+
+	Com_sprintf( path, sizeof( path ), "%s/.updates", Com_TrinityHome() );
+	return path;
+}
+
+static const char *Update_ApkPath( void ) {
+	static char path[MAX_OSPATH];
+
+	Com_sprintf( path, sizeof( path ), "%s/trinity-standalone-update.apk", Update_Dir() );
+	return path;
+}
 
 // state
 static updateState_t	updateState = UPDATE_IDLE;
@@ -214,8 +225,8 @@ Remove leftover APK from a previous download.
 static void Update_CleanupDownload( void )
 {
 	struct stat st;
-	if ( stat( UPDATE_APK_PATH, &st ) == 0 ) {
-		remove( UPDATE_APK_PATH );
+	if ( stat( Update_ApkPath(), &st ) == 0 ) {
+		remove( Update_ApkPath() );
 		Com_DPrintf( "Update: cleaned up previous download\n" );
 	}
 }
@@ -421,7 +432,7 @@ static void Update_BeginCheck( void )
 	qcurl_easy_setopt( updateCURL, CURLOPT_FOLLOWLOCATION, 1 );
 	qcurl_easy_setopt( updateCURL, CURLOPT_MAXREDIRS, 5 );
 	qcurl_easy_setopt( updateCURL, CURLOPT_TIMEOUT, 30 );
-	qcurl_easy_setopt( updateCURL, CURLOPT_CAINFO, "/sdcard/Trinity/cacert.pem" );
+	qcurl_easy_setopt( updateCURL, CURLOPT_CAINFO, va( "%s/cacert.pem", Com_TrinityHome() ) );
 #if CURL_AT_LEAST_VERSION(7, 85, 0)
 	qcurl_easy_setopt( updateCURL, CURLOPT_PROTOCOLS_STR, "https" );
 #else
@@ -564,11 +575,11 @@ static void Update_BeginDownload( void )
 	}
 
 	// ensure download directory exists
-	mkdir( UPDATE_DIR, 0755 );
+	mkdir( Update_Dir(), 0755 );
 
-	updateApkFile = fopen( UPDATE_APK_PATH, "wb" );
+	updateApkFile = fopen( Update_ApkPath(), "wb" );
 	if ( !updateApkFile ) {
-		Update_SetError( va( "Cannot write to %s", UPDATE_APK_PATH ) );
+		Update_SetError( va( "Cannot write to %s", Update_ApkPath() ) );
 		Update_CurlCleanup();
 		return;
 	}
@@ -595,7 +606,7 @@ static void Update_BeginDownload( void )
 	qcurl_easy_setopt( updateCURL, CURLOPT_FAILONERROR, 1 );
 	qcurl_easy_setopt( updateCURL, CURLOPT_FOLLOWLOCATION, 1 );
 	qcurl_easy_setopt( updateCURL, CURLOPT_MAXREDIRS, 10 );
-	qcurl_easy_setopt( updateCURL, CURLOPT_CAINFO, "/sdcard/Trinity/cacert.pem" );
+	qcurl_easy_setopt( updateCURL, CURLOPT_CAINFO, va( "%s/cacert.pem", Com_TrinityHome() ) );
 #if CURL_AT_LEAST_VERSION(7, 85, 0)
 	qcurl_easy_setopt( updateCURL, CURLOPT_PROTOCOLS_STR, "https" );
 #else
@@ -669,7 +680,7 @@ static void Update_PerformDownload( void )
 		long code = 0;
 		qcurl_easy_getinfo( msg->easy_handle, CURLINFO_RESPONSE_CODE, &code );
 		Update_CurlCleanup();
-		remove( UPDATE_APK_PATH );
+		remove( Update_ApkPath() );
 		Update_SetError( va( "Download failed (HTTP %ld)", code ) );
 	}
 }
@@ -807,7 +818,7 @@ void Update_Cancel_f( void )
 		updateApkFile = NULL;
 	}
 	Update_CurlCleanup();
-	remove( UPDATE_APK_PATH );
+	remove( Update_ApkPath() );
 	Com_Printf( "Update: download cancelled\n" );
 
 	Update_SetState( UPDATE_AVAILABLE );
@@ -831,13 +842,13 @@ void Update_Install_f( void )
 		return;
 	}
 
-	if ( stat( UPDATE_APK_PATH, &st ) != 0 ) {
+	if ( stat( Update_ApkPath(), &st ) != 0 ) {
 		Update_SetError( "Downloaded APK not found" );
 		return;
 	}
 
 	Com_Printf( "Update: launching installer for %s...\n", releaseVersion );
-	Sys_InstallApk( UPDATE_APK_PATH );
+	Sys_InstallApk( Update_ApkPath() );
 }
 
 

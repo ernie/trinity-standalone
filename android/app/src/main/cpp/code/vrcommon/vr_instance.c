@@ -9,6 +9,7 @@
 
 #if __ANDROID__
 #include <openxr/openxr_platform.h>
+#include <android/log.h>
 
 // Android-specific: stored context for XR instance creation
 static JavaVM* s_javaVM = NULL;
@@ -26,8 +27,11 @@ XrResult VR_InitializeLoaderAndroid(void)
 	if (s_loaderInitialized) {
 		return XR_SUCCESS;
 	}
-	s_loaderInitialized = qtrue;
-	// On Android, we must initialize the OpenXR loader before creating an instance
+
+	if (!s_javaVM || !s_activityObject) {
+		__android_log_print(ANDROID_LOG_ERROR, "OpenXR", "Android context is not ready");
+		return XR_ERROR_INITIALIZATION_FAILED;
+	}
 	PFN_xrInitializeLoaderKHR xrInitializeLoaderKHR = NULL;
 	XrResult result = xrGetInstanceProcAddr(
 		XR_NULL_HANDLE,
@@ -35,9 +39,8 @@ XrResult VR_InitializeLoaderAndroid(void)
 		(PFN_xrVoidFunction*)&xrInitializeLoaderKHR);
 
 	if (result != XR_SUCCESS || xrInitializeLoaderKHR == NULL) {
-		fprintf(stderr, "[OpenXR] xrInitializeLoaderKHR not available (result=%d)\n", result);
-		// This might be OK on some platforms, continue anyway
-		return XR_SUCCESS;
+		__android_log_print(ANDROID_LOG_ERROR, "OpenXR", "xrInitializeLoaderKHR not available: %d", result);
+		return XR_FAILED(result) ? result : XR_ERROR_INITIALIZATION_FAILED;
 	}
 
 	XrLoaderInitInfoAndroidKHR loaderInitInfo;
@@ -49,9 +52,9 @@ XrResult VR_InitializeLoaderAndroid(void)
 
 	result = xrInitializeLoaderKHR((XrLoaderInitInfoBaseHeaderKHR*)&loaderInitInfo);
 	if (result != XR_SUCCESS) {
-		fprintf(stderr, "[OpenXR] xrInitializeLoaderKHR failed: %d\n", result);
+		__android_log_print(ANDROID_LOG_ERROR, "OpenXR", "xrInitializeLoaderKHR failed: %d", result);
 	} else {
-		fprintf(stderr, "[OpenXR] Android loader initialized successfully\n");
+		s_loaderInitialized = qtrue;
 	}
 	return result;
 }
