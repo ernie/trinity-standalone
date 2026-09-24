@@ -271,6 +271,7 @@ typedef struct {
 #endif /* USE_HTTP */
 	int		sv_allowDownload;
 	char		sv_dlURL[MAX_CVAR_VALUE_STRING];
+	int		serverGametype;		// g_gametype from CS_SERVERINFO
 	int			downloadNumber;
 	int			downloadBlock;	// block we are waiting for
 	int			downloadCount;	// how many bytes we got

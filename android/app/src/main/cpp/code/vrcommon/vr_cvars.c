@@ -13,6 +13,7 @@ cvar_t *vr_currentHudDepth = NULL;
 cvar_t *vr_righthanded = NULL;
 cvar_t *vr_switchThumbsticks = NULL;
 cvar_t *vr_snapturn = NULL;
+cvar_t *vr_sensitivity = NULL;
 cvar_t *vr_heightAdjust = NULL;
 cvar_t *vr_directionMode = NULL;
 cvar_t *vr_weaponPitch = NULL;
@@ -61,6 +62,7 @@ void VR_InitCvars( void )
 	vr_righthanded = Cvar_Get ("vr_righthanded", "1", CVAR_ARCHIVE);
 	vr_switchThumbsticks = Cvar_Get ("vr_switchThumbsticks", "0", CVAR_ARCHIVE);
 	vr_snapturn = Cvar_Get ("vr_snapturn", "45", CVAR_ARCHIVE);
+	vr_sensitivity = Cvar_Get ("vr_sensitivity", "100", CVAR_ARCHIVE);
 	vr_directionMode = Cvar_Get ("vr_directionMode", "1", CVAR_ARCHIVE); // 0 = HMD, 1 = Off-hand
 	// Degrees on top of the fixed VR_GRIP_TO_AIM_PITCH correction; zero is no personal adjustment
 	vr_weaponPitch = Cvar_Get ("vr_weaponPitch", "0", CVAR_ARCHIVE);

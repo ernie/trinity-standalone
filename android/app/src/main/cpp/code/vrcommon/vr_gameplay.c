@@ -37,7 +37,7 @@ qboolean VR_IsInConsole( void )
 qboolean VR_IsSPIntermission( void )
 {
 	return (cl.snap.ps.pm_type == PM_INTERMISSION) &&
-	       (Cvar_VariableValue("g_gametype") == GT_SINGLE_PLAYER);
+	       (clc.serverGametype == GT_SINGLE_PLAYER);
 }
 
 qboolean VR_Gameplay_ShouldRenderInVirtualScreen( void )

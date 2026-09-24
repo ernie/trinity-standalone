@@ -198,6 +198,7 @@ typedef struct {
 	int fog_stage; // off, fog-in / fog-out
 	int abs_light;
 	int allow_discard;
+	int hud_coverage; // 0: material alpha, 1: opaque coverage, 2: preserve coverage
 	int acff; // none, rgb, rgba, alpha
 	int stencil_mark; // mark pixels with stencil bit 0x80 (for shadow exclusion)
 	struct {

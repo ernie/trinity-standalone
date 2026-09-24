@@ -12,6 +12,7 @@ void VR_DestroySessionInput( VR_Engine* engine );
 // Render loop
 void VR_RefreshDerivedModeState( void );
 void VR_ProcessInputActions( void );
+void VR_CancelTVDInput( void );
 void IN_VRUpdateHMD( XrView* views, uint32_t viewCount, XrFovf* fov );
 void IN_VRSyncActions( VR_Engine* engine );
 void IN_VRUpdateControllers( VR_Engine* engine, XrTime predictedDisplayTime );

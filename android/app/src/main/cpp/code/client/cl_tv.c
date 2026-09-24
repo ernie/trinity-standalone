@@ -487,6 +487,7 @@ qboolean CL_TV_Open( const char *filename ) {
 #ifdef USE_VOIP
 		clc.svVoipVersion = atoi( Info_ValueForKey( si, "sv_voipVersion" ) );
 #endif
+		clc.serverGametype = atoi( Info_ValueForKey( si, "g_gametype" ) );
 	}
 
 	// Save initial gameState and first frame offset for seeking

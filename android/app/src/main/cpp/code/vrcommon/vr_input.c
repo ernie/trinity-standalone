@@ -118,7 +118,7 @@ static float IN_ApplyThumbstickCurve(float value, float threshold)
 	return (value < 0) ? -f : f;
 }
 
-extern cvar_t *cl_sensitivity;
+extern cvar_t *vr_sensitivity;
 extern cvar_t *m_pitch;
 extern cvar_t *m_yaw;
 
@@ -448,6 +448,148 @@ static void IN_HandleInactiveInput(uint32_t * inputGroup, int inputFlag, char* i
 		// No assigned action -> just remove input activated state
 		IN_DeactivateInput(inputGroup, inputFlag);
 	}
+}
+
+static struct {
+	qboolean held, grips[2], reserved, blocked, needsRelease;
+	uint32_t muted[2];
+	int hand;
+} tvdInput;
+
+typedef struct {
+	char action[256];
+	qboolean thumbstick;
+} vrScrubRelease_t;
+
+/* Resolve every held mapping before dispatch: releasing +alt changes lookup. */
+static void IN_VRCollectScrubRelease(vrScrubRelease_t *releases, int *count,
+	uint32_t *group, int flag, const char *name, qboolean thumbstick)
+{
+	if (!IN_InputActivated(group, flag))
+		return;
+	if (IN_GetInputAction(name, releases[*count].action))
+	{
+		releases[*count].thumbstick = thumbstick;
+		(*count)++;
+	}
+	IN_DeactivateInput(group, flag);
+}
+
+static void IN_VRDispatchScrubReleases(vrScrubRelease_t *releases, int count)
+{
+	for (int i = 0; i < count; i++)
+		IN_SendInputAction(releases[i].action, qfalse, 0, releases[i].thumbstick);
+}
+
+static void IN_VRReleaseScrubActions(void)
+{
+	vrScrubRelease_t releases[2 * (9 + 1 + 8)];
+	int count = 0;
+	const int flags[] = { VR_Button_GripTrigger, VR_Button_Trackpad,
+		VR_Button_LThumb, VR_Button_RThumb, VR_Button_A, VR_Button_B,
+		VR_Button_X, VR_Button_Y, VR_Button_Thumbrest };
+	const char *axes[] = { "RTHUMBFORWARD", "RTHUMBFORWARDRIGHT", "RTHUMBRIGHT",
+		"RTHUMBBACKRIGHT", "RTHUMBBACK", "RTHUMBBACKLEFT", "RTHUMBLEFT", "RTHUMBFORWARDLEFT" };
+	for (int hand = 0; hand < 2; hand++)
+	{
+		vrController_t *controller = hand ? &rightController : &leftController;
+		qboolean primary = hand == (vr_righthanded->integer != 0);
+		const char *names[] = { primary ? "PRIMARYGRIP" : "SECONDARYGRIP",
+			primary ? "PRIMARYTRACKPAD" : "SECONDARYTRACKPAD",
+			"SECONDARYTHUMBSTICK", "PRIMARYTHUMBSTICK", "A", "B", "X", "Y",
+			primary ? "PRIMARYTHUMBREST" : "SECONDARYTHUMBREST" };
+		for (int i = 0; i < 9; i++)
+			IN_VRCollectScrubRelease(releases, &count, &controller->buttons, flags[i], names[i], qfalse);
+		IN_VRCollectScrubRelease(releases, &count, &controller->axisButtons, VR_TOUCH_AXIS_TRIGGER_INDEX,
+			primary ? "PRIMARYTRIGGER" : "SECONDARYTRIGGER", qfalse);
+		for (int i = 0; i < 8; i++)
+			IN_VRCollectScrubRelease(releases, &count, &controller->axisButtons, 1 << i, axes[i], qtrue);
+	}
+	IN_VRDispatchScrubReleases(releases, count);
+	for (int axis = 0; axis < 3; axis++)
+		Com_QueueEvent(in_vrEventTime, SE_JOYSTICK_AXIS, axis, 0, 0, NULL);
+	vr.vote_holding = 0;
+	vr.walking = qfalse;
+}
+
+/* Focus or session loss can stop input frames before the grip release arrives. */
+void VR_CancelTVDInput(void)
+{
+	if (tvdInput.held)
+	{
+		Cbuf_AddText("tv_scrub_cancel\n");
+		tvdInput.held = qfalse;
+		tvdInput.needsRelease = qtrue;
+		IN_VRReleaseScrubActions();
+	}
+}
+
+static void IN_VRTVScrub(uint32_t lButtons, uint32_t rButtons,
+	XrActionStateFloat leftGrip, XrActionStateFloat rightGrip)
+{
+	VR_Engine *engine = VR_GetEngine();
+	int primary = vr_righthanded->integer != 0, other = 1 - primary;
+	qboolean down[2] = { (lButtons & VR_Button_GripTrigger) != 0,
+		(rButtons & VR_Button_GripTrigger) != 0 };
+	qboolean active[2] = { leftGrip.isActive, rightGrip.isActive };
+	qboolean seekable = tvPlay.active && tvPlay.totalDuration > 0;
+	qboolean responsive = engine->appState.Focused && engine->appState.SessionActive &&
+		active[primary] && engine->appState.TrackedController[primary].Active;
+	qboolean eligible = seekable && responsive &&
+		!vr.weapon_adjust && !vr.in_menu && !VKeyboard_IsActive() &&
+		!(Key_GetCatcher() & (KEYCATCH_UI | KEYCATCH_CONSOLE | KEYCATCH_MESSAGE)) &&
+		!((lButtons | rButtons) & VR_Button_Enter);
+	qboolean blocked = tvdInput.held || vr.menuYawLocked;
+	qboolean wasBlocked = tvdInput.blocked;
+	qboolean reserved = seekable || tvdInput.held ||
+		(tvdInput.reserved && (down[0] || down[1] || tvdInput.needsRelease));
+
+	if (tvdInput.held && (!eligible || primary != tvdInput.hand))
+		VR_CancelTVDInput();
+	if (tvdInput.needsRelease && responsive && !down[0] && !down[1])
+		tvdInput.needsRelease = qfalse;
+
+	if (eligible && !tvdInput.needsRelease)
+	{
+		/* Cancel wins if both hands press together, regardless of handedness. */
+		if (down[other] && !tvdInput.grips[other])
+		{
+			if (tvdInput.held || vr.menuYawLocked)
+				Cbuf_AddText("tv_scrub_cancel\n");
+			tvdInput.held = qfalse;
+			tvdInput.needsRelease = qtrue;
+		}
+		else if (down[primary] && !tvdInput.grips[primary] && !vr.menuYawLocked)
+		{
+			Cbuf_AddText("+tv_scrub\n");
+			tvdInput.held = qtrue;
+			tvdInput.hand = primary;
+		}
+		if (tvdInput.held && !down[primary])
+		{
+			Cbuf_AddText("-tv_scrub\n");
+			tvdInput.held = qfalse;
+		}
+	}
+
+	tvdInput.blocked = blocked || tvdInput.held;
+	if (tvdInput.blocked && !wasBlocked)
+		IN_VRReleaseScrubActions();
+	if (reserved && !tvdInput.reserved)
+	{
+		vrScrubRelease_t releases[2];
+		int count = 0;
+		IN_VRCollectScrubRelease(releases, &count, &leftController.buttons, VR_Button_GripTrigger,
+			primary ? "SECONDARYGRIP" : "PRIMARYGRIP", qfalse);
+		IN_VRCollectScrubRelease(releases, &count, &rightController.buttons, VR_Button_GripTrigger,
+			primary ? "PRIMARYGRIP" : "SECONDARYGRIP", qfalse);
+		IN_VRDispatchScrubReleases(releases, count);
+	}
+	tvdInput.reserved = reserved;
+	tvdInput.grips[0] = down[0];
+	tvdInput.grips[1] = down[1];
+	if (tvdInput.blocked)
+		vr.vote_holding = 0;
 }
 
 // Human-readable name of the input the engine synthesizes K_SPACE from in
@@ -963,6 +1105,7 @@ void VR_InitSessionInput( VR_Engine* engine )
 
 void VR_DestroySessionInput( VR_Engine* engine )
 {
+	VR_CancelTVDInput();
 	// This will allow to recreate session-specific OpenXR input objects
 	inputInitialized = qfalse;
 }
@@ -1451,7 +1594,7 @@ static void IN_VRJoystick( qboolean isRightController, float joystickX, float jo
 			// turning while initiating weapon selection with a sideways thumbstick push
 			if (vr_snapturn->integer <= 0 && vr_weaponSelectorMode->integer != WS_HMD)
 			{
-				Com_QueueEvent(in_vrEventTime, SE_JOYSTICK_AXIS, 2, curvedX * (cl_sensitivity->value / 100.0f) * 32767.0f, 0, NULL);
+				Com_QueueEvent(in_vrEventTime, SE_JOYSTICK_AXIS, 2, curvedX * (vr_sensitivity->value / 100.0f) * 32767.0f, 0, NULL);
 			}
 
 			float joystickValue = length(curvedX, curvedY);
@@ -1644,9 +1787,14 @@ static void IN_VRTriggers( qboolean isRightController, float triggerValue )
 static void IN_VRButtons( qboolean isRightController, uint32_t buttons )
 {
 	vrController_t* controller = isRightController == qtrue ? &rightController : &leftController;
+	/* Holds that begin while blocked stay muted until physically released. */
+	tvdInput.muted[isRightController] &= buttons;
+	if (tvdInput.blocked)
+		tvdInput.muted[isRightController] |= buttons & ~VR_Button_Enter;
+	buttons &= ~tvdInput.muted[isRightController];
 
 	// Weapon adjustment mode: suppress most buttons, handle A (reset) and B (exit)
-	if (vr.weapon_adjust)
+	if (vr.weapon_adjust && !tvdInput.blocked)
 	{
 		// Still allow menu button
 		if ((buttons & VR_Button_Enter) && !IN_InputActivated(&controller->buttons, VR_Button_Enter))
@@ -1723,81 +1871,23 @@ static void IN_VRButtons( qboolean isRightController, uint32_t buttons )
 		Com_QueueEvent(in_vrEventTime, SE_KEY, K_ESCAPE, qfalse, 0, NULL);
 	}
 
-	if (isRightController == !vr_righthanded->integer)
+	/* IN_VRTVScrub settles grip ownership for both hands before either dispatches. */
+	if (tvdInput.blocked)
 	{
-		// Offhand grip
-		if (tvPlay.active && tvPlay.totalDuration > 0)
-		{
-			// During TVD playback, offhand grip cancels timeline scrubbing
-			if (buttons & VR_Button_GripTrigger)
-			{
-				if (!IN_InputActivated(&controller->buttons, VR_Button_GripTrigger))
-				{
-					IN_ActivateInput(&controller->buttons, VR_Button_GripTrigger);
-					Cbuf_AddText("tv_scrub_cancel\n");
-				}
-			}
-			else
-			{
-				if (IN_InputActivated(&controller->buttons, VR_Button_GripTrigger))
-				{
-					IN_DeactivateInput(&controller->buttons, VR_Button_GripTrigger);
-				}
-			}
-		}
+		return;
+	}
+	if (!tvdInput.reserved)
+	{
+		char *name = isRightController == (vr_righthanded->integer != 0) ? "PRIMARYGRIP" : "SECONDARYGRIP";
+		if (buttons & VR_Button_GripTrigger)
+			IN_HandleActiveInput(&controller->buttons, VR_Button_GripTrigger, name, 0, qfalse);
 		else
-		{
-			if (buttons & VR_Button_GripTrigger)
-			{
-				IN_HandleActiveInput(&controller->buttons, VR_Button_GripTrigger, "SECONDARYGRIP", 0, qfalse);
-			}
-			else
-			{
-				IN_HandleInactiveInput(&controller->buttons, VR_Button_GripTrigger, "SECONDARYGRIP", 0, qfalse);
-			}
-		}
+			IN_HandleInactiveInput(&controller->buttons, VR_Button_GripTrigger, name, 0, qfalse);
 	}
 	else
 	{
-		// Primary grip
-		if (tvPlay.active && tvPlay.totalDuration > 0)
-		{
-			// During TVD playback, primary grip activates timeline scrubbing
-			if (buttons & VR_Button_GripTrigger)
-			{
-				if (!IN_InputActivated(&controller->buttons, VR_Button_GripTrigger))
-				{
-					IN_ActivateInput(&controller->buttons, VR_Button_GripTrigger);
-					Cbuf_AddText("+tv_scrub\n");
-				}
-			}
-			else
-			{
-				if (IN_InputActivated(&controller->buttons, VR_Button_GripTrigger))
-				{
-					IN_DeactivateInput(&controller->buttons, VR_Button_GripTrigger);
-					Cbuf_AddText("-tv_scrub\n");
-				}
-			}
-		}
-		else
-		{
-			if (buttons & VR_Button_GripTrigger)
-			{
-				IN_HandleActiveInput(&controller->buttons, VR_Button_GripTrigger, "PRIMARYGRIP", 0, qfalse);
-			}
-			else
-			{
-				IN_HandleInactiveInput(&controller->buttons, VR_Button_GripTrigger, "PRIMARYGRIP", 0, qfalse);
-			}
-		}
-	}
-
-	// TVD scrub mode: suppress remaining buttons (trackpad, thumbstick, A, B)
-	// Menu button and grip are already handled above.
-	if (vr.menuYawLocked)
-	{
-		return;
+		/* These grip bits do not represent configurable gameplay actions. */
+		IN_DeactivateInput(&controller->buttons, VR_Button_GripTrigger);
 	}
 
 	// Trackpad
@@ -2123,22 +2213,25 @@ void VR_ProcessInputActions( void )
 	if (GetActionStateBoolean(menuAction).currentState) lButtons |= VR_Button_Enter;
 	if (GetActionStateBoolean(buttonXAction).currentState) lButtons |= VR_Button_X;
 	if (GetActionStateBoolean(buttonYAction).currentState) lButtons |= VR_Button_Y;
-	if (GetActionStateFloat(gripLeftAction).currentState > 0.5f) lButtons |= VR_Button_GripTrigger;
+	XrActionStateFloat leftGrip = GetActionStateFloat(gripLeftAction);
+	if (leftGrip.isActive && leftGrip.currentState > 0.5f) lButtons |= VR_Button_GripTrigger;
 	if (GetActionStateFloat(trackpadLeftAction).currentState > 0.3f) lButtons |= VR_Button_Trackpad;
 	if (GetActionStateBoolean(thumbstickLeftClickAction).currentState) lButtons |= VR_Button_LThumb;
 	if (GetActionStateBoolean(thumbrestLeftTouchAction).currentState) lButtons |= VR_Button_Thumbrest;
-	IN_VRButtons(qfalse, lButtons);
 	uint32_t rButtons = 0;
 	if (GetActionStateBoolean(buttonAAction).currentState) rButtons |= VR_Button_A;
 	if (GetActionStateBoolean(buttonBAction).currentState) rButtons |= VR_Button_B;
-	if (GetActionStateFloat(gripRightAction).currentState > 0.5f) rButtons |= VR_Button_GripTrigger;
+	XrActionStateFloat rightGrip = GetActionStateFloat(gripRightAction);
+	if (rightGrip.isActive && rightGrip.currentState > 0.5f) rButtons |= VR_Button_GripTrigger;
 	if (GetActionStateFloat(trackpadRightAction).currentState > 0.3f) rButtons |= VR_Button_Trackpad;
 	if (GetActionStateBoolean(thumbstickRightClickAction).currentState) rButtons |= VR_Button_RThumb;
 	if (GetActionStateBoolean(thumbrestRightTouchAction).currentState) rButtons |= VR_Button_Thumbrest;
+	IN_VRTVScrub(lButtons, rButtons, leftGrip, rightGrip);
+	IN_VRButtons(qfalse, lButtons);
 	IN_VRButtons(qtrue, rButtons);
 
 	// Dual-grip hold detection for weapon adjustment mode activation
-	if (vr_weaponAdjust->integer)
+	if (vr_weaponAdjust->integer && !tvdInput.reserved && !tvdInput.blocked)
 	{
 		qboolean bothGripsHeld = (lButtons & VR_Button_GripTrigger) && (rButtons & VR_Button_GripTrigger);
 		if (bothGripsHeld)
@@ -2163,22 +2256,27 @@ void VR_ProcessInputActions( void )
 			dualGripHoldStartTime = 0;
 		}
 	}
+	else
+	{
+		dualGripWasActive = qfalse;
+		dualGripHoldStartTime = 0;
+	}
 
 	//index finger trigger
 	XrActionStateFloat indexState;
 	indexState = GetActionStateFloat(indexLeftAction);
-	IN_VRTriggers(qfalse, indexState.currentState);
+	if (!tvdInput.blocked) IN_VRTriggers(qfalse, indexState.currentState);
 	indexState = GetActionStateFloat(indexRightAction);
-	IN_VRTriggers(qtrue, indexState.currentState);
+	if (!tvdInput.blocked) IN_VRTriggers(qtrue, indexState.currentState);
 
 	//thumbstick
 	XrActionStateVector2f moveJoystickState;
 	moveJoystickState = GetActionStateVector2(moveOnLeftJoystickAction);
 	float navLX = moveJoystickState.currentState.x, navLY = moveJoystickState.currentState.y;
-	IN_VRJoystick(qfalse, navLX, navLY);
+	if (!tvdInput.blocked) IN_VRJoystick(qfalse, navLX, navLY);
 	moveJoystickState = GetActionStateVector2(moveOnRightJoystickAction);
 	float navRX = moveJoystickState.currentState.x, navRY = moveJoystickState.currentState.y;
-	IN_VRJoystick(qtrue, navRX, navRY);
+	if (!tvdInput.blocked) IN_VRJoystick(qtrue, navRX, navRY);
 
 	// Menu thumbstick navigation: only in an actual menu (virtual screen, not
 	// follow-mode gameplay): the same menu gate the PGUP/PGDN path uses, minus
@@ -2187,7 +2285,7 @@ void VR_ProcessInputActions( void )
 	// or arrows would fire while playing. The helper resets its own repeat state when
 	// the gate is closed; we reuse the stick values already read above (no extra XR query).
 	IN_VRMenuThumbstickNav(
-		( vr.virtual_screen && ( !vr.first_person_following || vr.in_menu ) ),
+		( !tvdInput.blocked && vr.virtual_screen && ( !vr.first_person_following || vr.in_menu ) ),
 		navLX, navLY, navRX, navRY );
 
 	lastframetime = in_vrEventTime;

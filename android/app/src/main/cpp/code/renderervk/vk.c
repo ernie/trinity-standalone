@@ -1,4 +1,5 @@
 #include "tr_local.h"
+#include "vk_hud_coverage.h"
 #include "vk.h"
 #include "../vrvk/vr_vk.h"  // For VR_VulkanDeviceInfo (pull model)
 #include "../vrcommon/vr_clientinfo.h"
@@ -6215,9 +6216,8 @@ VkPipeline create_pipeline( const Vk_Pipeline_Def *def, renderPass_t renderPassI
 	spec_entries[19].offset = 18 * sizeof( int32_t );
 	spec_entries[19].size = sizeof( int32_t );
 
-	// For non-blended HUD render pass stages, force alpha=1.0
 	// This ensures 3D models (player heads, weapon icons) are fully opaque
-	if (renderPassIndex == RENDER_PASS_HUD && !(state_bits & (GLS_SRCBLEND_BITS | GLS_DSTBLEND_BITS))) {
+	if (renderPassIndex == RENDER_PASS_HUD && def->hud_coverage == 1) {
 		frag_spec_data[11].i = 1;
 	} else {
 		frag_spec_data[11].i = 0;
@@ -6744,16 +6744,10 @@ VkPipeline create_pipeline( const Vk_Pipeline_Def *def, renderPass_t renderPassI
 				break;
 		}
 
-		// HUD render pass: use separate alpha blend to accumulate toward opaque
-		// This matches glBlendFuncSeparate(srcFactor, dstFactor, GL_ONE, GL_ONE) from renderergl2
-		// RGB blends normally so specular shows through texture alpha
-		// Alpha accumulates: src=ONE, dst=ONE adds alphas together, saturating toward 1.0
-		if (renderPassIndex == RENDER_PASS_HUD) {
-			attachment_blend_state.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
-			attachment_blend_state.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
-		} else {
-			attachment_blend_state.srcAlphaBlendFactor = attachment_blend_state.srcColorBlendFactor;
-			attachment_blend_state.dstAlphaBlendFactor = attachment_blend_state.dstColorBlendFactor;
+		attachment_blend_state.srcAlphaBlendFactor = attachment_blend_state.srcColorBlendFactor;
+		attachment_blend_state.dstAlphaBlendFactor = attachment_blend_state.dstColorBlendFactor;
+		if ( renderPassIndex == RENDER_PASS_HUD ) {
+			VK_HudAlphaBlend( state_bits, def->hud_coverage, &attachment_blend_state );
 		}
 		attachment_blend_state.colorBlendOp = VK_BLEND_OP_ADD;
 		attachment_blend_state.alphaBlendOp = VK_BLEND_OP_ADD;

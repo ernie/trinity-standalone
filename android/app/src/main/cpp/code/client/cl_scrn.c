@@ -780,7 +780,7 @@ void SCR_DrawScreenField( stereoFrame_t stereoFrame ) {
 		// During SP intermission, render UI to HUD buffer for world-locked display at podium
 		// The HUD sprite is positioned at the podium location for this
 		qboolean isSPIntermission = (cl.snap.ps.pm_type == PM_INTERMISSION) &&
-		                            (Cvar_VariableValue("g_gametype") == GT_SINGLE_PLAYER);
+		                            (clc.serverGametype == GT_SINGLE_PLAYER);
 		if (isSPIntermission) {
 			re.HUDBufferStart(qtrue);  // Clear for fresh UI render
 		}

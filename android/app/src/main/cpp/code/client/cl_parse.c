@@ -463,6 +463,8 @@ static void CL_ParseServerInfo(void)
 
 	// Check if server supports VR head tracking
 	clc.serverSupportsVR = (atoi(Info_ValueForKey(serverInfo, "vr_support")) == 1);
+
+	clc.serverGametype = atoi(Info_ValueForKey(serverInfo, "g_gametype"));
 }
 
 /*

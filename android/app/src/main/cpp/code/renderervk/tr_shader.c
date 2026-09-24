@@ -20,6 +20,7 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 ===========================================================================
 */
 #include "tr_local.h"
+#include "vk_hud_coverage.h"
 
 // tr_shader.c -- this file deals with the parsing and definition of shaders
 
@@ -3045,6 +3046,10 @@ static shader_t *FinishShader( void ) {
 	colorBlend = qfalse;
 	depthMask = qfalse;
 	fogCollapse = qfalse;
+	/* The fog collapse and sort logic below reads these blend bits. */
+	if ( !Q_stricmp( shader.name, "sprites/vr/hud" ) ) {
+		stages[0].stateBits = VK_HudCompositeBlend( stages[0].stateBits );
+	}
 
 	//
 	// set sky stuff appropriate
@@ -3334,6 +3339,8 @@ static shader_t *FinishShader( void ) {
 			int env_mask;
 			shaderStage_t *pStage = &stages[i];
 			def.state_bits = pStage->stateBits;
+			def.hud_coverage = VK_HudCoverage(shader.lightmapIndex == LIGHTMAP_2D,
+				stages[0].stateBits, pStage->stateBits);
 
 			if ( pStage->mtEnv3 ) {
 				switch ( pStage->mtEnv3 ) {
@@ -4452,7 +4459,7 @@ static void CreateExternalShaders( void ) {
 		tr.hudShader->sort = SS_BLEND2;
 		// Reset stage's blend function config to a proper one
 		tr.hudShader->stages[0]->stateBits &= ~(GLS_SRCBLEND_BITS | GLS_DSTBLEND_BITS);
-		tr.hudShader->stages[0]->stateBits |= GLS_SRCBLEND_SRC_ALPHA | GLS_DSTBLEND_ONE_MINUS_SRC_ALPHA;
+		tr.hudShader->stages[0]->stateBits |= GLS_SRCBLEND_ONE | GLS_DSTBLEND_ONE_MINUS_SRC_ALPHA;
 	}
 #endif
 }

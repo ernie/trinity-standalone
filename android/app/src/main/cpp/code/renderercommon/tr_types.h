@@ -128,7 +128,6 @@ typedef struct {
 	// extra sprite information
 	float		radius;
 	float		rotation;
-	qboolean	invert;
 } refEntity_t;
 
 
