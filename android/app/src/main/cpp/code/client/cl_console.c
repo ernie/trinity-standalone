@@ -639,9 +639,13 @@ void Con_DrawNotify (void)
 	currentColor = 7;
 	re.SetColor( g_color_table[currentColor] );
 
-	// Console notifications always render to HUD buffer
-	// Stereo parallax is handled in vk_update_mvp() for direct screen drawing
-	re.HUDBufferStart(qfalse);
+	// mode 0 composites only the view, so there the lines draw over it, placed as in mode 2
+	int hudMode = vr_currentHudDrawStatus->integer ? vr_currentHudDrawStatus->integer : 2;
+	qboolean hudBuffer = vr_currentHudDrawStatus->integer != 0;
+
+	if (hudBuffer) {
+		re.HUDBufferStart(qfalse);
+	}
 
 	// Use console scale setting for notify messages
 	float charScale = con_scale ? con_scale->value : 2.0f;
@@ -650,11 +654,11 @@ void Con_DrawNotify (void)
 
 	// For HUD mode 2, transform the base position to screen coordinates
 	// and scale character size to try to match floating HUD scaling
-	if (vr_currentHudDrawStatus->integer == 2) {
+	if (hudMode == 2) {
 		if (!vr.virtual_screen) {
 			charScale /= 2.0f;
 		}
-		SCR_AdjustFrom640(&xadjust, &yadjust, NULL, NULL);
+		CL_VRHudFrom640(hudMode, &xadjust, &yadjust, NULL, NULL);
 	}
 
 	// We'll wrap to leave room for upper-right HUD elements (speed meter is widest at ~112px)
@@ -725,31 +729,10 @@ void Con_DrawNotify (void)
 	v = 0;
 
 	// cl_conXOffset is in virtual 640x480 coordinates
-	// Scale it to match HUD buffer coordinates for each mode
 	float effectiveConXOffset = 0.0f;
 	if (cl_conXOffset->integer > 0) {
-		if (vr_currentHudDrawStatus->integer == 1) {
-			// HUD mode 1: fixed 1280x960 buffer = 2x virtual coordinates
-			effectiveConXOffset = cl_conXOffset->integer * 2.0f;
-		} else if (vr_currentHudDrawStatus->integer == 2) {
-			if (vr.virtual_screen) {
-				// Virtual screen mode: scale to full screen width
-				float xscale = cls.glconfig.vidWidth / 640.0f;
-				effectiveConXOffset = cl_conXOffset->integer * xscale;
-			} else {
-				// HUD mode 2 in-world: scale by screenXScale / 2.25
-				// This matches how CG_AdjustFrom640 scales HUD content
-				float xscale = cls.glconfig.vidWidth / 640.0f;
-				float screenXScale = xscale / 2.25f;
-				effectiveConXOffset = cl_conXOffset->integer * screenXScale;
-				// Note: The xadjust local variable (calculated via SCR_AdjustFrom640)
-				// provides the centering offset that matches what CG_AdjustFrom640 adds
-			}
-		} else {
-			// HUD mode 0 or non-HUD: scale to full screen
-			float xscale = cls.glconfig.vidWidth / 640.0f;
-			effectiveConXOffset = cl_conXOffset->integer * xscale;
-		}
+		effectiveConXOffset = cl_conXOffset->integer;
+		CL_VRHudFrom640( hudMode, NULL, NULL, &effectiveConXOffset, NULL );
 	}
 
 	for (i = startSegment; i < segmentCount; i++) {
@@ -779,7 +762,9 @@ void Con_DrawNotify (void)
 
 	re.SetColor( NULL );
 
-	re.HUDBufferEnd();
+	if (hudBuffer) {
+		re.HUDBufferEnd();
+	}
 
 	if (Key_GetCatcher( ) & (KEYCATCH_UI | KEYCATCH_CGAME) ) {
 		return;
@@ -927,6 +912,51 @@ void Con_DrawSolidConsole( float frac ) {
 
 
 /*
+================
+CL_VRHudBufferActive
+
+Whether 2D overlays route through the HUD buffer while a match is active.
+Con_DrawNotify and any other overlay sharing its screen layer must use
+this same gate.
+================
+*/
+qboolean CL_VRHudBufferActive( void ) {
+	return clc.state == CA_ACTIVE;
+}
+
+/*
+================
+CL_VRHudFrom640
+
+Maps a 640x480 virtual point and size into the layer Con_DrawNotify draws to
+in HUD mode hudMode. Mode 1's buffer is a fixed 1280x960; mode 2 in the world
+matches CG_AdjustFrom640's static HUD transform.
+================
+*/
+void CL_VRHudFrom640( int hudMode, float *x, float *y, float *w, float *h ) {
+	float xscale = cls.glconfig.vidWidth / 640.0f;
+	float yscale = cls.glconfig.vidHeight / 480.0f;
+
+	if ( hudMode == 1 ) {
+		xscale = yscale = 2.0f;
+	} else if ( hudMode == 2 && vr.virtual_screen ) {
+		SCR_AdjustFrom640( x, y, NULL, NULL );
+		x = y = NULL;
+	} else if ( hudMode == 2 ) {
+		SCR_AdjustFrom640InWorld( x, y, w, h );
+		return;
+	}
+	if ( x )
+		*x *= xscale;
+	if ( y )
+		*y *= yscale;
+	if ( w )
+		*w *= xscale;
+	if ( h )
+		*h *= yscale;
+}
+
+/*
 ==================
 Con_DrawConsole
 ==================
@@ -947,7 +977,7 @@ void Con_DrawConsole( void ) {
 		Con_DrawSolidConsole( con.displayFrac );
 	} else {
 		// draw notify lines
-		if ( clc.state == CA_ACTIVE ) {
+		if ( CL_VRHudBufferActive() ) {
 			Con_DrawNotify ();
 		}
 	}

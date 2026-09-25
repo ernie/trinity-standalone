@@ -33,6 +33,10 @@ extern VR_Engine* VR_GetEngine( void );
 
 qboolean	scr_initialized;		// ready to draw
 
+static char	scr_vrFallbackPak[MAX_QPATH];	// pak last announced this connection; "" once cleared
+static int	scr_vrFallbackExpireTime;		// Sys_Milliseconds() value the notice draws until; 0 until play begins
+static char	scr_vrUiFallbackPak[MAX_QPATH];	// running UI's fallback pak; "" for any other UI
+
 cvar_t		*cl_timegraph;
 cvar_t		*cl_debuggraph;
 cvar_t		*cl_graphheight;
@@ -81,6 +85,47 @@ static void SCR_GetViewable4x3Dimensions(float *outWidth, float *outHeight) {
 		// Ultra-wide case: height-limited, constrain width to fit 4:3
 		*outHeight = fbHeight;
 		*outWidth = widthFromHeight;
+	}
+}
+
+/*
+================
+SCR_AdjustFrom640InWorld
+
+HUD mode 2's static in-world transform; CL_VRHudFrom640 shares it so notify
+text and the notice stay placed with cgame's HUD.
+================
+*/
+void SCR_AdjustFrom640InWorld( float *x, float *y, float *w, float *h ) {
+	float	xscale = cls.glconfig.vidWidth / 640.0;
+
+	// Use xscale for both to match cg_drawtools.c HUD rendering
+	float screenXScale = xscale / 2.25f;
+	float screenYScale = xscale / 2.25f;
+
+	// Calculate optical centering offset (asymmetric FOV compensation)
+	float opticalOffset = 0.0f;
+	float tanUp = tanf(vr.fov_angle_up);
+	float tanDown = tanf(vr.fov_angle_down);
+	float tanHeight = tanUp - tanDown;
+	if (fabsf(tanHeight) > 0.001f) {
+		float m9 = (tanUp + tanDown) / tanHeight;
+		opticalOffset = 240.0f * m9 * screenYScale;
+	}
+
+	if (x) {
+		*x *= screenXScale;
+		*x += (cls.glconfig.vidWidth - (640 * screenXScale)) / 2.0f;
+	}
+	if (y) {
+		*y *= screenYScale;
+		*y += (cls.glconfig.vidHeight - (480 * screenYScale)) / 2.0f + opticalOffset;
+	}
+	if (w) {
+		*w *= screenXScale;
+	}
+	if (h) {
+		*h *= screenYScale;
 	}
 }
 
@@ -177,34 +222,7 @@ void SCR_AdjustFrom640( float *x, float *y, float *w, float *h ) {
 		}
 	} else if (vr_currentHudDrawStatus->integer == 2) {
 		// HUD mode 2: scaled down for in-world display
-		// Use xscale for both to match cg_drawtools.c HUD rendering
-		float screenXScale = xscale / 2.25f;
-		float screenYScale = xscale / 2.25f;
-
-		// Calculate optical centering offset (asymmetric FOV compensation)
-		float opticalOffset = 0.0f;
-		float tanUp = tanf(vr.fov_angle_up);
-		float tanDown = tanf(vr.fov_angle_down);
-		float tanHeight = tanUp - tanDown;
-		if (fabsf(tanHeight) > 0.001f) {
-			float m9 = (tanUp + tanDown) / tanHeight;
-			opticalOffset = 240.0f * m9 * screenYScale;
-		}
-
-		if (x) {
-			*x *= screenXScale;
-			*x += (cls.glconfig.vidWidth - (640 * screenXScale)) / 2.0f;
-		}
-		if (y) {
-			*y *= screenYScale;
-			*y += (cls.glconfig.vidHeight - (480 * screenYScale)) / 2.0f + opticalOffset;
-		}
-		if (w) {
-			*w *= screenXScale;
-		}
-		if (h) {
-			*h *= screenYScale;
-		}
+		SCR_AdjustFrom640InWorld( x, y, w, h );
 	} else {
 		if (x) {
 			*x *= xscale;
@@ -592,6 +610,130 @@ void SCR_DrawDemoRecording( void ) {
 }
 
 
+#define VR_FALLBACK_NOTICE_MSEC	5000
+
+/*
+=================
+SCR_VRFallbackNotice
+
+VM_VRSelectModule replaced pakName's flat-only QVM with the native module;
+shown once per connection, at its cgame load.
+=================
+*/
+void SCR_VRFallbackNotice( const char *pakName ) {
+	if ( scr_vrFallbackPak[0] )
+		return;
+	Q_strncpyz( scr_vrFallbackPak, pakName, sizeof( scr_vrFallbackPak ) );
+	scr_vrFallbackExpireTime = 0;
+}
+
+/*
+=================
+SCR_VRFallbackClear
+
+Lets the next connection show the notice again.
+=================
+*/
+void SCR_VRFallbackClear( void ) {
+	scr_vrFallbackPak[0] = '\0';
+}
+
+/*
+=================
+SCR_VRUiFallbackSet
+
+Records the running UI's fallback pak ("" for any other load) for
+SCR_VRUiFallbackNotice.
+=================
+*/
+void SCR_VRUiFallbackSet( const char *pakName ) {
+	Q_strncpyz( scr_vrUiFallbackPak, pakName, sizeof( scr_vrUiFallbackPak ) );
+}
+
+/*
+=================
+SCR_VRUiFallbackNotice
+
+Announces a fallback UI at cgame load, so the notice shows in the match.
+=================
+*/
+void SCR_VRUiFallbackNotice( void ) {
+	if ( scr_vrUiFallbackPak[0] )
+		SCR_VRFallbackNotice( scr_vrUiFallbackPak );
+}
+
+/*
+=================
+SCR_DrawVRFallbackNotice
+=================
+*/
+static void SCR_DrawVRFallbackNotice( void ) {
+	static const float background[4] = { 0.025f, 0.025f, 0.025f, 0.85f };
+	char line2[MAX_QPATH + 32];
+	const char *lines[2];
+	int lengths[2];
+	float size = BIGCHAR_WIDTH, x = 320, y = 120, w, h, charW, charH;
+	int i, j, longest, hudMode;
+	qboolean useHudBuffer;
+
+	if ( !scr_vrFallbackPak[0] || clc.state != CA_ACTIVE )
+		return;
+	// the window starts with play, after any slow map load
+	if ( !scr_vrFallbackExpireTime )
+		scr_vrFallbackExpireTime = Sys_Milliseconds() + VR_FALLBACK_NOTICE_MSEC;
+	if ( Sys_Milliseconds() > scr_vrFallbackExpireTime )
+		return;
+
+	Com_sprintf( line2, sizeof( line2 ), "%s QVMs are VR-incompatible", scr_vrFallbackPak );
+	lines[0] = "Fallback VR modules active";
+	lines[1] = line2;
+	lengths[0] = (int)strlen( lines[0] );
+	lengths[1] = (int)strlen( lines[1] );
+	longest = lengths[0] > lengths[1] ? lengths[0] : lengths[1];
+	if ( longest * size > 560 )
+		size = 560.0f / longest;
+	w = ( longest + 2 ) * size;
+	h = size * 3.5f;
+	charW = charH = size;
+
+	if ( vr.virtual_screen ) {
+		// cgame hides the HUD sprite on the virtual screen, so the notice draws on its 4:3 view
+		SCR_AdjustFrom640( &x, &y, &w, &h );
+		SCR_AdjustFrom640( NULL, NULL, &charW, &charH );
+		useHudBuffer = qfalse;
+	} else {
+		// mode 0 composites only the view, so there the notice draws over it with mode 2's mapping
+		hudMode = vr_currentHudDrawStatus->integer == 1 ? 1 : 2;
+		CL_VRHudFrom640( hudMode, &x, &y, &w, &h );
+		CL_VRHudFrom640( hudMode, NULL, NULL, &charW, &charH );
+		useHudBuffer = vr_currentHudDrawStatus->integer != 0;
+	}
+	if ( useHudBuffer )
+		re.HUDBufferStart( qfalse );
+
+	// x is the mapped center, so the box stays centered whatever the layer's scale
+	re.SetColor( background );
+	re.DrawStretchPic( x - w * 0.5f, y, w, h, 0, 0, 0, 0, cls.whiteShader );
+	re.SetColor( g_color_table[7] );
+	for ( i = 0; i < 2; i++ ) {
+		float cx = x - lengths[i] * charW * 0.5f;
+		float cy = y + ( 0.5f + i * 1.5f ) * charH;
+
+		for ( j = 0; j < lengths[i]; j++, cx += charW ) {
+			int ch = lines[i][j] & 255;
+			float frow = ( ch >> 4 ) * 0.0625f;
+			float fcol = ( ch & 15 ) * 0.0625f;
+
+			if ( ch != ' ' )
+				re.DrawStretchPic( cx, cy, charW, charH, fcol, frow, fcol + 0.0625f, frow + 0.0625f, cls.charSetShader );
+		}
+	}
+	re.SetColor( NULL );
+
+	if ( useHudBuffer )
+		re.HUDBufferEnd();
+}
+
 #ifdef USE_VOIP
 /*
 =================
@@ -800,6 +942,8 @@ void SCR_DrawScreenField( stereoFrame_t stereoFrame ) {
 	if ( cl_debuggraph->integer || cl_timegraph->integer || cl_debugMove->integer ) {
 		SCR_DrawDebugGraph ();
 	}
+
+	SCR_DrawVRFallbackNotice();
 }
 
 /*

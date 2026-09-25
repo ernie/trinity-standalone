@@ -1762,7 +1762,7 @@ vm_t *VM_Restart( vm_t *vm ) {
 }
 
 
-// [vm_vr]: native DLL loading lives in the VR module ladder (vm_vr.c)
+// [vm_vr]: native DLL loading lives in vm_vr.c
 
 
 /*

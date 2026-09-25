@@ -1143,6 +1143,8 @@ void CL_Disconnect( qboolean showMainMenu ) {
 	Cvar_Set( "cl_voteYesKey", "" );
 	Cvar_Set( "cl_voteNoKey", "" );
 
+	SCR_VRFallbackClear();
+
 	if ( uivm && showMainMenu ) {
 		VM_Call( uivm, 1, UI_SET_ACTIVE_MENU, UIMENU_NONE );
 	}
@@ -3494,6 +3496,8 @@ void CL_Init( void ) {
 	}
 
 	cls.realtime = 0;
+
+	SCR_VRFallbackClear();
 
 	CL_InitInput ();
 

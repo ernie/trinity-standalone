@@ -1102,6 +1102,12 @@ void S_ClearSoundBuffer( void );
 
 void SCR_DebugGraph (float value);	// FIXME: move logging to common?
 
+void SCR_VRFallbackNotice( const char *pakName );
+// VM_VRSelectModule: native modules replaced a flat-only QVM
+
+void SCR_VRUiFallbackSet( const char *pakName );
+// VM_VRSelectModule: records the running UI's fallback pak
+
 // AVI files have the start of pixel lines 4 byte-aligned
 #define AVI_LINE_PADDING 4
 

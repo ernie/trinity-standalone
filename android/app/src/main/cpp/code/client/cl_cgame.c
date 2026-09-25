@@ -1007,6 +1007,8 @@ void CL_InitCGame( void ) {
 	if ( !cgvm ) {
 		Com_Error( ERR_DROP, "VM_Create on cgame failed" );
 	}
+	// after VM_Create, so a fallback cgame's pak takes the connection's one notice
+	SCR_VRUiFallbackNotice();
 	clc.state = CA_LOADING;
 
 	// remote loads block in CG_INIT too; a local load began this in CL_MapLoading

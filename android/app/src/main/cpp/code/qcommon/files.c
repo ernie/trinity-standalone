@@ -1536,7 +1536,7 @@ Find a suitable VM file in search path order.
 
 In each searchpath try:
  - if findQvm is qfalse, open a DLL file (native fallback phase)
- - if findQvm is qtrue, open a QVM file (VR-aware sentinel scan phase)
+ - if findQvm is qtrue, open the winning QVM file
 
 write found DLL or QVM to "found" and return VMI_NATIVE if DLL, VMI_COMPILED if QVM
 Return the searchpath in "startSearch".

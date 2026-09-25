@@ -662,6 +662,9 @@ qboolean CL_UpdateVisiblePings_f( int source );
 //
 void Con_DrawCharacter (int cx, int line, int num);
 
+qboolean CL_VRHudBufferActive( void );
+void CL_VRHudFrom640( int hudMode, float *x, float *y, float *w, float *h );
+
 void Con_CheckResize (void);
 void Con_Init(void);
 void Con_Shutdown(void);
@@ -698,9 +701,15 @@ void	SCR_UpdateScreen (void);
 
 void	SCR_DebugGraph (float value);
 
+void	SCR_VRFallbackNotice( const char *pakName );
+void	SCR_VRFallbackClear( void );
+void	SCR_VRUiFallbackSet( const char *pakName );
+void	SCR_VRUiFallbackNotice( void );
+
 int		SCR_GetBigStringWidth( const char *str );	// returns in virtual 640x480 coordinates
 
 void	SCR_AdjustFrom640( float *x, float *y, float *w, float *h );
+void	SCR_AdjustFrom640InWorld( float *x, float *y, float *w, float *h );
 void	SCR_FillRect( float x, float y, float width, float height, 
 					 const float *color );
 void	SCR_DrawPic( float x, float y, float width, float height, qhandle_t hShader );
