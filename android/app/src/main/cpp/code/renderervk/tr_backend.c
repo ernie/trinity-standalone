@@ -1791,6 +1791,8 @@ Switches rendering to/from the HUD buffer for in-world HUD sprite.
 */
 static const void* RB_HUDBuffer( const void* data ) {
 	const hudBufferCommand_t *cmd = data;
+	qboolean overlay;
+	int status;
 
 	// finish any 2D drawing if needed
 	if ( tess.numIndexes ) {
@@ -1798,9 +1800,13 @@ static const void* RB_HUDBuffer( const void* data ) {
 		tess.shader = NULL;
 	}
 
-	// For HUD mode 2 (overlay), don't switch to HUD render pass: just track state.
+	// Mode 2 overlays: no HUD render pass, just track state. So does mode 0 (no floating HUD),
+	// except its clears, which must still empty the texture cgame's sprite samples; an end
+	// closes whichever the start opened.
 	// 3D HUD icons should render to the current target (overlay or XR swapchain).
-	if ( vr_currentHudDrawStatus->integer == 2 ) {
+	status = vr_currentHudDrawStatus->integer;
+	overlay = cmd->start ? ( status == 2 || ( status == 0 && !cmd->clear ) ) : vk.renderPassIndex != RENDER_PASS_HUD;
+	if ( overlay ) {
 		if ( cmd->start && !backEnd.isDrawingHUD ) {
 			backEnd.isDrawingHUD = qtrue;
 			backEnd.projection2D = qfalse;

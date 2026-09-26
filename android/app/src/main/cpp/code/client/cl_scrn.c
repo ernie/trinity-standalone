@@ -702,11 +702,11 @@ static void SCR_DrawVRFallbackNotice( void ) {
 		SCR_AdjustFrom640( NULL, NULL, &charW, &charH );
 		useHudBuffer = qfalse;
 	} else {
-		// mode 0 composites only the view, so there the notice draws over it with mode 2's mapping
+		// mode 0 has no floating HUD, so the renderer overlays the notice as in mode 2
 		hudMode = vr_currentHudDrawStatus->integer == 1 ? 1 : 2;
 		CL_VRHudFrom640( hudMode, &x, &y, &w, &h );
 		CL_VRHudFrom640( hudMode, NULL, NULL, &charW, &charH );
-		useHudBuffer = vr_currentHudDrawStatus->integer != 0;
+		useHudBuffer = qtrue;
 	}
 	if ( useHudBuffer )
 		re.HUDBufferStart( qfalse );

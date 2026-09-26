@@ -4,6 +4,7 @@
 #include "../vrvk/vr_vk.h"  // For VR_VulkanDeviceInfo (pull model)
 #include "../vrcommon/vr_clientinfo.h"
 #include "../vrcommon/vr_gameplay.h"  // For VR_ShouldDisableStereo
+#include "../vrcommon/vr_virtual_screen.h"
 
 // VR client state accessible from renderer
 extern vr_clientinfo_t vr;
@@ -139,6 +140,7 @@ static PFN_vkGetImageMemoryRequirements2KHR				qvkGetImageMemoryRequirements2KHR
 
 static PFN_vkDebugMarkerSetObjectNameEXT				qvkDebugMarkerSetObjectNameEXT;
 static PFN_vkGetFramebufferTilePropertiesQCOM			qvkGetFramebufferTilePropertiesQCOM;
+static PFN_vkCmdEndRenderPass2KHR					qvkCmdEndRenderPass2KHR;
 
 ////////////////////////////////////////////////////////////////////////////
 
@@ -367,6 +369,7 @@ static void end_command_buffer( VkCommandBuffer command_buffer, const char *loca
 
 
 // Forward declaration for virtual screen rendering (defined later in file)
+static void vk_render_virtual_screen( void );
 
 
 // Forward declaration for record_image_layout_transition
@@ -487,6 +490,7 @@ static void vk_set_object_name( uint64_t obj, const char *objName, VkDebugReport
 // Forward declarations: defined later in file
 static VkFormat vk_get_unorm_format( VkFormat format );
 static VkSampler vk_find_sampler( const Vk_Sampler_Def *def );
+static void vk_cmd_end_render_pass( void );
 
 
 // VK_EXT_fragment_density_map: the map is the last attachment of every scene pass,
@@ -838,9 +842,14 @@ static void vk_create_subpass_transient_images( void )
 	imageInfo.extent.depth = 1;
 	imageInfo.mipLevels = 1;
 	imageInfo.arrayLayers = 2;  // Stereo multiview
+	imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
 	imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
 	imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 	imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+	// Every attachment of a scene pass that ends with density map offsets must carry this
+	if ( vk.xr.fdmOffsetSupported ) {
+		imageInfo.flags = VK_IMAGE_CREATE_FRAGMENT_DENSITY_MAP_OFFSET_BIT_QCOM;
+	}
 
 	// Common view creation settings
 	Com_Memset( &viewInfo, 0, sizeof( viewInfo ) );
@@ -1874,9 +1883,13 @@ static void init_vulkan_library( void )
 	vk.xr.tileProperties = xrDevice->tileProperties ? qtrue : qfalse;
 	// Gates the vkDebugMarkerSetObjectNameEXT load below, and so every SET_OBJECT_NAME
 	vk.debugMarkers = xrDevice->debugMarkers ? qtrue : qfalse;
+	vk.imageFormatList = xrDevice->imageFormatList ? qtrue : qfalse;
 	// The density map is written at the finest granularity the hardware reads
 	vk.xr.fdmTexelWidth = xrDevice->minDensityTexelWidth;
 	vk.xr.fdmTexelHeight = xrDevice->minDensityTexelHeight;
+	vk.xr.fdmOffsetSupported = ( vk.xr.fdmSupported && xrDevice->fragmentDensityMapOffset ) ? qtrue : qfalse;
+	vk.xr.fdmOffsetGranularity[0] = xrDevice->densityOffsetGranularityWidth ? xrDevice->densityOffsetGranularityWidth : 1;
+	vk.xr.fdmOffsetGranularity[1] = xrDevice->densityOffsetGranularityHeight ? xrDevice->densityOffsetGranularityHeight : 1;
 
 	ri.Printf( PRINT_ALL, "[VK] Using VR-provided Vulkan device (fragment density map: %s)\n",
 		vk.xr.fdmSupported ? "yes" : "no" );
@@ -2023,6 +2036,13 @@ static void init_vulkan_library( void )
 
 	if ( vk.xr.tileProperties ) {
 		INIT_DEVICE_FUNCTION_EXT(vkGetFramebufferTilePropertiesQCOM)
+	}
+
+	if ( vk.xr.fdmOffsetSupported ) {
+		INIT_DEVICE_FUNCTION_EXT(vkCmdEndRenderPass2KHR)
+		if ( !qvkCmdEndRenderPass2KHR ) {
+			vk.xr.fdmOffsetSupported = qfalse;
+		}
 	}
 
 	// Check multiview support for VR single-pass stereo rendering
@@ -2188,6 +2208,7 @@ static void deinit_device_functions( void )
 
 	qvkDebugMarkerSetObjectNameEXT				= NULL;
 	qvkGetFramebufferTilePropertiesQCOM			= NULL;
+	qvkCmdEndRenderPass2KHR						= NULL;
 }
 
 
@@ -2983,6 +3004,19 @@ static void vk_create_shader_modules( void )
 	vk.modules.gamma_vs = SHADER_MODULE( gamma_vert_spv );
 	vk.modules.foveationdebug_fs = SHADER_MODULE( foveationdebug_frag_spv );
 	SET_OBJECT_NAME( vk.modules.foveationdebug_fs, "foveation debug fragment module", VK_DEBUG_REPORT_OBJECT_TYPE_SHADER_MODULE_EXT );
+
+	vk.modules.vscreen_vs = SHADER_MODULE( vscreen_vert_spv );
+	vk.modules.vscreen_fs = SHADER_MODULE( vscreen_frag_spv );
+	vk.modules.vscreen_reflect_fs = SHADER_MODULE( vscreen_reflect_frag_spv );
+	vk.modules.floor_grid_fs = SHADER_MODULE( floor_grid_frag_spv );
+	vk.modules.vscreen_capture_vs = SHADER_MODULE( vscreen_capture_vert_spv );
+	vk.modules.vscreen_capture_fs = SHADER_MODULE( vscreen_capture_frag_spv );
+	SET_OBJECT_NAME( vk.modules.vscreen_vs, "virtual screen vertex module", VK_DEBUG_REPORT_OBJECT_TYPE_SHADER_MODULE_EXT );
+	SET_OBJECT_NAME( vk.modules.vscreen_fs, "virtual screen fragment module", VK_DEBUG_REPORT_OBJECT_TYPE_SHADER_MODULE_EXT );
+	SET_OBJECT_NAME( vk.modules.vscreen_reflect_fs, "virtual screen reflection fragment module", VK_DEBUG_REPORT_OBJECT_TYPE_SHADER_MODULE_EXT );
+	SET_OBJECT_NAME( vk.modules.floor_grid_fs, "floor grid fragment module", VK_DEBUG_REPORT_OBJECT_TYPE_SHADER_MODULE_EXT );
+	SET_OBJECT_NAME( vk.modules.vscreen_capture_vs, "virtual screen capture vertex module", VK_DEBUG_REPORT_OBJECT_TYPE_SHADER_MODULE_EXT );
+	SET_OBJECT_NAME( vk.modules.vscreen_capture_fs, "virtual screen capture fragment module", VK_DEBUG_REPORT_OBJECT_TYPE_SHADER_MODULE_EXT );
 
 	SET_OBJECT_NAME( vk.modules.gamma_fs, "gamma post-processing fragment module", VK_DEBUG_REPORT_OBJECT_TYPE_SHADER_MODULE_EXT );
 	SET_OBJECT_NAME( vk.modules.gamma_vs, "gamma post-processing vertex module", VK_DEBUG_REPORT_OBJECT_TYPE_SHADER_MODULE_EXT );
@@ -4153,7 +4187,7 @@ void vk_initialize( void )
 		uint32_t i, maxSets;
 
 		pool_size[0].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-		pool_size[0].descriptorCount = MAX_DRAWIMAGES + 1 + 1 + 1 + VK_NUM_BLOOM_PASSES * 2 + 4; // color, screenmap, bloom descriptors, +4 for combined blur descriptor
+		pool_size[0].descriptorCount = MAX_DRAWIMAGES + 1 + 1 + 1 + VK_NUM_BLOOM_PASSES * 2 + 4 + MAX_SWAPCHAIN_IMAGES + 1; // color, screenmap, bloom descriptors, +4 for combined blur descriptor, virtual screen and its capture sources
 
 		pool_size[1].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
 		pool_size[1].descriptorCount = NUM_COMMAND_BUFFERS * 2; // binding 0 (fog/dlight) + binding 1 (per-view eyeProj)
@@ -4272,6 +4306,24 @@ void vk_initialize( void )
 		desc.pPushConstantRanges = NULL;
 
 		VK_CHECK( qvkCreatePipelineLayout( vk.device, &desc, NULL, &vk.pipeline_layout_post_process ) );
+
+		// r_foveationDebug: no sets, a small block for the fragment shader
+		{
+			VkPushConstantRange debug_range;
+
+			debug_range.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+			debug_range.offset = 0;
+			debug_range.size = 12 * sizeof( float );
+
+			desc.setLayoutCount = 0;
+			desc.pSetLayouts = NULL;
+			desc.pushConstantRangeCount = 1;
+			desc.pPushConstantRanges = &debug_range;
+			VK_CHECK( qvkCreatePipelineLayout( vk.device, &desc, NULL, &vk.pipeline_layout_foveation_debug ) );
+			desc.pSetLayouts = set_layouts;
+			desc.pushConstantRangeCount = 0;
+			desc.pPushConstantRanges = NULL;
+		}
 
 		desc.setLayoutCount = VK_NUM_BLOOM_PASSES;
 
@@ -4592,6 +4644,7 @@ void vk_shutdown( refShutdownCode_t code )
 	qvkDestroyPipelineLayout(vk.device, vk.pipeline_layout, NULL);
 	qvkDestroyPipelineLayout(vk.device, vk.pipeline_layout_storage, NULL);
 	qvkDestroyPipelineLayout(vk.device, vk.pipeline_layout_post_process, NULL);
+	qvkDestroyPipelineLayout(vk.device, vk.pipeline_layout_foveation_debug, NULL);
 	qvkDestroyPipelineLayout(vk.device, vk.pipeline_layout_blend, NULL);
 
 	// Post pass pipeline layouts
@@ -4703,6 +4756,13 @@ void vk_shutdown( refShutdownCode_t code )
 	qvkDestroyShaderModule(vk.device, vk.modules.gamma_fs, NULL);
 	qvkDestroyShaderModule(vk.device, vk.modules.foveationdebug_fs, NULL);
 
+	qvkDestroyShaderModule(vk.device, vk.modules.vscreen_vs, NULL);
+	qvkDestroyShaderModule(vk.device, vk.modules.vscreen_fs, NULL);
+	qvkDestroyShaderModule(vk.device, vk.modules.vscreen_reflect_fs, NULL);
+	qvkDestroyShaderModule(vk.device, vk.modules.floor_grid_fs, NULL);
+	qvkDestroyShaderModule(vk.device, vk.modules.vscreen_capture_vs, NULL);
+	qvkDestroyShaderModule(vk.device, vk.modules.vscreen_capture_fs, NULL);
+
 	// Null when the density map feature is absent, which vkDestroyShaderModule allows
 	qvkDestroyShaderModule(vk.device, vk.modules.final_composite_fov_fs, NULL);
 	qvkDestroyShaderModule(vk.device, vk.modules.gamma_fov_fs, NULL);
@@ -4786,6 +4846,10 @@ void vk_release_resources( void ) {
 	}
 	vk.bloom_blur_combined_descriptor = VK_NULL_HANDLE;
 	vk.xr.hudDescriptor = VK_NULL_HANDLE;
+	vk.xr.vscreenDescriptor = VK_NULL_HANDLE;
+	for ( i = 0; i < MAX_SWAPCHAIN_IMAGES; i++ ) {
+		vk.xr.vscreenSourceDescriptor[i] = VK_NULL_HANDLE;
+	}
 
 	// Reallocate the bloom-chain descriptor sets invalidated by the pool reset
 	// (quest has no desktop mirror or virtual screen mirror descriptors)
@@ -5665,7 +5729,7 @@ static void vk_create_foveation_debug_pipeline( VkRenderPass renderPass )
 	create_info.pMultisampleState = &multisample_state;
 	create_info.pDepthStencilState = &depth_stencil_state;
 	create_info.pColorBlendState = &blend_state;
-	create_info.layout = vk.pipeline_layout_post_process;
+	create_info.layout = vk.pipeline_layout_foveation_debug;
 	create_info.renderPass = renderPass;
 	create_info.subpass = 0;
 
@@ -5691,7 +5755,8 @@ void vk_draw_foveation_debug( void )
 	// The pass that carries the map: the split scene pass, or the main pass in direct mode
 	VkRenderPass pass = vk.fboActive ? vk.render_pass.fov_scene : vk.render_pass.main;
 
-	if ( !r_foveationDebug->integer || !vk.xr.foveationActive || !vk.inRenderPass ) {
+	// gl_FragSizeEXT means nothing outside the pass carrying the map
+	if ( !r_foveationDebug->integer || !vk.xr.mapPassOpen || !vk.inRenderPass || vk.inHudCommandBuffer ) {
 		return;
 	}
 	if ( pass == VK_NULL_HANDLE || vk.cmd == NULL || vk.cmd->command_buffer == VK_NULL_HANDLE ) {
@@ -5711,7 +5776,28 @@ void vk_draw_foveation_debug( void )
 		return;
 	}
 
-	qvkCmdBindPipeline( vk.cmd->command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, vk.foveation_debug_pipeline );
+	// Gaze and the bins as the renderer has them: offsets move the bins' corners with the gaze
+	{
+		float push[12];
+		int eye;
+
+		Com_Memset( push, 0, sizeof( push ) );
+		for ( eye = 0; eye < 2; eye++ ) {
+			push[eye * 2 + 0] = ( vk.xr.fdmCenter[eye][0] + 1.0f ) * 0.5f * (float)vk.xr.width;
+			push[eye * 2 + 1] = ( vk.xr.fdmCenter[eye][1] + 1.0f ) * 0.5f * (float)vk.xr.height;
+			if ( vk.xr.fdmOffsets ) {
+				push[4 + eye * 2 + 0] = (float)vk.xr.fdmOffset[eye][0];
+				push[4 + eye * 2 + 1] = (float)vk.xr.fdmOffset[eye][1];
+			}
+		}
+		push[8] = (float)vk.xr.tileWidth;
+		push[9] = (float)vk.xr.tileHeight;
+		push[10] = ( vk.xr.fdmLevel > 0 ) ? 1.0f : 0.0f;
+
+		qvkCmdBindPipeline( vk.cmd->command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, vk.foveation_debug_pipeline );
+		qvkCmdPushConstants( vk.cmd->command_buffer, vk.pipeline_layout_foveation_debug,
+			VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof( push ), push );
+	}
 	qvkCmdDraw( vk.cmd->command_buffer, 4, 1, 0, 0 );
 	vk.cmd->last_pipeline = VK_NULL_HANDLE;
 }
@@ -7165,7 +7251,8 @@ void vk_set_view_eyeproj( void )
 			// Portal cyclopean: no refdef-FOV override. The scope projection already matches the buffer.
 			Com_Memcpy( proj, backEnd.viewParms.projectionMatrix, sizeof( proj ) );
 			if ( !vr.weapon_zoomed ) {
-				proj[5] *= (float)glConfig.vidHeight / (float)glConfig.vidWidth;
+				// Square pixels across the crop, matching the main view below
+				proj[5] = copysignf( proj[0] * (float)glConfig.vidWidth / (float)glConfig.vidHeight, proj[5] );
 			}
 			proj[8] = 0.0f;
 			proj[9] = 0.0f;
@@ -7178,8 +7265,9 @@ void vk_set_view_eyeproj( void )
 				proj[0] = ( 1.0f / tan( DEG2RAD( backEnd.viewParms.fovX ) * 0.5f ) ) / cropFactor;
 				proj[5] = ( -1.0f / tan( DEG2RAD( backEnd.viewParms.fovY ) * 0.5f ) ) / cropFactor;
 			} else if ( !vr.weapon_zoomed ) {
-				// Virtual screen: 4:3 crop. The scope projection already matches the buffer.
-				proj[5] *= (float)glConfig.vidHeight / (float)glConfig.vidWidth;
+				// Virtual screen: the refdef's FOV across the crop with square pixels, never the runtime's
+				proj[0] = 1.0f / tan( DEG2RAD( backEnd.viewParms.fovX ) * 0.5f );
+				proj[5] = copysignf( proj[0] * (float)glConfig.vidWidth / (float)glConfig.vidHeight, proj[5] );
 			}
 			proj[8] = 0.0f;
 			proj[9] = 0.0f;
@@ -7263,7 +7351,7 @@ void vk_update_mvp( const float *m ) {
 		qboolean isVirtualScreen = VR_Gameplay_ShouldRenderInVirtualScreen();
 
 		float hudScale = 1.0f;
-		if ( backEnd.isDrawingHUD && hudStatus == 2 && !isVirtualScreen ) {
+		if ( backEnd.isDrawingHUD && hudStatus != 1 && !isVirtualScreen ) {
 			hudScale = ( vr_hudScale ? vr_hudScale->value : 1.0f ) * ( 2.0f / 3.0f );
 		}
 
@@ -7275,14 +7363,14 @@ void vk_update_mvp( const float *m ) {
 		float asymmetryOffsetY = perEye ? tr.vrParms.projectionEye[0][9] : 0.0f;
 
 		float depthOffset = 0.0f;
-		if ( backEnd.isDrawingHUD && hudStatus == 2 && !vr.first_person_following && !vr.weapon_zoomed ) {
+		if ( backEnd.isDrawingHUD && hudStatus != 1 && !vr.first_person_following && !vr.weapon_zoomed ) {
 			float hudDepth = vr_currentHudDepth ? vr_currentHudDepth->value : 3.0f;
 			float heightFraction = 0.05f / ( hudDepth + 1.0f );
 			depthOffset = heightFraction * (float)vk.renderHeight * mvp0;
 		}
 
 		float yOffset = 0.0f;
-		if ( backEnd.isDrawingHUD && hudStatus == 2 && !isVirtualScreen ) {
+		if ( backEnd.isDrawingHUD && hudStatus != 1 && !isVirtualScreen ) {
 			yOffset = -asymmetryOffsetY * 0.5f;
 			float userOffset = vr_hudYOffset ? vr_hudYOffset->value : 0.0f;
 			yOffset += -userOffset * mvp5 * 0.5f;
@@ -7823,7 +7911,7 @@ void vk_begin_main_render_pass( void )
 				// Already transitioned to post-bloom 2D (vk_finish_subpass_post changed renderPassIndex)
 				vk_end_post_scene_subpass();
 			} else {
-				qvkCmdEndRenderPass( vk.cmd->command_buffer );
+				vk_cmd_end_render_pass();
 				vk.inRenderPass = qfalse;
 			}
 		}
@@ -7919,6 +8007,8 @@ void vk_begin_main_render_pass( void )
 
 	qvkCmdBeginRenderPass( vk.cmd->command_buffer, &render_pass_begin_info, VK_SUBPASS_CONTENTS_INLINE );
 	vk.inRenderPass = qtrue;
+	// Split or direct, this is the pass carrying the map
+	vk.xr.mapPassOpen = vk.xr.foveationActive;
 
 	// Note: mono modelview is passed via push constants (64 bytes); per-eye
 	// projection lives in the ViewTransform UBO (set 0, binding 1)
@@ -7958,10 +8048,8 @@ void vk_end_render_pass( void )
 		return; // Not in a render pass, nothing to end
 	}
 
-	// Direct mode ends its scene pass here
-	if ( vk.renderPassIndex == RENDER_PASS_MAIN ) {
-		vk_draw_foveation_debug();
-	}
+	// Direct mode ends its scene pass here; vk_draw_foveation_debug skips every other pass
+	vk_draw_foveation_debug();
 
 	// For subpass-based render passes, need to advance to final subpass before ending
 	if ( vk.renderPassIndex == RENDER_PASS_MAIN_WITH_POST ) {
@@ -7977,7 +8065,7 @@ void vk_end_render_pass( void )
 		// Already in post-bloom 2D subpass (vk_finish_subpass_post changed renderPassIndex)
 		vk_end_post_scene_subpass();
 	} else {
-		qvkCmdEndRenderPass( vk.cmd->command_buffer );
+		vk_cmd_end_render_pass();
 		vk.inRenderPass = qfalse;
 	}
 }
@@ -8545,6 +8633,10 @@ void vk_end_frame( void )
 		}
 	}
 
+	if ( vk.xr.initialized && vk.recordingCommands && !vk.inRenderPass ) {
+		vk_render_virtual_screen();
+	}
+
 	// Only proceed if we're actually recording commands
 	if ( !vk.recordingCommands ) {
 		vk.renderPassIndex = RENDER_PASS_MAIN;
@@ -8609,7 +8701,7 @@ static qboolean vk_end_interrupted_pass( void )
 			// Already in final subpass, safe to end
 		}
 		// All other render pass types (RENDER_PASS_MAIN, HUD, etc.) just end directly
-		qvkCmdEndRenderPass( vk.cmd->command_buffer );
+		vk_cmd_end_render_pass();
 		vk.inRenderPass = qfalse;
 		vk.subpassPostDone = qfalse;
 	}
@@ -9034,7 +9126,7 @@ static void vk_begin_fov_post_pass( void )
 	VkRenderPassBeginInfo beginInfo;
 	const qboolean useBloom = ( r_bloom && r_bloom->integer );
 
-	qvkCmdEndRenderPass( vk.cmd->command_buffer );
+	vk_cmd_end_render_pass();
 
 	if ( useBloom && vk.blur_pipeline[0] != VK_NULL_HANDLE ) {
 		VkMemoryBarrier barrier;
@@ -9218,7 +9310,7 @@ void vk_finish_subpass_post( void )
 	else {
 		// Subpass pipelines not available, fall back to ending render pass normally
 		ri.Printf( PRINT_WARNING, "vk_finish_subpass_post: subpass pipelines not ready\n" );
-		qvkCmdEndRenderPass( vk.cmd->command_buffer );
+		vk_cmd_end_render_pass();
 		vk.inRenderPass = qfalse;
 		vk.renderPassIndex = RENDER_PASS_MAIN;  // Reset for subsequent rendering
 		// Note: don't set subpassPostDone: the subpass wasn't actually done
@@ -9244,7 +9336,7 @@ void vk_end_post_scene_subpass( void )
 		// End it anyway to maintain state consistency
 		ri.Printf( PRINT_WARNING, "vk_end_post_scene_subpass: not in post-bloom 2D subpass, ending render pass anyway\n" );
 		if ( vk.cmd && vk.cmd->command_buffer != VK_NULL_HANDLE ) {
-			qvkCmdEndRenderPass( vk.cmd->command_buffer );
+			vk_cmd_end_render_pass();
 		}
 		vk.inRenderPass = qfalse;
 		vk.renderPassIndex = RENDER_PASS_MAIN;
@@ -9259,7 +9351,7 @@ void vk_end_post_scene_subpass( void )
 	}
 
 	// End the render pass
-	qvkCmdEndRenderPass( vk.cmd->command_buffer );
+	vk_cmd_end_render_pass();
 	vk.inRenderPass = qfalse;
 	vk.renderPassIndex = RENDER_PASS_MAIN;  // Reset for subsequent rendering
 }
@@ -9283,7 +9375,8 @@ the eyes, so we write our own. R8G8_UNORM texels are the fraction of a fragment 
 shade per pixel. The tiler reads one texel per bin and holds it across the bin, and
 scales a bin by at most four per axis, so the map carries three levels at the
 resolution of bins. One map per swapchain image, rewritten in the frame that renders
-into it.
+into it -- or, where the device takes density map offsets, drawn once around a fixed
+point and slid onto the gaze as each scene pass ends.
 ================================================================================
 */
 
@@ -9318,7 +9411,13 @@ void vk_destroy_authored_fdm( void )
 		vk.xr.fdmUploaded[i] = qfalse;
 		vk.xr.fdmAppliedLevel[i] = -1;
 	}
+	if ( vk.xr.fdmScratch != NULL ) {
+		ri.Free( vk.xr.fdmScratch );
+		vk.xr.fdmScratch = NULL;
+	}
 	vk.xr.fdmAuthored = qfalse;
+	vk.xr.fdmOffsets = qfalse;
+	Com_Memset( vk.xr.fdmOffset, 0, sizeof( vk.xr.fdmOffset ) );
 }
 
 /*
@@ -9328,7 +9427,8 @@ vk_create_authored_fdm
 Fails clean so the caller can fall back to the runtime's map.
 ==================
 */
-static qboolean vk_create_authored_fdm( uint32_t imageCount, uint32_t layers, uint32_t fbWidth, uint32_t fbHeight )
+static qboolean vk_create_authored_fdm( uint32_t imageCount, uint32_t layers, uint32_t fbWidth, uint32_t fbHeight,
+	qboolean swapchainOffsets )
 {
 	VkImageCreateInfo imageInfo;
 	VkBufferCreateInfo bufferInfo;
@@ -9337,6 +9437,8 @@ static qboolean vk_create_authored_fdm( uint32_t imageCount, uint32_t layers, ui
 	// Finest granularity the device reads: a coarser grid measured no faster, and this gives smoother density steps
 	const uint32_t texelW = vk.xr.fdmTexelWidth ? vk.xr.fdmTexelWidth : VK_FDM_TEXEL_SIZE;
 	const uint32_t texelH = vk.xr.fdmTexelHeight ? vk.xr.fdmTexelHeight : VK_FDM_TEXEL_SIZE;
+	// Offsets need every attachment flagged; direct rendering attaches the swapchain images too
+	const qboolean offsets = ( vk.xr.fdmOffsetSupported && ( vk.fboActive || swapchainOffsets ) ) ? qtrue : qfalse;
 	uint32_t mapWidth, mapHeight, memoryType, i;
 	VkDeviceSize bufferSize;
 
@@ -9350,6 +9452,7 @@ static qboolean vk_create_authored_fdm( uint32_t imageCount, uint32_t layers, ui
 
 	Com_Memset( &imageInfo, 0, sizeof( imageInfo ) );
 	imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+	imageInfo.flags = offsets ? VK_IMAGE_CREATE_FRAGMENT_DENSITY_MAP_OFFSET_BIT_QCOM : 0;
 	imageInfo.imageType = VK_IMAGE_TYPE_2D;
 	imageInfo.format = VK_FDM_FORMAT;
 	imageInfo.extent.width = mapWidth;
@@ -9411,7 +9514,12 @@ static qboolean vk_create_authored_fdm( uint32_t imageCount, uint32_t layers, ui
 		vk.xr.fdmAppliedLevel[i] = -1;
 	}
 
+	if ( offsets ) {
+		vk.xr.fdmScratch = (byte*)ri.Malloc( (int)bufferSize );
+	}
+
 	vk.xr.fdmAuthored = qtrue;
+	vk.xr.fdmOffsets = offsets;
 	vk.xr.fdmLayers = layers;
 	vk.xr.foveationWidth = mapWidth;
 	vk.xr.foveationHeight = mapHeight;
@@ -9553,6 +9661,272 @@ static void vk_write_fdm_texels( byte *dst, uint32_t width, uint32_t height, uin
 
 /*
 ==================
+vk_fdm_reference_points
+
+Each eye's map is drawn around its optical axis. With the bin known, the point moves to
+the middle of the bin holding the axis: the tiler samples the map at bin centers, and the
+offsets keep that lattice fixed in the map, so the gaze always lands mid-bin.
+==================
+*/
+static void vk_fdm_reference_points( void )
+{
+	const float width = (float)vk.xr.width;
+	const float height = (float)vk.xr.height;
+	int eye;
+
+	for ( eye = 0; eye < 2; eye++ ) {
+		const float spanX = vk.xr.fdmFovTan[eye][1] - vk.xr.fdmFovTan[eye][0];
+		const float spanY = vk.xr.fdmFovTan[eye][2] - vk.xr.fdmFovTan[eye][3];
+		float axisX = ( spanX > 1e-6f ) ? -vk.xr.fdmFovTan[eye][0] / spanX * width : 0.5f * width;
+		float axisY = ( spanY > 1e-6f ) ? vk.xr.fdmFovTan[eye][2] / spanY * height : 0.5f * height;
+
+		if ( axisX < 0.0f ) axisX = 0.0f; else if ( axisX > width - 1.0f ) axisX = width - 1.0f;
+		if ( axisY < 0.0f ) axisY = 0.0f; else if ( axisY > height - 1.0f ) axisY = height - 1.0f;
+
+		if ( vk.xr.tileWidth > 0 && vk.xr.tileHeight > 0 ) {
+			vk.xr.fdmRef[eye][0] = (int32_t)( ( (uint32_t)axisX / vk.xr.tileWidth ) * vk.xr.tileWidth + vk.xr.tileWidth / 2 );
+			vk.xr.fdmRef[eye][1] = (int32_t)( ( (uint32_t)axisY / vk.xr.tileHeight ) * vk.xr.tileHeight + vk.xr.tileHeight / 2 );
+		} else {
+			vk.xr.fdmRef[eye][0] = (int32_t)axisX;
+			vk.xr.fdmRef[eye][1] = (int32_t)axisY;
+		}
+	}
+}
+
+/*
+==================
+vk_write_fdm_texels_fixed
+
+The offset map, drawn with the gaze on each eye's reference point. Eccentricity is taken
+as if that point were the optical axis, which only overstates the sharp region once the
+eye turns. With the bin known, a texel takes the level its bin's nearest point to the
+gaze asks for, so a bin the sharp region reaches is sharp all through: the levels are
+the least resolution out to their angle, however coarse the bins.
+==================
+*/
+static void vk_write_fdm_texels_fixed( byte *dst, uint32_t width, uint32_t height, uint32_t layers,
+	int level, qboolean eyeTracked )
+{
+	const float texelW = (float)vk.xr.fdmTexelWidth;
+	const float texelH = (float)vk.xr.fdmTexelHeight;
+	const float tileW = (float)vk.xr.tileWidth;
+	const float tileH = (float)vk.xr.tileHeight;
+	const qboolean binned = ( vk.xr.tileWidth > 0 && vk.xr.tileHeight > 0 ) ? qtrue : qfalse;
+	float sharpDeg, coarseDeg, midDeg, sharp2, mid2, coarse2, t;
+	uint32_t layer, y, x;
+
+	vk_foveation_level_angles( level, eyeTracked, &sharpDeg, &coarseDeg );
+	midDeg = 0.5f * ( sharpDeg + coarseDeg );
+	t = tanf( (float)DEG2RAD( sharpDeg ) ); sharp2 = t * t;
+	t = tanf( (float)DEG2RAD( midDeg ) ); mid2 = t * t;
+	t = tanf( (float)DEG2RAD( coarseDeg ) ); coarse2 = t * t;
+
+	for ( layer = 0; layer < layers; layer++ ) {
+		const int eye = ( layer < 2 ) ? (int)layer : 0;
+		const float spanX = vk.xr.fdmFovTan[eye][1] - vk.xr.fdmFovTan[eye][0];
+		const float spanY = vk.xr.fdmFovTan[eye][2] - vk.xr.fdmFovTan[eye][3];
+		const float tanPerPxX = ( vk.xr.width > 0 ) ? spanX / (float)vk.xr.width : 0.0f;
+		const float tanPerPxY = ( vk.xr.height > 0 ) ? spanY / (float)vk.xr.height : 0.0f;
+		const float refX = (float)vk.xr.fdmRef[eye][0];
+		const float refY = (float)vk.xr.fdmRef[eye][1];
+
+		for ( y = 0; y < height; y++ ) {
+			float py = ( (float)y + 0.5f ) * texelH;
+			float dy;
+
+			if ( binned ) {
+				const float y0 = floorf( py / tileH ) * tileH;
+				py = ( refY < y0 ) ? y0 : ( refY > y0 + tileH ) ? y0 + tileH : refY;
+			}
+			dy = ( py - refY ) * tanPerPxY;
+
+			for ( x = 0; x < width; x++ ) {
+				float px = ( (float)x + 0.5f ) * texelW;
+				float dx, r2;
+				byte value;
+
+				if ( binned ) {
+					const float x0 = floorf( px / tileW ) * tileW;
+					px = ( refX < x0 ) ? x0 : ( refX > x0 + tileW ) ? x0 + tileW : refX;
+				}
+				dx = ( px - refX ) * tanPerPxX;
+				r2 = dx * dx + dy * dy;
+
+				// Same four values as the gaze-drawn map, for the same reasons
+				if ( r2 < sharp2 ) {
+					value = 255;  // 1x1
+				} else if ( r2 < mid2 ) {
+					value = 127;  // 2x2
+				} else if ( r2 < coarse2 ) {
+					value = 64;   // 2x4
+				} else {
+					value = 63;   // 4x4
+				}
+				dst[0] = value;
+				dst[1] = value;
+				dst += 2;
+			}
+		}
+	}
+}
+
+/*
+==================
+vk_update_fixed_fdm
+
+Turnip reads the map on the host as the pass is recorded, so a copy recorded into the
+frame would land after the read. The map changes only with the level, the field of
+view or the bins, so it is uploaded and waited on out of band, and never mid-flight.
+==================
+*/
+static void vk_update_fixed_fdm( void )
+{
+	const size_t size = (size_t)vk.xr.foveationWidth * vk.xr.foveationHeight * vk.xr.fdmLayers * 2;
+	const int level = ( vk.xr.fdmLevel > 0 ) ? vk.xr.fdmLevel : 0;
+	qboolean changed = qfalse;
+	uint32_t count = 0, i;
+	int eye;
+
+	if ( vk.xr.fdmScratch == NULL ) {
+		return;
+	}
+
+	vk_fdm_reference_points();
+	if ( level == 0 ) {
+		Com_Memset( vk.xr.fdmScratch, 0xFF, size );
+	} else {
+		vk_write_fdm_texels_fixed( vk.xr.fdmScratch, vk.xr.foveationWidth, vk.xr.foveationHeight,
+			vk.xr.fdmLayers, level, vk.xr.fdmEyeTracked );
+	}
+
+	for ( i = 0; i < MAX_SWAPCHAIN_IMAGES && vk.xr.fdmImage[i] != VK_NULL_HANDLE; i++ ) {
+		if ( !vk.xr.fdmUploaded[i] ) {
+			changed = qtrue;
+		}
+		count++;
+	}
+	if ( count == 0 ) {
+		return;
+	}
+	if ( !changed && memcmp( vk.xr.fdmScratch, vk.xr.fdmStagingMapped[0], size ) != 0 ) {
+		changed = qtrue;
+	}
+
+	if ( changed ) {
+		VkCommandBuffer commandBuffer = begin_command_buffer();
+		VkImageMemoryBarrier barrier;
+		VkBufferImageCopy region;
+
+		Com_Memset( &barrier, 0, sizeof( barrier ) );
+		barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+		barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+		barrier.subresourceRange.levelCount = 1;
+		barrier.subresourceRange.layerCount = vk.xr.fdmLayers;
+
+		Com_Memset( &region, 0, sizeof( region ) );
+		region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+		region.imageSubresource.layerCount = vk.xr.fdmLayers;
+		region.imageExtent.width = vk.xr.foveationWidth;
+		region.imageExtent.height = vk.xr.foveationHeight;
+		region.imageExtent.depth = 1;
+
+		for ( i = 0; i < count; i++ ) {
+			Com_Memcpy( vk.xr.fdmStagingMapped[i], vk.xr.fdmScratch, size );
+
+			barrier.image = vk.xr.fdmImage[i];
+			barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+			barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+			barrier.srcAccessMask = 0;
+			barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+			qvkCmdPipelineBarrier( commandBuffer,
+				VK_PIPELINE_STAGE_FRAGMENT_DENSITY_PROCESS_BIT_EXT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+				0, 0, NULL, 0, NULL, 1, &barrier );
+
+			qvkCmdCopyBufferToImage( commandBuffer, vk.xr.fdmStaging[i], vk.xr.fdmImage[i],
+				VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region );
+
+			barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+			barrier.newLayout = VK_IMAGE_LAYOUT_FRAGMENT_DENSITY_MAP_OPTIMAL_EXT;
+			barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+			barrier.dstAccessMask = VK_ACCESS_FRAGMENT_DENSITY_MAP_READ_BIT_EXT;
+			qvkCmdPipelineBarrier( commandBuffer,
+				VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_DENSITY_PROCESS_BIT_EXT,
+				0, 0, NULL, 0, NULL, 1, &barrier );
+
+			vk.xr.fdmUploaded[i] = qtrue;
+			vk.xr.fdmAppliedLevel[i] = level;
+			vk.xr.fdmAppliedEyeTracked[i] = vk.xr.fdmEyeTracked;
+		}
+
+		end_command_buffer( commandBuffer, __func__ );
+		ri.Printf( PRINT_DEVELOPER, "Density map redrawn for offsets: level %d%s, references %d,%d and %d,%d\n",
+			level, vk.xr.fdmEyeTracked ? " eye tracked" : "",
+			vk.xr.fdmRef[0][0], vk.xr.fdmRef[0][1], vk.xr.fdmRef[1][0], vk.xr.fdmRef[1][1] );
+	}
+
+	// Where the gaze sits relative to each reference point, in whole steps of the granularity
+	for ( eye = 0; eye < 2; eye++ ) {
+		const int32_t granX = (int32_t)vk.xr.fdmOffsetGranularity[0];
+		const int32_t granY = (int32_t)vk.xr.fdmOffsetGranularity[1];
+		float gx = ( vk.xr.fdmCenter[eye][0] + 1.0f ) * 0.5f * (float)vk.xr.width;
+		float gy = ( vk.xr.fdmCenter[eye][1] + 1.0f ) * 0.5f * (float)vk.xr.height;
+		float dx, dy;
+
+		if ( level == 0 ) {
+			vk.xr.fdmOffset[eye][0] = vk.xr.fdmOffset[eye][1] = 0;
+			continue;
+		}
+		if ( gx < 0.0f ) gx = 0.0f; else if ( gx > (float)vk.xr.width ) gx = (float)vk.xr.width;
+		if ( gy < 0.0f ) gy = 0.0f; else if ( gy > (float)vk.xr.height ) gy = (float)vk.xr.height;
+		dx = ( gx - (float)vk.xr.fdmRef[eye][0] ) / (float)granX;
+		dy = ( gy - (float)vk.xr.fdmRef[eye][1] ) / (float)granY;
+		vk.xr.fdmOffset[eye][0] = (int32_t)floorf( dx + 0.5f ) * granX;
+		vk.xr.fdmOffset[eye][1] = (int32_t)floorf( dy + 0.5f ) * granY;
+	}
+}
+
+/*
+==================
+vk_cmd_end_render_pass
+
+Ends the frame's open pass; a scene pass in offset mode ends carrying the gaze offsets.
+==================
+*/
+static void vk_cmd_end_render_pass( void )
+{
+	const qboolean offsetPass = ( vk.xr.mapPassOpen && vk.xr.fdmOffsets ) ? qtrue : qfalse;
+
+	vk.xr.mapPassOpen = qfalse;
+	if ( offsetPass && qvkCmdEndRenderPass2KHR != NULL ) {
+		VkSubpassFragmentDensityMapOffsetEndInfoQCOM offsetInfo;
+		VkSubpassEndInfo endInfo;
+		VkOffset2D offsets[2];
+		uint32_t eye;
+
+		for ( eye = 0; eye < 2; eye++ ) {
+			offsets[eye].x = vk.xr.fdmOffset[eye][0];
+			offsets[eye].y = vk.xr.fdmOffset[eye][1];
+		}
+
+		Com_Memset( &offsetInfo, 0, sizeof( offsetInfo ) );
+		offsetInfo.sType = VK_STRUCTURE_TYPE_SUBPASS_FRAGMENT_DENSITY_MAP_OFFSET_END_INFO_QCOM;
+		offsetInfo.fragmentDensityOffsetCount = ( vk.xr.fdmLayers < 2 ) ? vk.xr.fdmLayers : 2;
+		offsetInfo.pFragmentDensityOffsets = offsets;
+
+		Com_Memset( &endInfo, 0, sizeof( endInfo ) );
+		endInfo.sType = VK_STRUCTURE_TYPE_SUBPASS_END_INFO;
+		endInfo.pNext = &offsetInfo;
+		qvkCmdEndRenderPass2KHR( vk.cmd->command_buffer, &endInfo );
+		return;
+	}
+
+	qvkCmdEndRenderPass( vk.cmd->command_buffer );
+}
+
+/*
+==================
 vk_update_authored_fdm
 
 Recorded before the scene render pass opens, and only when the map changed.
@@ -9570,6 +9944,10 @@ void vk_update_authored_fdm( uint32_t index )
 		return;
 	}
 	if ( !vk.cmd || vk.cmd->command_buffer == VK_NULL_HANDLE ) {
+		return;
+	}
+	if ( vk.xr.fdmOffsets ) {
+		vk_update_fixed_fdm();
 		return;
 	}
 
@@ -9708,16 +10086,23 @@ int vk_foveation_block_at( int eye, float ndcX, float ndcY )
 		return 8;
 	}
 
-	// Map texel under the position; the map runs the same way as the image
-	fx = ( ndcX * 0.5f + 0.5f ) * (float)vk.renderWidth / (float)vk.xr.fdmTexelWidth;
-	fy = ( ndcY * 0.5f + 0.5f ) * (float)vk.renderHeight / (float)vk.xr.fdmTexelHeight;
+	layer = ( eye > 0 && vk.xr.fdmLayers > 1 ) ? 1 : 0;
+
+	// Map texel under the position; the map runs the same way as the image, shifted by any gaze offset
+	fx = ( ndcX * 0.5f + 0.5f ) * (float)vk.renderWidth;
+	fy = ( ndcY * 0.5f + 0.5f ) * (float)vk.renderHeight;
+	if ( vk.xr.fdmOffsets ) {
+		fx -= (float)vk.xr.fdmOffset[layer][0];
+		fy -= (float)vk.xr.fdmOffset[layer][1];
+	}
+	fx /= (float)vk.xr.fdmTexelWidth;
+	fy /= (float)vk.xr.fdmTexelHeight;
 	if ( fx < 0.0f ) fx = 0.0f;
 	if ( fy < 0.0f ) fy = 0.0f;
 	tx = (uint32_t)fx;
 	ty = (uint32_t)fy;
 	if ( tx >= vk.xr.foveationWidth ) tx = vk.xr.foveationWidth - 1;
 	if ( ty >= vk.xr.foveationHeight ) ty = vk.xr.foveationHeight - 1;
-	layer = ( eye > 0 && vk.xr.fdmLayers > 1 ) ? 1 : 0;
 
 	map = (const byte*)vk.xr.fdmStagingMapped[vk.xr.colorIndex];
 	density = (float)map[ ( ( (size_t)layer * vk.xr.foveationHeight + ty ) * vk.xr.foveationWidth + tx ) * 2 ] / 255.0f;
@@ -9746,33 +10131,184 @@ Print it once per framebuffer set; it is the number that says how much of the fa
 survives, and whether the bin grid is a strip grid or something square.
 ==================
 */
+// Any alignment, unlike PAD
+#define ROUND_UP( value, alignment ) ( ( ( value ) + ( alignment ) - 1 ) / ( alignment ) * ( alignment ) )
+
+static uint32_t vk_turnip_gmem_cpp( VkFormat format )
+{
+	switch ( format ) {
+		case VK_FORMAT_R8G8B8A8_UNORM:
+		case VK_FORMAT_R8G8B8A8_SRGB:
+		case VK_FORMAT_B8G8R8A8_UNORM:
+		case VK_FORMAT_B8G8R8A8_SRGB:
+		case VK_FORMAT_A2B10G10R10_UNORM_PACK32:
+		case VK_FORMAT_A2R10G10B10_UNORM_PACK32:
+		case VK_FORMAT_D24_UNORM_S8_UINT:
+		case VK_FORMAT_X8_D24_UNORM_PACK32:
+		case VK_FORMAT_D32_SFLOAT:
+			return 4;
+		case VK_FORMAT_R16G16B16A16_SFLOAT:
+		case VK_FORMAT_R16G16B16A16_UNORM:
+			return 8;
+		default:
+			return 0;  // separate stencil and the rest change the alignment this does not model
+	}
+}
+
+// Whether the A7xx LRZ fast-clear flag RAM (1024 bytes) covers a two-layer depth image this size
+static qboolean vk_turnip_lrz_fc_covered( uint32_t width, uint32_t height, uint32_t samples )
+{
+	uint32_t pitch, rows, layerSize;
+
+	// LRZ covers the supersampled surface (fdl6_lrz_get_super_sampled_size)
+	if ( samples >= 2 ) height *= 2;
+	if ( samples >= 4 ) width *= 2;
+	if ( samples >= 8 ) height *= 2;
+	pitch = ROUND_UP( ( width + 7 ) / 8, 32 );
+	rows = ROUND_UP( ( height + 7 ) / 8, 32 );
+	layerSize = pitch * rows * 2;
+
+	return ( ROUND_UP( layerSize >> 7, 512 ) / 8 * 2 <= 1024 ) ? qtrue : qfalse;
+}
+
+/*
+==================
+vk_turnip_offset_tile_limit
+
+A depth image made for density map offsets gets its LRZ padded by the largest tile that
+keeps LRZ fast clears, and the tiles are then held to that (fdl6_lrz_get_max_fdm_extra_size).
+==================
+*/
+static void vk_turnip_offset_tile_limit( uint32_t width, uint32_t height, uint32_t samples,
+	uint32_t *limitW, uint32_t *limitH )
+{
+	uint32_t extra;
+
+	*limitW = 2016;
+	*limitH = 2032;
+	if ( !vk_turnip_lrz_fc_covered( width, height, samples ) ) {
+		return;
+	}
+	for ( extra = 2016; extra > 192; extra -= 4 ) {
+		if ( vk_turnip_lrz_fc_covered( width + extra, height + extra, samples ) ) {
+			*limitW = extra / 16 * 16;
+			*limitH = extra / 4 * 4;
+			return;
+		}
+	}
+}
+
+/*
+==================
+vk_assume_turnip_tile_size
+
+Turnip reports no bin size. This mirrors its tiling choice (tu_util.cc) for an Adreno
+750 and the scene pass: 3 MB of GMEM less the A750's VPC attribute buffer and the eighth
+of the color CCU cache a density map pass keeps clear, shared between the color and depth
+held in GMEM by their bytes a pixel (the MSAA resolve target is not), both views to a
+bin, and the fewest bins with no side over twice the other. Stale if Turnip changes its
+tiling; the log says the size was assumed.
+==================
+*/
+static qboolean vk_assume_turnip_tile_size( uint32_t width, uint32_t height, uint32_t *tileW, uint32_t *tileH )
+{
+	const uint32_t gmemSize = 3 * 1024 * 1024 - 6 * 0xc000 - ( 6 * 64 * 1024 ) / 8;
+	const uint32_t alignW = 96, alignH = 32, layers = 2;
+	const uint32_t gmemAlign = 8 * alignW * alignH;
+	const uint32_t samples = vk.msaaActive ? (uint32_t)vkSamples : 1;
+	VkPhysicalDeviceProperties props;
+	uint32_t cpp[2], cppTotal, blocks, pixels, i, w, best = ~0u, bestW = 0, bestH = 0;
+	uint32_t maxW = 2016, maxH = 2032;
+
+	qvkGetPhysicalDeviceProperties( vk.physical_device, &props );
+	if ( !strstr( props.deviceName, "Turnip" ) || !strstr( props.deviceName, "750" ) ) {
+		return qfalse;
+	}
+	cpp[0] = vk_turnip_gmem_cpp( vk.color_format ) * samples;
+	cpp[1] = vk_turnip_gmem_cpp( vk.depth_format ) * samples;
+	if ( cpp[0] == 0 || cpp[1] == 0 ) {
+		return qfalse;
+	}
+	if ( vk.xr.fdmOffsets ) {
+		vk_turnip_offset_tile_limit( width, height, samples, &maxW, &maxH );
+	}
+
+	blocks = gmemSize / gmemAlign;
+	cppTotal = cpp[0] + cpp[1];
+	pixels = ~0u;
+	for ( i = 0; i < 2; i++ ) {
+		// Wide pixels take whole pairs (or more) of blocks
+		const uint32_t align = ( cpp[i] >> 3 ) ? ( cpp[i] >> 3 ) : 1;
+		uint32_t n = ( blocks * cpp[i] / cppTotal ) & ~( align - 1 );
+		if ( n < align ) n = align;
+		blocks -= n;
+		cppTotal -= cpp[i];
+		if ( n * gmemAlign / cpp[i] < pixels ) pixels = n * gmemAlign / cpp[i];
+	}
+
+	for ( w = alignW; w <= maxW && w <= ROUND_UP( width, alignW ); w += alignW ) {
+		uint32_t h = pixels / ( w * layers ), countW, countH, total;
+
+		if ( h > maxH ) h = maxH;
+		if ( h > ROUND_UP( height, alignH ) ) h = ROUND_UP( height, alignH );
+		h = h / alignH * alignH;
+		if ( h == 0 ) {
+			continue;
+		}
+		total = ( w > h * 2 || h > w * 2 ) ? 1000 : 0;
+		countW = ( width + w - 1 ) / w;
+		countH = ( height + h - 1 ) / h;
+		h = ROUND_UP( ( height + countH - 1 ) / countH, alignH );
+		total += countW * countH;
+		if ( total < best || ( total == best && abs( (int)w - (int)h ) < abs( (int)bestW - (int)bestH ) ) ) {
+			best = total;
+			bestW = w;
+			bestH = h;
+		}
+	}
+	if ( bestW == 0 ) {
+		return qfalse;
+	}
+
+	*tileW = bestW;
+	*tileH = bestH;
+	return qtrue;
+}
+
 static void vk_log_tile_size( VkFramebuffer framebuffer, const char *pass )
 {
 	VkTilePropertiesQCOM props;
 	uint32_t count = 1;
+	const char *source = "reported";
 
-	if ( qvkGetFramebufferTilePropertiesQCOM == NULL || framebuffer == VK_NULL_HANDLE ) {
+	vk.xr.tileWidth = 0;
+	vk.xr.tileHeight = 0;
+	vk.xr.tileAssumed = qfalse;
+
+	if ( qvkGetFramebufferTilePropertiesQCOM != NULL && framebuffer != VK_NULL_HANDLE ) {
+		Com_Memset( &props, 0, sizeof( props ) );
+		props.sType = VK_STRUCTURE_TYPE_TILE_PROPERTIES_QCOM;
+		if ( qvkGetFramebufferTilePropertiesQCOM( vk.device, framebuffer, &count, &props ) < VK_SUCCESS || count == 0 ) {
+			ri.Printf( PRINT_WARNING, "Tile size for the %s pass: query failed\n", pass );
+			return;
+		}
+		vk.xr.tileWidth = props.tileSize.width;
+		vk.xr.tileHeight = props.tileSize.height;
+	} else if ( vk_assume_turnip_tile_size( vk.xr.width, vk.xr.height, &vk.xr.tileWidth, &vk.xr.tileHeight ) ) {
+		vk.xr.tileAssumed = qtrue;
+		source = "assumed from Turnip's tiling";
+	} else {
 		return;
 	}
-
-	Com_Memset( &props, 0, sizeof( props ) );
-	props.sType = VK_STRUCTURE_TYPE_TILE_PROPERTIES_QCOM;
-	if ( qvkGetFramebufferTilePropertiesQCOM( vk.device, framebuffer, &count, &props ) < VK_SUCCESS || count == 0 ) {
-		ri.Printf( PRINT_WARNING, "Tile size for the %s pass: query failed\n", pass );
-		return;
-	}
-
-	vk.xr.tileWidth = props.tileSize.width;
-	vk.xr.tileHeight = props.tileSize.height;
 
 	// Bins per eye buffer, and how many map texels fall inside one bin, since that is what gets thrown away
-	ri.Printf( PRINT_ALL, "Tile size for the %s pass: %ux%u (%ux%u bins over %ux%u, %ux%u map texels a bin)\n",
-		pass, props.tileSize.width, props.tileSize.height,
-		props.tileSize.width ? ( vk.xr.width + props.tileSize.width - 1 ) / props.tileSize.width : 0,
-		props.tileSize.height ? ( vk.xr.height + props.tileSize.height - 1 ) / props.tileSize.height : 0,
+	ri.Printf( PRINT_ALL, "Tile size for the %s pass: %ux%u %s (%ux%u bins over %ux%u, %ux%u map texels a bin)\n",
+		pass, vk.xr.tileWidth, vk.xr.tileHeight, source,
+		vk.xr.tileWidth ? ( vk.xr.width + vk.xr.tileWidth - 1 ) / vk.xr.tileWidth : 0,
+		vk.xr.tileHeight ? ( vk.xr.height + vk.xr.tileHeight - 1 ) / vk.xr.tileHeight : 0,
 		vk.xr.width, vk.xr.height,
-		vk.xr.fdmTexelWidth ? props.tileSize.width / vk.xr.fdmTexelWidth : 0,
-		vk.xr.fdmTexelHeight ? props.tileSize.height / vk.xr.fdmTexelHeight : 0 );
+		vk.xr.fdmTexelWidth ? vk.xr.tileWidth / vk.xr.fdmTexelWidth : 0,
+		vk.xr.fdmTexelHeight ? vk.xr.tileHeight / vk.xr.fdmTexelHeight : 0 );
 }
 
 
@@ -11052,6 +11588,871 @@ static qboolean vk_recreate_xr_render_pass( VkFormat colorFormat, VkFormat depth
 }
 
 /*
+==============================================================================
+
+VIRTUAL SCREEN
+
+Menus, the console, loading and spectating: the finished mono frame's 4:3 crop
+is sampled out of layer 0 and drawn back, in stereo, as a curved screen standing
+on a floor grid.
+
+==============================================================================
+*/
+
+#define VSCREEN_SEGMENTS	64
+#define VSCREEN_MIP_LEVELS	5
+// Must match SPAN in vscreen_reflect.frag
+#define VSCREEN_REFLECT_SPAN	0.25f
+
+
+static void vk_destroy_virtual_screen( void )
+{
+	VkXrResources *xr = &vk.xr;
+	uint32_t i;
+
+	if ( xr->vscreenCapturePipeline != VK_NULL_HANDLE ) {
+		qvkDestroyPipeline( vk.device, xr->vscreenCapturePipeline, NULL );
+		xr->vscreenCapturePipeline = VK_NULL_HANDLE;
+	}
+	if ( xr->vscreenPipeline != VK_NULL_HANDLE ) {
+		qvkDestroyPipeline( vk.device, xr->vscreenPipeline, NULL );
+		xr->vscreenPipeline = VK_NULL_HANDLE;
+	}
+	if ( xr->vscreenReflectPipeline != VK_NULL_HANDLE ) {
+		qvkDestroyPipeline( vk.device, xr->vscreenReflectPipeline, NULL );
+		xr->vscreenReflectPipeline = VK_NULL_HANDLE;
+	}
+	if ( xr->floorGridPipeline != VK_NULL_HANDLE ) {
+		qvkDestroyPipeline( vk.device, xr->floorGridPipeline, NULL );
+		xr->floorGridPipeline = VK_NULL_HANDLE;
+	}
+	for ( i = 0; i < MAX_SWAPCHAIN_IMAGES; i++ ) {
+		if ( xr->vscreenFramebuffers[i] != VK_NULL_HANDLE ) {
+			qvkDestroyFramebuffer( vk.device, xr->vscreenFramebuffers[i], NULL );
+			xr->vscreenFramebuffers[i] = VK_NULL_HANDLE;
+		}
+	}
+	if ( vk.render_pass.virtualScreen != VK_NULL_HANDLE ) {
+		qvkDestroyRenderPass( vk.device, vk.render_pass.virtualScreen, NULL );
+		vk.render_pass.virtualScreen = VK_NULL_HANDLE;
+	}
+	if ( xr->vscreenCaptureFramebuffer != VK_NULL_HANDLE ) {
+		qvkDestroyFramebuffer( vk.device, xr->vscreenCaptureFramebuffer, NULL );
+		xr->vscreenCaptureFramebuffer = VK_NULL_HANDLE;
+	}
+	if ( vk.render_pass.virtualScreenCapture != VK_NULL_HANDLE ) {
+		qvkDestroyRenderPass( vk.device, vk.render_pass.virtualScreenCapture, NULL );
+		vk.render_pass.virtualScreenCapture = VK_NULL_HANDLE;
+	}
+	if ( xr->vscreenSampler != VK_NULL_HANDLE ) {
+		qvkDestroySampler( vk.device, xr->vscreenSampler, NULL );
+		xr->vscreenSampler = VK_NULL_HANDLE;
+	}
+	if ( xr->vscreenSourceSampler != VK_NULL_HANDLE ) {
+		qvkDestroySampler( vk.device, xr->vscreenSourceSampler, NULL );
+		xr->vscreenSourceSampler = VK_NULL_HANDLE;
+	}
+	if ( xr->vscreenView != VK_NULL_HANDLE ) {
+		qvkDestroyImageView( vk.device, xr->vscreenView, NULL );
+		xr->vscreenView = VK_NULL_HANDLE;
+	}
+	if ( xr->vscreenMip0View != VK_NULL_HANDLE ) {
+		qvkDestroyImageView( vk.device, xr->vscreenMip0View, NULL );
+		xr->vscreenMip0View = VK_NULL_HANDLE;
+	}
+	if ( xr->vscreenImage != VK_NULL_HANDLE ) {
+		qvkDestroyImage( vk.device, xr->vscreenImage, NULL );
+		xr->vscreenImage = VK_NULL_HANDLE;
+	}
+	if ( xr->vscreenMemory != VK_NULL_HANDLE ) {
+		qvkFreeMemory( vk.device, xr->vscreenMemory, NULL );
+		xr->vscreenMemory = VK_NULL_HANDLE;
+	}
+	// The pool-owned sets stay allocated: vk_create_virtual_screen rewrites them, a pool reset nulls them
+}
+
+
+static VkPipeline vk_create_virtual_screen_pipeline( VkShaderModule fs, qboolean blend, const char *name )
+{
+	VkXrResources *xr = &vk.xr;
+	VkPipelineShaderStageCreateInfo stages[2];
+	VkVertexInputBindingDescription binding;
+	VkVertexInputAttributeDescription attrs[2];
+	VkPipelineVertexInputStateCreateInfo vertexInput;
+	VkPipelineInputAssemblyStateCreateInfo inputAssembly;
+	VkPipelineRasterizationStateCreateInfo raster;
+	VkPipelineMultisampleStateCreateInfo multisample;
+	VkPipelineColorBlendAttachmentState attachmentBlend;
+	VkPipelineColorBlendStateCreateInfo blendState;
+	VkViewport viewport;
+	VkRect2D scissor;
+	VkPipelineViewportStateCreateInfo viewportState;
+	VkGraphicsPipelineCreateInfo ci;
+	VkPipeline pipeline = VK_NULL_HANDLE;
+
+	set_shader_stage_desc( &stages[0], VK_SHADER_STAGE_VERTEX_BIT, vk.modules.vscreen_vs, "main" );
+	set_shader_stage_desc( &stages[1], VK_SHADER_STAGE_FRAGMENT_BIT, fs, "main" );
+
+	binding.binding = 0;
+	binding.stride = 5 * sizeof( float );
+	binding.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+	attrs[0].location = 0;
+	attrs[0].binding = 0;
+	attrs[0].format = VK_FORMAT_R32G32B32_SFLOAT;
+	attrs[0].offset = 0;
+	attrs[1].location = 1;
+	attrs[1].binding = 0;
+	attrs[1].format = VK_FORMAT_R32G32_SFLOAT;
+	attrs[1].offset = 3 * sizeof( float );
+
+	Com_Memset( &vertexInput, 0, sizeof( vertexInput ) );
+	vertexInput.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+	vertexInput.vertexBindingDescriptionCount = 1;
+	vertexInput.pVertexBindingDescriptions = &binding;
+	vertexInput.vertexAttributeDescriptionCount = 2;
+	vertexInput.pVertexAttributeDescriptions = attrs;
+
+	Com_Memset( &inputAssembly, 0, sizeof( inputAssembly ) );
+	inputAssembly.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+	inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
+
+	Com_Memset( &raster, 0, sizeof( raster ) );
+	raster.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+	raster.polygonMode = VK_POLYGON_MODE_FILL;
+	raster.cullMode = VK_CULL_MODE_NONE;
+	raster.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+	raster.lineWidth = 1.0f;
+
+	Com_Memset( &multisample, 0, sizeof( multisample ) );
+	multisample.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+	multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+	multisample.minSampleShading = 1.0f;
+
+	// Blended draws leave alpha at the clear's 1: the projection layer blends by source alpha
+	Com_Memset( &attachmentBlend, 0, sizeof( attachmentBlend ) );
+	attachmentBlend.blendEnable = blend ? VK_TRUE : VK_FALSE;
+	attachmentBlend.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+	attachmentBlend.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+	attachmentBlend.colorBlendOp = VK_BLEND_OP_ADD;
+	attachmentBlend.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+	attachmentBlend.dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
+	attachmentBlend.alphaBlendOp = VK_BLEND_OP_ADD;
+	attachmentBlend.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT;
+	if ( !blend ) {
+		attachmentBlend.colorWriteMask |= VK_COLOR_COMPONENT_A_BIT;
+	}
+
+	Com_Memset( &blendState, 0, sizeof( blendState ) );
+	blendState.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+	blendState.attachmentCount = 1;
+	blendState.pAttachments = &attachmentBlend;
+
+	viewport.x = 0.0f;
+	viewport.y = 0.0f;
+	viewport.width = (float)xr->width;
+	viewport.height = (float)xr->height;
+	viewport.minDepth = 0.0f;
+	viewport.maxDepth = 1.0f;
+	scissor.offset.x = 0;
+	scissor.offset.y = 0;
+	scissor.extent.width = xr->width;
+	scissor.extent.height = xr->height;
+
+	Com_Memset( &viewportState, 0, sizeof( viewportState ) );
+	viewportState.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+	viewportState.viewportCount = 1;
+	viewportState.pViewports = &viewport;
+	viewportState.scissorCount = 1;
+	viewportState.pScissors = &scissor;
+
+	Com_Memset( &ci, 0, sizeof( ci ) );
+	ci.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+	ci.stageCount = 2;
+	ci.pStages = stages;
+	ci.pVertexInputState = &vertexInput;
+	ci.pInputAssemblyState = &inputAssembly;
+	ci.pViewportState = &viewportState;
+	ci.pRasterizationState = &raster;
+	ci.pMultisampleState = &multisample;
+	ci.pColorBlendState = &blendState;
+	ci.layout = vk.pipeline_layout;
+	ci.renderPass = vk.render_pass.virtualScreen;
+	ci.subpass = 0;
+	ci.basePipelineIndex = -1;
+
+	if ( qvkCreateGraphicsPipelines( vk.device, vk.pipelineCache, 1, &ci, NULL, &pipeline ) != VK_SUCCESS ) {
+		return VK_NULL_HANDLE;
+	}
+	SET_OBJECT_NAME( pipeline, name, VK_DEBUG_REPORT_OBJECT_TYPE_PIPELINE_EXT );
+	return pipeline;
+}
+
+
+static VkPipeline vk_create_virtual_screen_capture_pipeline( void )
+{
+	VkXrResources *xr = &vk.xr;
+	const int32_t specData[2] = { (int32_t)xr->vscreenX, (int32_t)xr->vscreenY };
+	VkSpecializationMapEntry specEntries[2];
+	VkSpecializationInfo specInfo;
+	VkPipelineShaderStageCreateInfo stages[2];
+	VkPipelineVertexInputStateCreateInfo vertexInput;
+	VkPipelineInputAssemblyStateCreateInfo inputAssembly;
+	VkPipelineRasterizationStateCreateInfo raster;
+	VkPipelineMultisampleStateCreateInfo multisample;
+	VkPipelineColorBlendAttachmentState attachmentBlend;
+	VkPipelineColorBlendStateCreateInfo blendState;
+	VkViewport viewport;
+	VkRect2D scissor;
+	VkPipelineViewportStateCreateInfo viewportState;
+	VkGraphicsPipelineCreateInfo ci;
+	VkPipeline pipeline = VK_NULL_HANDLE;
+
+	specEntries[0].constantID = 0;
+	specEntries[0].offset = 0;
+	specEntries[0].size = sizeof( int32_t );
+	specEntries[1].constantID = 1;
+	specEntries[1].offset = sizeof( int32_t );
+	specEntries[1].size = sizeof( int32_t );
+	specInfo.mapEntryCount = 2;
+	specInfo.pMapEntries = specEntries;
+	specInfo.dataSize = sizeof( specData );
+	specInfo.pData = specData;
+
+	set_shader_stage_desc( &stages[0], VK_SHADER_STAGE_VERTEX_BIT, vk.modules.vscreen_capture_vs, "main" );
+	set_shader_stage_desc( &stages[1], VK_SHADER_STAGE_FRAGMENT_BIT, vk.modules.vscreen_capture_fs, "main" );
+	stages[1].pSpecializationInfo = &specInfo;
+
+	Com_Memset( &vertexInput, 0, sizeof( vertexInput ) );
+	vertexInput.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+
+	Com_Memset( &inputAssembly, 0, sizeof( inputAssembly ) );
+	inputAssembly.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+	inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+
+	Com_Memset( &raster, 0, sizeof( raster ) );
+	raster.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+	raster.polygonMode = VK_POLYGON_MODE_FILL;
+	raster.cullMode = VK_CULL_MODE_NONE;
+	raster.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+	raster.lineWidth = 1.0f;
+
+	Com_Memset( &multisample, 0, sizeof( multisample ) );
+	multisample.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+	multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+	multisample.minSampleShading = 1.0f;
+
+	Com_Memset( &attachmentBlend, 0, sizeof( attachmentBlend ) );
+	attachmentBlend.blendEnable = VK_FALSE;
+	attachmentBlend.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+		VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+
+	Com_Memset( &blendState, 0, sizeof( blendState ) );
+	blendState.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+	blendState.attachmentCount = 1;
+	blendState.pAttachments = &attachmentBlend;
+
+	viewport.x = 0.0f;
+	viewport.y = 0.0f;
+	viewport.width = (float)xr->vscreenWidth;
+	viewport.height = (float)xr->vscreenHeight;
+	viewport.minDepth = 0.0f;
+	viewport.maxDepth = 1.0f;
+	scissor.offset.x = 0;
+	scissor.offset.y = 0;
+	scissor.extent.width = xr->vscreenWidth;
+	scissor.extent.height = xr->vscreenHeight;
+
+	Com_Memset( &viewportState, 0, sizeof( viewportState ) );
+	viewportState.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+	viewportState.viewportCount = 1;
+	viewportState.pViewports = &viewport;
+	viewportState.scissorCount = 1;
+	viewportState.pScissors = &scissor;
+
+	Com_Memset( &ci, 0, sizeof( ci ) );
+	ci.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+	ci.stageCount = 2;
+	ci.pStages = stages;
+	ci.pVertexInputState = &vertexInput;
+	ci.pInputAssemblyState = &inputAssembly;
+	ci.pViewportState = &viewportState;
+	ci.pRasterizationState = &raster;
+	ci.pMultisampleState = &multisample;
+	ci.pColorBlendState = &blendState;
+	ci.layout = vk.pipeline_layout_post_process;
+	ci.renderPass = vk.render_pass.virtualScreenCapture;
+	ci.subpass = 0;
+	ci.basePipelineIndex = -1;
+
+	if ( qvkCreateGraphicsPipelines( vk.device, vk.pipelineCache, 1, &ci, NULL, &pipeline ) != VK_SUCCESS ) {
+		return VK_NULL_HANDLE;
+	}
+	SET_OBJECT_NAME( pipeline, "virtual screen capture pipeline", VK_DEBUG_REPORT_OBJECT_TYPE_PIPELINE_EXT );
+	return pipeline;
+}
+
+
+static void vk_write_virtual_screen_set( VkDescriptorSet set, VkSampler sampler, VkImageView view )
+{
+	VkDescriptorImageInfo imageInfo;
+	VkWriteDescriptorSet write;
+
+	imageInfo.sampler = sampler;
+	imageInfo.imageView = view;
+	imageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+	Com_Memset( &write, 0, sizeof( write ) );
+	write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+	write.dstSet = set;
+	write.dstBinding = 0;
+	write.descriptorCount = 1;
+	write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+	write.pImageInfo = &imageInfo;
+	qvkUpdateDescriptorSets( vk.device, 1, &write, 0, NULL );
+}
+
+
+static qboolean vk_create_virtual_screen( void )
+{
+	VkXrResources *xr = &vk.xr;
+	const VkFormat format = xr->colorInfo->format;
+	const VkFormatFeatureFlags blitFeatures = VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT |
+		VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
+	const uint32_t viewMask = 3;
+	VkFormatProperties formatProps;
+	VkImageCreateInfo imageCI;
+	VkImageFormatListCreateInfo formatList;
+	VkFormat viewFormats[2];
+	VkMemoryRequirements memReqs;
+	VkMemoryAllocateInfo allocInfo;
+	VkImageViewCreateInfo viewCI;
+	VkSamplerCreateInfo samplerCI;
+	VkAttachmentDescription attachment;
+	VkAttachmentReference colorRef;
+	VkSubpassDescription subpass;
+	VkSubpassDependency deps[2];
+	VkRenderPassCreateInfo capturePassCI;
+	VkRenderPassMultiviewCreateInfo multiview;
+	VkRenderPassCreateInfo passCI;
+	VkFramebufferCreateInfo fbCI;
+	int rect[4];
+	uint32_t i;
+
+	vk_destroy_virtual_screen();
+
+	VR_ScreenCaptureRect( xr->width, xr->height, xr->width, xr->height, 0.0f, 0.0f, rect );
+	xr->vscreenX = rect[0];
+	xr->vscreenY = rect[1];
+	xr->vscreenWidth = rect[2] - rect[0];
+	xr->vscreenHeight = rect[3] - rect[1];
+
+	// The mip chain is built by linear blits; without them the reflection is sharp instead of blurred
+	qvkGetPhysicalDeviceFormatProperties( vk.physical_device, format, &formatProps );
+	xr->vscreenMips = ( formatProps.optimalTilingFeatures & blitFeatures ) == blitFeatures ? VSCREEN_MIP_LEVELS : 1;
+
+	// The swapchain's own format, so the capture's UNORM texel copy is byte-exact
+	Com_Memset( &imageCI, 0, sizeof( imageCI ) );
+	imageCI.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+	imageCI.flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+	imageCI.imageType = VK_IMAGE_TYPE_2D;
+	imageCI.format = format;
+	imageCI.extent.width = xr->vscreenWidth;
+	imageCI.extent.height = xr->vscreenHeight;
+	imageCI.extent.depth = 1;
+	imageCI.mipLevels = xr->vscreenMips;
+	imageCI.arrayLayers = 1;
+	imageCI.samples = VK_SAMPLE_COUNT_1_BIT;
+	imageCI.tiling = VK_IMAGE_TILING_OPTIMAL;
+	imageCI.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+		VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+	imageCI.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+	imageCI.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+	// Naming both view formats lets the driver keep the image compressed
+	if ( vk.imageFormatList ) {
+		viewFormats[0] = format;
+		viewFormats[1] = vk_get_unorm_format( format );
+		Com_Memset( &formatList, 0, sizeof( formatList ) );
+		formatList.sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO;
+		formatList.viewFormatCount = ( viewFormats[1] == viewFormats[0] ) ? 1 : 2;
+		formatList.pViewFormats = viewFormats;
+		imageCI.pNext = &formatList;
+	}
+	VK_CHECK( qvkCreateImage( vk.device, &imageCI, NULL, &xr->vscreenImage ) );
+	SET_OBJECT_NAME( xr->vscreenImage, "virtual screen image", VK_DEBUG_REPORT_OBJECT_TYPE_IMAGE_EXT );
+
+	qvkGetImageMemoryRequirements( vk.device, xr->vscreenImage, &memReqs );
+	Com_Memset( &allocInfo, 0, sizeof( allocInfo ) );
+	allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+	allocInfo.allocationSize = memReqs.size;
+	allocInfo.memoryTypeIndex = find_memory_type( memReqs.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT );
+	VK_CHECK( qvkAllocateMemory( vk.device, &allocInfo, NULL, &xr->vscreenMemory ) );
+	VK_CHECK( qvkBindImageMemory( vk.device, xr->vscreenImage, xr->vscreenMemory, 0 ) );
+
+	Com_Memset( &viewCI, 0, sizeof( viewCI ) );
+	viewCI.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+	viewCI.image = xr->vscreenImage;
+	viewCI.viewType = VK_IMAGE_VIEW_TYPE_2D;
+	viewCI.format = vk_get_unorm_format( format );
+	viewCI.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+	viewCI.subresourceRange.levelCount = xr->vscreenMips;
+	viewCI.subresourceRange.layerCount = 1;
+	VK_CHECK( qvkCreateImageView( vk.device, &viewCI, NULL, &xr->vscreenView ) );
+	SET_OBJECT_NAME( xr->vscreenView, "virtual screen view", VK_DEBUG_REPORT_OBJECT_TYPE_IMAGE_VIEW_EXT );
+
+	viewCI.subresourceRange.levelCount = 1;
+	VK_CHECK( qvkCreateImageView( vk.device, &viewCI, NULL, &xr->vscreenMip0View ) );
+	SET_OBJECT_NAME( xr->vscreenMip0View, "virtual screen mip 0 view", VK_DEBUG_REPORT_OBJECT_TYPE_IMAGE_VIEW_EXT );
+
+	Com_Memset( &samplerCI, 0, sizeof( samplerCI ) );
+	samplerCI.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+	samplerCI.magFilter = VK_FILTER_LINEAR;
+	samplerCI.minFilter = VK_FILTER_LINEAR;
+	samplerCI.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+	samplerCI.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+	samplerCI.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+	samplerCI.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+	samplerCI.maxAnisotropy = 1.0f;
+	samplerCI.maxLod = (float)xr->vscreenMips;
+	samplerCI.borderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK;
+	VK_CHECK( qvkCreateSampler( vk.device, &samplerCI, NULL, &xr->vscreenSampler ) );
+	SET_OBJECT_NAME( xr->vscreenSampler, "virtual screen sampler", VK_DEBUG_REPORT_OBJECT_TYPE_SAMPLER_EXT );
+
+	samplerCI.magFilter = VK_FILTER_NEAREST;
+	samplerCI.minFilter = VK_FILTER_NEAREST;
+	samplerCI.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+	samplerCI.maxLod = 0.0f;
+	VK_CHECK( qvkCreateSampler( vk.device, &samplerCI, NULL, &xr->vscreenSourceSampler ) );
+	SET_OBJECT_NAME( xr->vscreenSourceSampler, "virtual screen source sampler", VK_DEBUG_REPORT_OBJECT_TYPE_SAMPLER_EXT );
+
+	// Capture: every texel of mip 0 is written, and TRANSFER_SRC feeds the first mip blit
+	Com_Memset( &attachment, 0, sizeof( attachment ) );
+	attachment.format = vk_get_unorm_format( format );
+	attachment.samples = VK_SAMPLE_COUNT_1_BIT;
+	attachment.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+	attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+	attachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+	attachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+	attachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+	attachment.finalLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+
+	colorRef.attachment = 0;
+	colorRef.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+
+	Com_Memset( &subpass, 0, sizeof( subpass ) );
+	subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+	subpass.colorAttachmentCount = 1;
+	subpass.pColorAttachments = &colorRef;
+
+	// Waits for the previous screen frame's sampling of mip 0
+	deps[0].srcSubpass = VK_SUBPASS_EXTERNAL;
+	deps[0].dstSubpass = 0;
+	deps[0].srcStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+	deps[0].dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+	deps[0].srcAccessMask = 0;
+	deps[0].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+	deps[0].dependencyFlags = 0;
+	deps[1].srcSubpass = 0;
+	deps[1].dstSubpass = VK_SUBPASS_EXTERNAL;
+	deps[1].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+	deps[1].dstStageMask = VK_PIPELINE_STAGE_TRANSFER_BIT;
+	deps[1].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+	deps[1].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+	deps[1].dependencyFlags = 0;
+
+	Com_Memset( &capturePassCI, 0, sizeof( capturePassCI ) );
+	capturePassCI.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+	capturePassCI.attachmentCount = 1;
+	capturePassCI.pAttachments = &attachment;
+	capturePassCI.subpassCount = 1;
+	capturePassCI.pSubpasses = &subpass;
+	capturePassCI.dependencyCount = 2;
+	capturePassCI.pDependencies = deps;
+	VK_CHECK( qvkCreateRenderPass( vk.device, &capturePassCI, NULL, &vk.render_pass.virtualScreenCapture ) );
+	SET_OBJECT_NAME( vk.render_pass.virtualScreenCapture, "render pass - virtual screen capture", VK_DEBUG_REPORT_OBJECT_TYPE_RENDER_PASS_EXT );
+
+	Com_Memset( &fbCI, 0, sizeof( fbCI ) );
+	fbCI.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+	fbCI.renderPass = vk.render_pass.virtualScreenCapture;
+	fbCI.attachmentCount = 1;
+	fbCI.pAttachments = &xr->vscreenMip0View;
+	fbCI.width = xr->vscreenWidth;
+	fbCI.height = xr->vscreenHeight;
+	fbCI.layers = 1;
+	VK_CHECK( qvkCreateFramebuffer( vk.device, &fbCI, NULL, &xr->vscreenCaptureFramebuffer ) );
+	SET_OBJECT_NAME( xr->vscreenCaptureFramebuffer, "virtual screen capture framebuffer", VK_DEBUG_REPORT_OBJECT_TYPE_FRAMEBUFFER_EXT );
+
+	Com_Memset( &attachment, 0, sizeof( attachment ) );
+	attachment.format = vk_get_unorm_format( format );
+	attachment.samples = VK_SAMPLE_COUNT_1_BIT;
+	attachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+	attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+	attachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+	attachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+	// The capture left layer 0 in SHADER_READ; the pass redraws everything
+	attachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+	attachment.finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+
+	colorRef.attachment = 0;
+	colorRef.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+
+	Com_Memset( &subpass, 0, sizeof( subpass ) );
+	subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+	subpass.colorAttachmentCount = 1;
+	subpass.pColorAttachments = &colorRef;
+
+	// Waits for the capture's reads of layer 0 and the mip blits' writes to the screen image
+	deps[0].srcSubpass = VK_SUBPASS_EXTERNAL;
+	deps[0].dstSubpass = 0;
+	deps[0].srcStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
+	deps[0].dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+	deps[0].srcAccessMask = 0;
+	deps[0].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+	deps[0].dependencyFlags = 0;
+	deps[1].srcSubpass = 0;
+	deps[1].dstSubpass = VK_SUBPASS_EXTERNAL;
+	deps[1].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+	deps[1].dstStageMask = VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT;
+	deps[1].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+	deps[1].dstAccessMask = 0;
+	deps[1].dependencyFlags = 0;
+
+	Com_Memset( &multiview, 0, sizeof( multiview ) );
+	multiview.sType = VK_STRUCTURE_TYPE_RENDER_PASS_MULTIVIEW_CREATE_INFO;
+	multiview.subpassCount = 1;
+	multiview.pViewMasks = &viewMask;
+	multiview.correlationMaskCount = 1;
+	multiview.pCorrelationMasks = &viewMask;
+
+	Com_Memset( &passCI, 0, sizeof( passCI ) );
+	passCI.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+	passCI.pNext = &multiview;
+	passCI.attachmentCount = 1;
+	passCI.pAttachments = &attachment;
+	passCI.subpassCount = 1;
+	passCI.pSubpasses = &subpass;
+	passCI.dependencyCount = 2;
+	passCI.pDependencies = deps;
+	VK_CHECK( qvkCreateRenderPass( vk.device, &passCI, NULL, &vk.render_pass.virtualScreen ) );
+	SET_OBJECT_NAME( vk.render_pass.virtualScreen, "render pass - virtual screen", VK_DEBUG_REPORT_OBJECT_TYPE_RENDER_PASS_EXT );
+
+	for ( i = 0; i < xr->colorInfo->imageCount && i < MAX_SWAPCHAIN_IMAGES; i++ ) {
+		Com_Memset( &fbCI, 0, sizeof( fbCI ) );
+		fbCI.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+		fbCI.renderPass = vk.render_pass.virtualScreen;
+		fbCI.attachmentCount = 1;
+		fbCI.pAttachments = &xr->gammaViews[i];
+		fbCI.width = xr->width;
+		fbCI.height = xr->height;
+		fbCI.layers = 1;
+		VK_CHECK( qvkCreateFramebuffer( vk.device, &fbCI, NULL, &xr->vscreenFramebuffers[i] ) );
+		SET_OBJECT_NAME( xr->vscreenFramebuffers[i], va( "virtual screen framebuffer %d", i ), VK_DEBUG_REPORT_OBJECT_TYPE_FRAMEBUFFER_EXT );
+	}
+
+	xr->vscreenPipeline = vk_create_virtual_screen_pipeline( vk.modules.vscreen_fs, qfalse, "virtual screen pipeline" );
+	xr->vscreenReflectPipeline = vk_create_virtual_screen_pipeline( vk.modules.vscreen_reflect_fs, qtrue, "virtual screen reflection pipeline" );
+	xr->floorGridPipeline = vk_create_virtual_screen_pipeline( vk.modules.floor_grid_fs, qtrue, "floor grid pipeline" );
+	xr->vscreenCapturePipeline = vk_create_virtual_screen_capture_pipeline();
+	if ( xr->vscreenPipeline == VK_NULL_HANDLE || xr->vscreenReflectPipeline == VK_NULL_HANDLE ||
+		xr->floorGridPipeline == VK_NULL_HANDLE || xr->vscreenCapturePipeline == VK_NULL_HANDLE ) {
+		vk_destroy_virtual_screen();
+		return qfalse;
+	}
+
+	// Sets that survived an XR reinit still point at the views and samplers just replaced
+	if ( xr->vscreenDescriptor != VK_NULL_HANDLE ) {
+		vk_write_virtual_screen_set( xr->vscreenDescriptor, xr->vscreenSampler, xr->vscreenView );
+	}
+	for ( i = 0; i < MAX_SWAPCHAIN_IMAGES; i++ ) {
+		if ( xr->vscreenSourceDescriptor[i] != VK_NULL_HANDLE && xr->gammaViews[i] != VK_NULL_HANDLE ) {
+			vk_write_virtual_screen_set( xr->vscreenSourceDescriptor[i], xr->vscreenSourceSampler, xr->gammaViews[i] );
+		}
+	}
+
+	ri.Printf( PRINT_ALL, "Virtual screen: %ux%u crop, %u mips%s\n", xr->vscreenWidth, xr->vscreenHeight, xr->vscreenMips,
+		vk.imageFormatList ? ", view formats listed" : "" );
+	return qtrue;
+}
+
+
+// A pool reset during a map load frees the sets, so they are made again on first use
+static qboolean vk_virtual_screen_set( VkDescriptorSet *set, VkSampler sampler, VkImageView view )
+{
+	VkDescriptorSetAllocateInfo allocInfo;
+
+	if ( *set != VK_NULL_HANDLE ) {
+		return qtrue;
+	}
+
+	Com_Memset( &allocInfo, 0, sizeof( allocInfo ) );
+	allocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+	allocInfo.descriptorPool = vk.descriptor_pool;
+	allocInfo.descriptorSetCount = 1;
+	allocInfo.pSetLayouts = &vk.set_layout_sampler;
+	if ( qvkAllocateDescriptorSets( vk.device, &allocInfo, set ) != VK_SUCCESS ) {
+		*set = VK_NULL_HANDLE;
+		return qfalse;
+	}
+
+	vk_write_virtual_screen_set( *set, sampler, view );
+	return qtrue;
+}
+
+
+// The screen texture's set and the capture's source set for this frame's swapchain image
+static qboolean vk_virtual_screen_descriptors( void )
+{
+	VkXrResources *xr = &vk.xr;
+
+	return vk_virtual_screen_set( &xr->vscreenDescriptor, xr->vscreenSampler, xr->vscreenView ) &&
+		vk_virtual_screen_set( &xr->vscreenSourceDescriptor[xr->colorIndex], xr->vscreenSourceSampler, xr->gammaViews[xr->colorIndex] );
+}
+
+
+static void vk_virtual_screen_barrier( VkImage image, uint32_t baseMip, uint32_t mipCount,
+	VkImageLayout oldLayout, VkImageLayout newLayout, VkAccessFlags srcAccess, VkAccessFlags dstAccess,
+	VkPipelineStageFlags srcStage, VkPipelineStageFlags dstStage )
+{
+	VkImageMemoryBarrier barrier;
+
+	Com_Memset( &barrier, 0, sizeof( barrier ) );
+	barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+	barrier.srcAccessMask = srcAccess;
+	barrier.dstAccessMask = dstAccess;
+	barrier.oldLayout = oldLayout;
+	barrier.newLayout = newLayout;
+	barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barrier.image = image;
+	barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+	barrier.subresourceRange.baseMipLevel = baseMip;
+	barrier.subresourceRange.levelCount = mipCount;
+	barrier.subresourceRange.baseArrayLayer = 0;
+	// All layers: a sampled view's whole range must be in the layout its descriptor names
+	barrier.subresourceRange.layerCount = VK_REMAINING_ARRAY_LAYERS;
+	qvkCmdPipelineBarrier( vk.cmd->command_buffer, srcStage, dstStage, 0, 0, NULL, 0, NULL, 1, &barrier );
+}
+
+
+// The swapchain's last pass wrote it as an attachment in both r_fbo modes; the capture samples it
+static void vk_virtual_screen_source_barrier( void )
+{
+	VkXrResources *xr = &vk.xr;
+
+	vk_virtual_screen_barrier( xr->colorInfo->images[xr->colorIndex], 0, 1,
+		VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+		VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+		VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT );
+}
+
+
+// Samples the crop out of layer 0 into mip 0 and builds the mip chain the reflection samples
+static void vk_capture_virtual_screen( void )
+{
+	VkXrResources *xr = &vk.xr;
+	VkRenderPassBeginInfo begin;
+	uint32_t i;
+
+	// Waits for the previous screen frame's sampling, earlier on the same queue
+	if ( xr->vscreenMips > 1 ) {
+		vk_virtual_screen_barrier( xr->vscreenImage, 1, xr->vscreenMips - 1,
+			VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+			0, VK_ACCESS_TRANSFER_WRITE_BIT,
+			VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT );
+	}
+
+	Com_Memset( &begin, 0, sizeof( begin ) );
+	begin.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+	begin.renderPass = vk.render_pass.virtualScreenCapture;
+	begin.framebuffer = xr->vscreenCaptureFramebuffer;
+	begin.renderArea.extent.width = xr->vscreenWidth;
+	begin.renderArea.extent.height = xr->vscreenHeight;
+	qvkCmdBeginRenderPass( vk.cmd->command_buffer, &begin, VK_SUBPASS_CONTENTS_INLINE );
+	qvkCmdBindPipeline( vk.cmd->command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, xr->vscreenCapturePipeline );
+	qvkCmdBindDescriptorSets( vk.cmd->command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+		vk.pipeline_layout_post_process, 0, 1, &xr->vscreenSourceDescriptor[xr->colorIndex], 0, NULL );
+	qvkCmdDraw( vk.cmd->command_buffer, 3, 1, 0, 0 );
+	qvkCmdEndRenderPass( vk.cmd->command_buffer );
+
+	for ( i = 1; i < xr->vscreenMips; i++ ) {
+		VkImageBlit blit;
+
+		// Mip 0 leaves the capture pass already in TRANSFER_SRC
+		if ( i > 1 ) {
+			vk_virtual_screen_barrier( xr->vscreenImage, i - 1, 1,
+				VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+				VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+				VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT );
+		}
+
+		Com_Memset( &blit, 0, sizeof( blit ) );
+		blit.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+		blit.srcSubresource.mipLevel = i - 1;
+		blit.srcSubresource.layerCount = 1;
+		blit.srcOffsets[1].x = MAX( 1, (int32_t)( xr->vscreenWidth >> ( i - 1 ) ) );
+		blit.srcOffsets[1].y = MAX( 1, (int32_t)( xr->vscreenHeight >> ( i - 1 ) ) );
+		blit.srcOffsets[1].z = 1;
+		blit.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+		blit.dstSubresource.mipLevel = i;
+		blit.dstSubresource.layerCount = 1;
+		blit.dstOffsets[1].x = MAX( 1, (int32_t)( xr->vscreenWidth >> i ) );
+		blit.dstOffsets[1].y = MAX( 1, (int32_t)( xr->vscreenHeight >> i ) );
+		blit.dstOffsets[1].z = 1;
+		qvkCmdBlitImage( vk.cmd->command_buffer,
+			xr->vscreenImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+			xr->vscreenImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+			1, &blit, VK_FILTER_LINEAR );
+	}
+
+	if ( xr->vscreenMips > 1 ) {
+		vk_virtual_screen_barrier( xr->vscreenImage, 0, xr->vscreenMips - 1,
+			VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+			VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_READ_BIT,
+			VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT );
+		vk_virtual_screen_barrier( xr->vscreenImage, xr->vscreenMips - 1, 1,
+			VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+			VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+			VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT );
+	} else {
+		vk_virtual_screen_barrier( xr->vscreenImage, 0, 1,
+			VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+			VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_READ_BIT,
+			VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT );
+	}
+}
+
+
+// Vertices go in the frame's ring: nothing to rebuild when the curvature slider moves
+static uint32_t vk_virtual_screen_vertices( const float *vertices, uint32_t floatCount )
+{
+	const uint32_t size = floatCount * sizeof( float );
+	const uint32_t offset = PAD( vk.cmd->vertex_buffer_offset, 16 );
+
+	if ( offset + size > vk.geometry_buffer_size ) {
+		vk.geometry_buffer_size_new = log2pad( offset + size, 1 );
+		return ~0U;
+	}
+	Com_Memcpy( vk.cmd->vertex_buffer_ptr + offset, vertices, size );
+	vk.cmd->vertex_buffer_offset = offset + size;
+	return offset;
+}
+
+
+// A strip from row v0 down to the bottom edge, at scale 1
+static uint32_t vk_virtual_screen_strip( const vrScreenGeometry_t *unit, float v0, uint32_t *vertexCount )
+{
+	float vertices[( VSCREEN_SEGMENTS + 1 ) * 2 * 5];
+	const int segments = unit->curved ? VSCREEN_SEGMENTS : 1;
+	float *p = vertices;
+	int i;
+
+	for ( i = 0; i <= segments; i++ ) {
+		const float u = (float)i / (float)segments;
+
+		VR_ScreenLocalPoint( unit, u, v0, p );
+		p[3] = u;
+		p[4] = v0;
+		p += 5;
+		VR_ScreenLocalPoint( unit, u, 1.0f, p );
+		p[3] = u;
+		p[4] = 1.0f;
+		p += 5;
+	}
+	*vertexCount = ( segments + 1 ) * 2;
+	return vk_virtual_screen_vertices( vertices, *vertexCount * 5 );
+}
+
+
+static void vk_draw_virtual_screen_mesh( VkPipeline pipeline, const float model[16], uint32_t offset, uint32_t vertexCount )
+{
+	VkDeviceSize vertexOffset = offset;
+
+	qvkCmdBindPipeline( vk.cmd->command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline );
+	qvkCmdPushConstants( vk.cmd->command_buffer, vk.pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT, 0, 64, model );
+	qvkCmdBindVertexBuffers( vk.cmd->command_buffer, 0, 1, &vk.cmd->vertex_buffer, &vertexOffset );
+	qvkCmdDraw( vk.cmd->command_buffer, vertexCount, 1, 0, 0 );
+}
+
+
+/*
+ * vk_render_virtual_screen - on screen frames, redraw the finished frame as the virtual screen
+ *
+ * Runs after the mode's last pass, which leaves the swapchain in COLOR_ATTACHMENT_OPTIMAL
+ * in both r_fbo modes. Gameplay frames return at the first test.
+ */
+static void vk_render_virtual_screen( void )
+{
+	static const float floorQuad[4 * 5] = {
+		-0.5f, 0.0f, -0.5f,   0.0f, 0.0f,
+		 0.5f, 0.0f, -0.5f,   1.0f, 0.0f,
+		-0.5f, 0.0f,  0.5f,   0.0f, 1.0f,
+		 0.5f, 0.0f,  0.5f,   1.0f, 1.0f,
+	};
+	VkXrResources *xr = &vk.xr;
+	vrScreenDraw_t draw;
+	float savedEyeProj[2][16];
+	uint32_t eyeProjOffset, floorOffset, screenOffset, reflectOffset, screenCount, reflectCount;
+	VkRenderPassBeginInfo begin;
+	VkClearValue clear;
+	qboolean ready;
+
+	if ( !VR_VirtualScreen_GetDraw( &draw ) ) {
+		return;
+	}
+	if ( vk.render_pass.virtualScreen == VK_NULL_HANDLE || xr->colorIndex >= MAX_SWAPCHAIN_IMAGES ||
+		xr->vscreenFramebuffers[xr->colorIndex] == VK_NULL_HANDLE ) {
+		return;
+	}
+
+	// Anything missing still clears to black: a screen frame never shows the flat frame
+	ready = xr->vscreenImage != VK_NULL_HANDLE && vk_virtual_screen_descriptors() ? qtrue : qfalse;
+
+	vk_virtual_screen_source_barrier();
+	eyeProjOffset = reflectOffset = screenOffset = floorOffset = ~0U;
+	reflectCount = screenCount = 0;
+	if ( ready ) {
+		vk_capture_virtual_screen();
+
+		// This frame's eyes through the standard set 0 binding 1 slot, leaving the view's pair untouched
+		Com_Memcpy( savedEyeProj, vk_view_eyeproj, sizeof( savedEyeProj ) );
+		Com_Memcpy( vk_view_eyeproj, draw.eyeProj, sizeof( savedEyeProj ) );
+		eyeProjOffset = VK_PushEyeProj();
+		Com_Memcpy( vk_view_eyeproj, savedEyeProj, sizeof( savedEyeProj ) );
+
+		reflectOffset = vk_virtual_screen_strip( &draw.unit, 1.0f - VSCREEN_REFLECT_SPAN, &reflectCount );
+		screenOffset = vk_virtual_screen_strip( &draw.unit, 0.0f, &screenCount );
+		floorOffset = vk_virtual_screen_vertices( floorQuad, ARRAY_LEN( floorQuad ) );
+	}
+
+	Com_Memset( &clear, 0, sizeof( clear ) );
+	clear.color.float32[3] = 1.0f;
+	Com_Memset( &begin, 0, sizeof( begin ) );
+	begin.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+	begin.renderPass = vk.render_pass.virtualScreen;
+	begin.framebuffer = xr->vscreenFramebuffers[xr->colorIndex];
+	begin.renderArea.extent.width = xr->width;
+	begin.renderArea.extent.height = xr->height;
+	begin.clearValueCount = 1;
+	begin.pClearValues = &clear;
+	qvkCmdBeginRenderPass( vk.cmd->command_buffer, &begin, VK_SUBPASS_CONTENTS_INLINE );
+
+	// A full ring clears to black and skips the draws; the next frame resizes the ring and is dropped
+	if ( eyeProjOffset != ~0U && reflectOffset != ~0U && screenOffset != ~0U && floorOffset != ~0U ) {
+		const VkDescriptorSet sets[2] = { vk.cmd->uniform_descriptor, xr->vscreenDescriptor };
+		const uint32_t offsets[2] = { 0, eyeProjOffset };
+
+		qvkCmdBindDescriptorSets( vk.cmd->command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+			vk.pipeline_layout, 0, 2, sets, 2, offsets );
+		vk_draw_virtual_screen_mesh( xr->vscreenReflectPipeline, draw.reflectModel, reflectOffset, reflectCount );
+		vk_draw_virtual_screen_mesh( xr->floorGridPipeline, draw.floorModel, floorOffset, 4 );
+		vk_draw_virtual_screen_mesh( xr->vscreenPipeline, draw.screenModel, screenOffset, screenCount );
+	}
+
+	qvkCmdEndRenderPass( vk.cmd->command_buffer );
+	vk.cmd->last_pipeline = VK_NULL_HANDLE;
+}
+
+/*
  * vk_init_xr_resources - Initialize all XR-related Vulkan resources
  *
  * Called after VR layer creates XR swapchains and renderer creates render passes.
@@ -11072,6 +12473,7 @@ qboolean vk_init_xr_resources( void )
 
 		// Destroy existing XR Vulkan resources (but preserve swapchain info pointers
 		// since they point to VR layer data that remains valid across soft shutdown)
+		vk_destroy_virtual_screen();
 		vk_destroy_post_process_pipelines();
 		vk_destroy_gamma_framebuffers();
 		vk_destroy_xr_framebuffers();
@@ -11140,10 +12542,13 @@ qboolean vk_init_xr_resources( void )
 	vk.xr.foveationHeight = 0;
 	if ( vk.xr.fdmSupported ) {
 		if ( vk_create_authored_fdm( xrInfo->colorImageCount, xrInfo->colorArraySize,
-				xrInfo->colorWidth, xrInfo->colorHeight ) ) {
+				xrInfo->colorWidth, xrInfo->colorHeight, xrInfo->densityMapOffsetImages ? qtrue : qfalse ) ) {
 			vk.xr.foveationActive = qtrue;
-			ri.Printf( PRINT_ALL, "Foveated rendering: %ux%u density maps written by the renderer (%ux%u px texels)\n",
-				vk.xr.foveationWidth, vk.xr.foveationHeight, vk.xr.fdmTexelWidth, vk.xr.fdmTexelHeight );
+			ri.Printf( PRINT_ALL, "Foveated rendering: %ux%u density maps written by the renderer (%ux%u px texels), %s\n",
+				vk.xr.foveationWidth, vk.xr.foveationHeight, vk.xr.fdmTexelWidth, vk.xr.fdmTexelHeight,
+				vk.xr.fdmOffsets ? "held still and offset onto the gaze" :
+				!vk.xr.fdmOffsetSupported ? "redrawn around the gaze (device has no density map offsets)" :
+				"redrawn around the gaze (runtime cannot flag its swapchain images for offsets)" );
 		} else if ( xrInfo->foveationImages && xrInfo->foveationWidth > 0 && xrInfo->foveationHeight > 0 ) {
 			vk.xr.foveationActive = qtrue;
 			vk.xr.foveationWidth = xrInfo->foveationWidth;
@@ -11220,10 +12625,10 @@ qboolean vk_init_xr_resources( void )
 	// Note: HUD buffer is created earlier in R_InitImages(), not here
 	// This ensures tr.hudImage exists before CreateExternalShaders() runs
 
-	// Note: Virtual screen resources (buffer, meshes, pipelines) are NOT created here.
-	// Virtual screen (menus, spectator mode) is handled by OpenXR cylinder layer
-	// composition in VR_EndFrame (vr_render_loop.c). The cylinder layer uses the
-	// color swapchain directly, so no separate virtual screen buffer is needed.
+	// Without it screen frames show the flat frame; gameplay is unaffected
+	if ( !vk_create_virtual_screen() ) {
+		ri.Printf( PRINT_WARNING, "Virtual screen resources could not be created\n" );
+	}
 
 	vk.xr.initialized = qtrue;
 	ri.Printf( PRINT_ALL, "XR resources initialized successfully\n" );
@@ -11244,6 +12649,8 @@ void vk_shutdown_xr_resources( void )
 	if ( vk.device != VK_NULL_HANDLE ) {
 		qvkDeviceWaitIdle( vk.device );
 	}
+
+	vk_destroy_virtual_screen();
 
 	// Destroy post-processing pipelines first
 	vk_destroy_post_process_pipelines();

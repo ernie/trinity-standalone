@@ -28,12 +28,12 @@ qboolean vr_initialized = qfalse;
 qboolean vr_shutdown = qfalse;
 
 // Required extensions first, optional extensions only if the runtime advertises them.
-#define MAX_REQUIRED_EXTENSIONS 16
+#define MAX_REQUIRED_EXTENSIONS 24
 static const char* requiredExtensionNames[MAX_REQUIRED_EXTENSIONS];
 static uint32_t numRequiredExtensions = 0;
 static qboolean frameControllersEnabled = qfalse;
-static qboolean cylinderLayersEnabled = qfalse;
 static qboolean picoControllersEnabled = qfalse;
+static qboolean swapchainCreateFlagsEnabled = qfalse;
 
 // Instance extensions the runtime advertises, enumerated once per VR_Init
 static XrExtensionProperties* s_instanceExtensions = NULL;
@@ -144,8 +144,6 @@ static void VR_BuildExtensionList(void)
 	VR_AddOptionalExtension(XR_EXT_PERFORMANCE_SETTINGS_EXTENSION_NAME);
 	VR_AddOptionalExtension(XR_KHR_ANDROID_THREAD_SETTINGS_EXTENSION_NAME);
 #endif
-	// The virtual screen falls back to a flat quad where the runtime has no cylinder layers (Steam Frame)
-	cylinderLayersEnabled = VR_AddOptionalExtension(XR_KHR_COMPOSITION_LAYER_CYLINDER_EXTENSION_NAME);
 	// XR_KHR_vulkan_swapchain_format_list lets the runtime know which view formats
 	// we'll use for the swapchain images, so it can skip unnecessary usage flags
 	// (e.g. STORAGE_BIT). Only enable if the runtime advertises it: it is chained
@@ -172,6 +170,9 @@ static void VR_BuildExtensionList(void)
 	picoControllersEnabled = VR_AddOptionalExtension("XR_BD_controller_interaction");
 
 	VR_BuildFoveationExtensions(&vr_engine.foveation);
+
+	// Lets swapchain images carry the density map offset flag, so direct rendering can use offsets too
+	swapchainCreateFlagsEnabled = VR_AddOptionalExtension("XR_META_vulkan_swapchain_create_info");
 }
 
 VR_Bool VR_HasFrameControllers(void)
@@ -184,9 +185,9 @@ VR_Bool VR_HasPicoControllers(void)
 	return picoControllersEnabled ? VR_TRUE : VR_FALSE;
 }
 
-VR_Bool VR_HasCylinderLayers(void)
+VR_Bool VR_HasSwapchainCreateFlags(void)
 {
-	return cylinderLayersEnabled ? VR_TRUE : VR_FALSE;
+	return swapchainCreateFlagsEnabled ? VR_TRUE : VR_FALSE;
 }
 
 static void VR_PrintEyeInfo( void )

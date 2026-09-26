@@ -24,6 +24,7 @@
 #include "../vrcommon/vr_spaces.h"
 #include "../vrcommon/vr_swapchains.h"
 #include "../vrcommon/vr_types.h"
+#include "../vrcommon/vr_virtual_screen.h"
 
 // Vulkan-specific headers
 #include "vr_vk.h"
@@ -37,7 +38,6 @@ extern cvar_t *vr_heightAdjust;
 extern cvar_t *vr_refreshrate;
 extern cvar_t *vr_refreshrates;
 extern cvar_t *vr_desktopMode;
-extern cvar_t *vr_virtualScreenMode;
 
 const float hudScale = M_PI * 15.0f / 180.0f;
 
@@ -45,13 +45,14 @@ XrBool32 stageSupported = XR_FALSE;
 XrTime lastPredictedDisplayTime = 0;
 qboolean frameStarted = qfalse;
 qboolean needRecenter = qtrue;
-qboolean fullscreenMode = qfalse;
-qboolean menuYawTracking = qfalse;
 
 // Per-frame data held between BeginFrame and EndFrame
 XrFovf fov = { 0 };
 XrView views[2];
 uint32_t viewCount = 2;
+// The views the color swapchain's last released image was drawn from
+XrView imageViews[2];
+uint32_t imageViewCount = 0;
 uint32_t swapchainColorIndex = 0;
 uint32_t swapchainDepthIndex = 0;
 
@@ -59,6 +60,7 @@ uint32_t swapchainDepthIndex = 0;
 void VR_Renderer_BeginFrame(VR_Engine* engine, XrBool32 needsRecenter);
 void VR_Renderer_EndFrame(VR_Engine* engine);
 void VR_Recenter(VR_Engine* engine, XrTime predictedDisplayTime);
+void VR_Renderer_ReleaseImages(VR_SwapchainInfos* swapchains);
 void VR_ClearFrameBuffer(int width, int height);
 void VR_UpdatePerFrameState(void);
 
@@ -385,6 +387,9 @@ void VR_Renderer_BeginFrame(VR_Engine* engine, XrBool32 needsRecenter)
 	// Update HMD position/views
 	IN_VRUpdateHMD(views, viewCount, &fov);
 
+	// Before the controllers aim the cursor at it and before this frame draws it
+	VR_VirtualScreen_Update(views, viewCount);
+
 	// SP intermission state tracking: must be set before rendering
 	// so UI code sees the correct state for scaling/offsets
 	qboolean isSPIntermission = VR_IsSPIntermission();
@@ -501,6 +506,18 @@ void VR_Renderer_BeginFrame(VR_Engine* engine, XrBool32 needsRecenter)
 }
 
 
+// Every release goes through here: the compositor reprojects an image from its own poses, not this frame's
+void VR_Renderer_ReleaseImages(VR_SwapchainInfos* swapchains)
+{
+	if (swapchains->color.acquired)
+	{
+		memcpy(imageViews, views, sizeof(imageViews));
+		imageViewCount = viewCount;
+	}
+	VR_VK_Swapchains_Release(swapchains);
+}
+
+
 void VR_Renderer_EndFrame(VR_Engine* engine)
 {
 	// A load is over once the main thread submits gameplay (or menu) frames again
@@ -519,57 +536,10 @@ void VR_Renderer_EndFrame(VR_Engine* engine)
 
 	VR_SwapchainInfos* swapchains = engine->appState.Renderer.Swapchains;
 
-	// Draw Virtual Screen if needed
-	const int use_virtual_screen = VR_Gameplay_ShouldRenderInVirtualScreen();
-	if (use_virtual_screen)
+	// Outside the virtual screen, anything anchored to menuYaw faces the head
+	if (!VR_Gameplay_ShouldRenderInVirtualScreen() && !vr.menuYawLocked)
 	{
-		// Capture menuYaw on the first frame of the window, and re-capture
-		// when the client state changes mid-window (e.g. a map load
-		// beginning) so the screen appears where the player is facing
-		if ((!fullscreenMode || VR_Gameplay_VirtualScreenContextChanged()) && !vr.menuYawLocked) {
-			vr.menuYaw = vr.hmdorientation[YAW];
-		}
-		fullscreenMode = qtrue;
-
-		// Follow mode: re-face the cylinder when the head yaw drifts far,
-		// with hysteresis so it settles instead of chattering. Angular
-		// thresholds are the chord-angle equivalents of the PC ladder's
-		// distance ratios (settle ~2.3 deg, re-target 35 deg, snap 70 deg);
-		// drift is 1%/frame of the remaining angle.
-		if (vr_virtualScreenMode && vr_virtualScreenMode->integer == 1 && !vr.menuYawLocked)
-		{
-			float yawDelta = AngleSubtract(vr.hmdorientation[YAW], vr.menuYaw);
-			float absDelta = fabsf(yawDelta);
-
-			if (absDelta < 2.3f)
-			{
-				menuYawTracking = qfalse;
-			}
-			else if (absDelta > 35.0f || menuYawTracking)
-			{
-				menuYawTracking = qtrue;
-				if (absDelta > 70.0f)
-				{
-					// Too far: snap; we probably just started or switched into the virtual screen
-					vr.menuYaw = vr.hmdorientation[YAW];
-				}
-				else
-				{
-					vr.menuYaw += yawDelta * 0.01f;
-				}
-			}
-		}
-		else
-		{
-			menuYawTracking = qfalse;
-		}
-	}
-	else
-	{
-		if (!vr.menuYawLocked) {
-			vr.menuYaw = vr.hmdorientation[YAW];
-		}
-		fullscreenMode = qfalse;
+		vr.menuYaw = vr.hmdorientation[YAW];
 	}
 
 	// NOTE: Do NOT call re.WaitForRenderComplete() here!
@@ -581,15 +551,15 @@ void VR_Renderer_EndFrame(VR_Engine* engine)
 	// Release the images this frame drew into, if it drew at all
 	if (swapchains->color.acquired)
 	{
-		VR_VK_Swapchains_Release(swapchains);
+		VR_Renderer_ReleaseImages(swapchains);
 	}
 
 	// Submit layers to OpenXR
 	VR_EndFrame(
 		engine->appState.Session,
 		swapchains,
-		views,
-		viewCount,
+		imageViews,
+		imageViewCount,
 		engine->appState.CurrentSpace,
 		engine->appState.ViewSpace,
 		lastPredictedDisplayTime);
@@ -616,7 +586,7 @@ void VR_Renderer_FinishFrame(VR_Engine* engine)
 
 	// Release main swapchains (color and depth)
 	if (swapchains->color.acquired || swapchains->depth.acquired) {
-		VR_VK_Swapchains_Release(swapchains);
+		VR_Renderer_ReleaseImages(swapchains);
 	}
 
 	// End the XR frame with empty layers (we're shutting down, don't care about display)
@@ -747,8 +717,9 @@ void VR_Recenter(VR_Engine* engine, XrTime predictedDisplayTime)
 		engine->appState.CurrentSpace = engine->appState.StageSpace;
 	}
 
-	// Update menu orientation
+	// Update menu orientation; the screen's old anchor is in the space just replaced
 	vr.menuYaw = 0;
+	VR_VirtualScreen_Reanchor();
 }
 
 

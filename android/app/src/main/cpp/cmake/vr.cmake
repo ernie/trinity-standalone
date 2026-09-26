@@ -21,6 +21,7 @@ set(VR_COMMON_SOURCES
     ${SOURCE_DIR}/vrcommon/vr_shared_sync.c
     ${SOURCE_DIR}/vrcommon/vr_spaces.c
     ${SOURCE_DIR}/vrcommon/vr_swapchains.c
+    ${SOURCE_DIR}/vrcommon/vr_virtual_screen.c
 )
 
 # Vulkan specific VR sources (vrvk/)

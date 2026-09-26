@@ -54,9 +54,13 @@ static PFN_xrCreateVulkanDeviceKHR xrCreateVulkanDeviceKHR = NULL;
 static PFN_vkGetPhysicalDeviceFeatures2 pfn_vkGetPhysicalDeviceFeatures2 = NULL;
 static PFN_vkGetPhysicalDeviceProperties2 pfn_vkGetPhysicalDeviceProperties2 = NULL;
 
+// The NDK headers predate the EXT promotion
+#define VR_EXT_FRAGMENT_DENSITY_MAP_OFFSET_EXTENSION_NAME "VK_EXT_fragment_density_map_offset"
+
 // Forward declarations
 static VR_Bool LoadXrVulkanFunctions(XrInstance xrInstance);
 static void VR_Vulkan_QueryFragmentDensityMap(void);
+static void VR_Vulkan_QueryFragmentDensityMapOffset(void);
 
 // Get the Vulkan graphics extension name for OpenXR instance creation
 const char* VR_VK_GetGraphicsExtensionName(void)
@@ -154,6 +158,10 @@ const VR_VulkanDeviceInfo* VR_Vulkan_GetDeviceInfo(void)
     info.minDensityTexelWidth = vr_vk.minFragmentDensityTexelSize.width;
     info.minDensityTexelHeight = vr_vk.minFragmentDensityTexelSize.height;
     info.tileProperties = vr_vk.tilePropertiesSupported;
+    info.fragmentDensityMapOffset = vr_vk.fragmentDensityMapOffsetSupported;
+    info.densityOffsetGranularityWidth = vr_vk.fragmentDensityOffsetGranularity.width;
+    info.densityOffsetGranularityHeight = vr_vk.fragmentDensityOffsetGranularity.height;
+    info.imageFormatList = vr_vk.imageFormatListEnabled;
     return &info;
 }
 
@@ -189,6 +197,7 @@ const VR_VulkanSwapchainInfo* VR_Vulkan_GetSwapchainInfo(void)
     info.foveationImages = swapchains->color.foveationImages;
     info.foveationWidth = swapchains->color.foveationWidth;
     info.foveationHeight = swapchains->color.foveationHeight;
+    info.densityMapOffsetImages = VR_Vulkan_SwapchainsTakeDensityMapOffsets();
 
     return &info;
 }
@@ -493,12 +502,69 @@ static void VR_Vulkan_QueryFragmentDensityMap(void)
         vr_vk.fragmentDensityMap2Supported ? "yes" : "no",
         fdmProps.minFragmentDensityTexelSize.width, fdmProps.minFragmentDensityTexelSize.height,
         fdmProps.maxFragmentDensityTexelSize.width, fdmProps.maxFragmentDensityTexelSize.height));
+
+    VR_Vulkan_QueryFragmentDensityMapOffset();
+}
+
+/*
+==================
+VR_Vulkan_QueryFragmentDensityMapOffset
+
+The EXT promoted the QCOM extension without changing its structures, so the QCOM
+types, whose names the NDK headers carry, describe either.
+==================
+*/
+static void VR_Vulkan_QueryFragmentDensityMapOffset(void)
+{
+    VkPhysicalDeviceFragmentDensityMapOffsetFeaturesQCOM offsetFeatures = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_DENSITY_MAP_OFFSET_FEATURES_QCOM,
+        .pNext = NULL,
+    };
+    VkPhysicalDeviceFeatures2 features2 = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+        .pNext = &offsetFeatures,
+    };
+    VkPhysicalDeviceFragmentDensityMapOffsetPropertiesQCOM offsetProps = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_DENSITY_MAP_OFFSET_PROPERTIES_QCOM,
+        .pNext = NULL,
+    };
+    VkPhysicalDeviceProperties2 props2 = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
+        .pNext = &offsetProps,
+    };
+
+    vr_vk.fragmentDensityMapOffsetSupported = VR_FALSE;
+    vr_vk.fragmentDensityMapOffsetExtension = NULL;
+
+    if (!vr_vk.fragmentDensityMapSupported || !vr_vk.fragmentDensityMapNonSubsampled) {
+        return;
+    }
+    if (VR_Vulkan_HasDeviceExtension(VR_EXT_FRAGMENT_DENSITY_MAP_OFFSET_EXTENSION_NAME)) {
+        vr_vk.fragmentDensityMapOffsetExtension = VR_EXT_FRAGMENT_DENSITY_MAP_OFFSET_EXTENSION_NAME;
+    } else if (VR_Vulkan_HasDeviceExtension(VK_QCOM_FRAGMENT_DENSITY_MAP_OFFSET_EXTENSION_NAME)) {
+        vr_vk.fragmentDensityMapOffsetExtension = VK_QCOM_FRAGMENT_DENSITY_MAP_OFFSET_EXTENSION_NAME;
+    }
+    if (!vr_vk.fragmentDensityMapOffsetExtension ||
+        !VR_Vulkan_HasDeviceExtension(VK_KHR_CREATE_RENDERPASS_2_EXTENSION_NAME)) {
+        VR_VK_LogLine("Fragment density map offsets: absent");
+        return;
+    }
+
+    pfn_vkGetPhysicalDeviceFeatures2(vr_vk.physicalDevice, &features2);
+    pfn_vkGetPhysicalDeviceProperties2(vr_vk.physicalDevice, &props2);
+
+    vr_vk.fragmentDensityMapOffsetSupported = offsetFeatures.fragmentDensityMapOffset ? VR_TRUE : VR_FALSE;
+    vr_vk.fragmentDensityOffsetGranularity = offsetProps.fragmentDensityOffsetGranularity;
+    VR_VK_LogLine(va("Fragment density map offsets: %s (%s, granularity %ux%u)",
+        vr_vk.fragmentDensityMapOffsetSupported ? "supported" : "feature off",
+        vr_vk.fragmentDensityMapOffsetExtension,
+        vr_vk.fragmentDensityOffsetGranularity.width, vr_vk.fragmentDensityOffsetGranularity.height));
 }
 
 XrResult VR_Vulkan_CreateDevice(XrInstance xrInstance, XrSystemId systemId)
 {
     // Our required extensions: runtime will add any additional ones via xrCreateVulkanDeviceKHR
-    const char* extensions[5] = {
+    const char* extensions[10] = {
         VK_KHR_MULTIVIEW_EXTENSION_NAME,  // For stereo rendering
     };
     uint32_t extensionCount = 1;
@@ -516,6 +582,10 @@ XrResult VR_Vulkan_CreateDevice(XrInstance xrInstance, XrSystemId systemId)
         }
         VR_VK_LogLine(va("Tile properties: %s",
             vr_vk.tilePropertiesSupported ? "supported, bin size will be reported" : "absent"));
+        if (vr_vk.fragmentDensityMapOffsetSupported) {
+            extensions[extensionCount++] = vr_vk.fragmentDensityMapOffsetExtension;
+            extensions[extensionCount++] = VK_KHR_CREATE_RENDERPASS_2_EXTENSION_NAME;
+        }
     }
 
     // Only a loaded validation layer offers this; it is what makes SET_OBJECT_NAME reach the layer
@@ -525,6 +595,14 @@ XrResult VR_Vulkan_CreateDevice(XrInstance xrInstance, XrSystemId systemId)
     }
     __android_log_print(ANDROID_LOG_INFO, "VRVK", "VK_EXT_debug_marker %s",
         vr_vk.debugMarkersEnabled ? "enabled, Vulkan objects will be named" : "absent, objects print as bare handles");
+
+    // A mutable image that names its view formats keeps the driver's framebuffer compression
+    vr_vk.imageFormatListEnabled = VR_Vulkan_HasDeviceExtension(VK_KHR_IMAGE_FORMAT_LIST_EXTENSION_NAME);
+    if (vr_vk.imageFormatListEnabled) {
+        extensions[extensionCount++] = VK_KHR_IMAGE_FORMAT_LIST_EXTENSION_NAME;
+    }
+    __android_log_print(ANDROID_LOG_INFO, "VRVK", "VK_KHR_image_format_list %s",
+        vr_vk.imageFormatListEnabled ? "enabled" : "absent, the virtual screen image stays uncompressed");
 
     // Find graphics queue family
     uint32_t queueFamilyCount = 0;
@@ -577,6 +655,14 @@ XrResult VR_Vulkan_CreateDevice(XrInstance xrInstance, XrSystemId systemId)
         fdmFeatures.pNext = multiviewFeatures.pNext;
         multiviewFeatures.pNext = &fdmFeatures;
     }
+    VkPhysicalDeviceFragmentDensityMapOffsetFeaturesQCOM offsetFeatures = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_DENSITY_MAP_OFFSET_FEATURES_QCOM,
+        .pNext = NULL,
+    };
+    if (vr_vk.fragmentDensityMapOffsetSupported) {
+        offsetFeatures.pNext = multiviewFeatures.pNext;
+        multiviewFeatures.pNext = &offsetFeatures;
+    }
 
     VkPhysicalDeviceFeatures2 features2 = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
@@ -594,6 +680,9 @@ XrResult VR_Vulkan_CreateDevice(XrInstance xrInstance, XrSystemId systemId)
         fdmFeatures.fragmentDensityMap = VK_TRUE;
         fdmFeatures.fragmentDensityMapDynamic = VK_FALSE;
         fdmFeatures.fragmentDensityMapNonSubsampledImages = vr_vk.fragmentDensityMapNonSubsampled ? VK_TRUE : VK_FALSE;
+    }
+    if (vr_vk.fragmentDensityMapOffsetSupported) {
+        offsetFeatures.fragmentDensityMapOffset = VK_TRUE;
     }
 
     // Queue create info
@@ -744,6 +833,11 @@ VkFormat VR_Vulkan_SelectDepthFormat(const int64_t* formats, uint32_t count)
     return (VkFormat)formats[0];
 }
 
+VR_Bool VR_Vulkan_SwapchainsTakeDensityMapOffsets(void)
+{
+    return (vr_vk.fragmentDensityMapOffsetSupported && VR_HasSwapchainCreateFlags()) ? VR_TRUE : VR_FALSE;
+}
+
 XrResult VR_Vulkan_CreateSwapchain(XrSession session, VkFormat format,
                                     uint32_t width, uint32_t height,
                                     uint32_t arraySize, XrSwapchainUsageFlags usage,
@@ -787,6 +881,18 @@ XrResult VR_Vulkan_CreateSwapchainWithFormatList(XrSession session, VkFormat for
     if (foveated) {
         foveationInfo.next = nextChain;
         nextChain = &foveationInfo;
+    }
+
+    // Direct rendering draws the foveated scene into these images, and an offset pass needs every attachment flagged
+    XrVulkanSwapchainCreateInfoMETA vulkanInfo = {
+        .type = XR_TYPE_VULKAN_SWAPCHAIN_CREATE_INFO_META,
+        .next = NULL,
+        .additionalCreateFlags = VK_IMAGE_CREATE_FRAGMENT_DENSITY_MAP_OFFSET_BIT_QCOM,
+        .additionalUsageFlags = 0,
+    };
+    if (VR_Vulkan_SwapchainsTakeDensityMapOffsets()) {
+        vulkanInfo.next = nextChain;
+        nextChain = &vulkanInfo;
     }
 
     XrSwapchainCreateInfo createInfo = {

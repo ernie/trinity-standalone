@@ -639,25 +639,22 @@ void Con_DrawNotify (void)
 	currentColor = 7;
 	re.SetColor( g_color_table[currentColor] );
 
-	// mode 0 composites only the view, so there the lines draw over it, placed as in mode 2
+	// mode 0 has no floating HUD, so the renderer overlays the lines as in mode 2
 	int hudMode = vr_currentHudDrawStatus->integer ? vr_currentHudDrawStatus->integer : 2;
-	qboolean hudBuffer = vr_currentHudDrawStatus->integer != 0;
 
-	if (hudBuffer) {
-		re.HUDBufferStart(qfalse);
-	}
+	re.HUDBufferStart(qfalse);
 
 	// Use console scale setting for notify messages
 	float charScale = con_scale ? con_scale->value : 2.0f;
 	float xadjust = 10.0f;
 	float yadjust = 10.0f;
 
-	// For HUD mode 2, transform the base position to screen coordinates
-	// and scale character size to try to match floating HUD scaling
+	// Mode 1's buffer has 2 pixels per 640 unit; keep the glyphs that size in 640 units
 	if (hudMode == 2) {
-		if (!vr.virtual_screen) {
-			charScale /= 2.0f;
-		}
+		float left = 0.0f, right = 640.0f, unused = 0.0f;
+		CL_VRHudFrom640(hudMode, &left, &unused, NULL, NULL);
+		CL_VRHudFrom640(hudMode, &right, &unused, NULL, NULL);
+		charScale *= (right - left) / 640.0f / 2.0f;
 		CL_VRHudFrom640(hudMode, &xadjust, &yadjust, NULL, NULL);
 	}
 
@@ -762,9 +759,7 @@ void Con_DrawNotify (void)
 
 	re.SetColor( NULL );
 
-	if (hudBuffer) {
-		re.HUDBufferEnd();
-	}
+	re.HUDBufferEnd();
 
 	if (Key_GetCatcher( ) & (KEYCATCH_UI | KEYCATCH_CGAME) ) {
 		return;

@@ -439,8 +439,9 @@ typedef struct {
 	// Runtime density maps (XR_FB_foveation_vulkan), one per color image, attached to the scene passes when foveationActive
 	qboolean fdmSupported;          // device feature enabled by the VR layer
 	qboolean tileProperties;        // VK_QCOM_tile_properties enabled, so the bin size can be read back
-	uint32_t tileWidth;             // bin the tiler chose for the scene pass, 0 until the query answers
+	uint32_t tileWidth;             // bin the tiler chose for the scene pass, 0 while unknown
 	uint32_t tileHeight;
+	qboolean tileAssumed;           // mirrored from Turnip's tiling rather than reported
 	qboolean foveationActive;
 	VkImageView foveationViews[MAX_SWAPCHAIN_IMAGES];
 	uint32_t foveationWidth;
@@ -466,6 +467,34 @@ typedef struct {
 	uint32_t fdmAppliedOffset[MAX_SWAPCHAIN_IMAGES][2][2];  // gaze per eye, quantized to map texels
 	int fdmAppliedLevel[MAX_SWAPCHAIN_IMAGES];
 	qboolean fdmAppliedEyeTracked[MAX_SWAPCHAIN_IMAGES];
+
+	// Offset mode: the map holds still around a reference point and the scene pass ends with the
+	// gaze's offset from it, so the tiler slides its bins with the eye
+	qboolean fdmOffsetSupported;    // device enabled the offsets and render pass 2
+	qboolean fdmOffsets;            // this map is in offset mode
+	uint32_t fdmOffsetGranularity[2];
+	int32_t fdmRef[2][2];           // per eye, framebuffer pixel the map's sharp region is drawn around
+	int32_t fdmOffset[2][2];        // per eye, the offset the current scene pass ends with
+	qboolean mapPassOpen;           // the open pass is the scene pass carrying the density map
+	byte *fdmScratch;               // the map as this frame would write it, compared before any upload
+
+	// Virtual screen: the finished frame's 4:3 crop with a mip chain for the reflection's blur
+	VkImage vscreenImage;
+	VkDeviceMemory vscreenMemory;
+	VkImageView vscreenView;        // UNORM, so sampling returns the encoded bytes
+	VkImageView vscreenMip0View;    // UNORM, the capture pass's attachment
+	VkSampler vscreenSampler;
+	VkSampler vscreenSourceSampler; // nearest: the capture is an exact texel copy
+	VkDescriptorSet vscreenDescriptor;  // from the shared pool; reallocated after a pool reset
+	VkDescriptorSet vscreenSourceDescriptor[MAX_SWAPCHAIN_IMAGES];  // swapchain gammaViews, same pool rules
+	uint32_t vscreenX, vscreenY;    // crop's top left in layer 0; constant, screen frames publish a symmetric FOV
+	uint32_t vscreenWidth, vscreenHeight, vscreenMips;
+	VkFramebuffer vscreenCaptureFramebuffer;
+	VkFramebuffer vscreenFramebuffers[MAX_SWAPCHAIN_IMAGES];
+	VkPipeline vscreenCapturePipeline;
+	VkPipeline vscreenPipeline;
+	VkPipeline vscreenReflectPipeline;
+	VkPipeline floorGridPipeline;
 
 	// Initialization state
 	qboolean initialized;
@@ -512,6 +541,10 @@ typedef struct {
 		VkRenderPass main_with_gamma;  // 2 subpasses: scene, gamma only
 		// Foveated split (vk.fovSplit): scene alone with the density map; main_with_* then load it for the post subpasses
 		VkRenderPass fov_scene;
+		// Virtual screen: clears the swapchain and draws the screen back into it, no density map
+		VkRenderPass virtualScreen;
+		// Virtual screen capture: single view, samples layer 0's crop into the screen texture's mip 0
+		VkRenderPass virtualScreenCapture;
 	} render_pass;
 
 	VkDescriptorPool descriptor_pool;
@@ -527,6 +560,7 @@ typedef struct {
 	// Post pass: set 0 is a combined image sampler on the stored scene
 	VkPipelineLayout pipeline_layout_fov_composite;
 	VkPipelineLayout pipeline_layout_fov_gamma;
+	VkPipelineLayout pipeline_layout_foveation_debug;  // gaze, bin origin and bin size, pushed
 
 	VkDescriptorSet color_descriptor;
 
@@ -669,6 +703,13 @@ typedef struct {
 		VkShaderModule gamma_vs;
 		VkShaderModule foveationdebug_fs;  // reuses gamma_vs for its fullscreen quad
 
+		VkShaderModule vscreen_vs;          // virtual screen, reflection and floor share it
+		VkShaderModule vscreen_fs;
+		VkShaderModule vscreen_reflect_fs;
+		VkShaderModule floor_grid_fs;
+		VkShaderModule vscreen_capture_vs;
+		VkShaderModule vscreen_capture_fs;
+
 		VkShaderModule fog_fs;  // multiview
 		VkShaderModule fog_vs;  // multiview
 
@@ -752,6 +793,7 @@ typedef struct {
 	qboolean fragmentStores;
 	qboolean dedicatedAllocation;
 	qboolean debugMarkers;
+	qboolean imageFormatList;      // VK_KHR_image_format_list enabled by the VR layer
 	qboolean multiviewSupported;   // VK_KHR_multiview available
 	qboolean depthClamp;           // depth clamp for z-fail shadow volumes
 

@@ -47,7 +47,13 @@ typedef struct {
 
     VR_Bool tilePropertiesSupported;  // VK_QCOM_tile_properties was available, so the bin size can be read back
 
+    // Density map offsets slide the tiler's bins with the gaze; ended through render pass 2
+    VR_Bool fragmentDensityMapOffsetSupported;
+    const char* fragmentDensityMapOffsetExtension;  // the EXT name where offered, else the QCOM original
+    VkExtent2D fragmentDensityOffsetGranularity;
+
     VR_Bool debugMarkersEnabled;   // VK_EXT_debug_marker was available and was requested
+    VR_Bool imageFormatListEnabled;  // VK_KHR_image_format_list was available and was requested
 } VR_VulkanState;
 
 // Global VR Vulkan state
@@ -88,6 +94,10 @@ typedef struct {
     uint32_t minDensityTexelWidth;
     uint32_t minDensityTexelHeight;
     VR_Bool tileProperties;        // VK_QCOM_tile_properties enabled, so the bin size can be read back
+    VR_Bool fragmentDensityMapOffset;  // offsets and VK_KHR_create_renderpass2 enabled
+    uint32_t densityOffsetGranularityWidth;
+    uint32_t densityOffsetGranularityHeight;
+    VR_Bool imageFormatList;       // VK_KHR_image_format_list enabled, so mutable images can name their view formats
 } VR_VulkanDeviceInfo;
 
 // Get the XR-created Vulkan device for renderer initialization
@@ -110,7 +120,12 @@ typedef struct {
     // Density map per color image (XR_FB_foveation_vulkan), NULL without foveation
     VkImage* foveationImages;      // NOT owned: from OpenXR
     uint32_t foveationWidth, foveationHeight;
+
+    VR_Bool densityMapOffsetImages;  // color and depth images carry the density map offset create flag
 } VR_VulkanSwapchainInfo;
+
+// Whether swapchains are created with the density map offset flag (device offsets plus XR_META_vulkan_swapchain_create_info)
+VR_Bool VR_Vulkan_SwapchainsTakeDensityMapOffsets(void);
 
 // Get the XR swapchain info for renderer initialization
 // Returns NULL if swapchains are not yet created

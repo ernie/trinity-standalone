@@ -624,7 +624,8 @@ static void R_SetupFrustum( void )
 	float halfIpdWorldUnits = 0.0f;
 
 	// Use combined stereo horizontal FOV for culling (encompasses both eyes)
-	if (tr.vrParms.combinedFovX > 0) {
+	// The screen shows the refdef's FOV, which may be wider than the runtime's
+	if (tr.vrParms.combinedFovX > 0 && !(vr.virtual_screen && !vr.weapon_zoomed)) {
 		fovX = tr.vrParms.combinedFovX;
 		fovUp = tr.vrParms.fovUp;
 		fovDown = tr.vrParms.fovDown;

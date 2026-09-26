@@ -1,9 +1,9 @@
 /*
  * vr_vk_loading.c - keeps the headset fed while a map load blocks the main thread
  *
- * A map load runs inside one Com_Frame for seconds; VR_Loading_Pump ends the frame in
- * progress with the virtual screen showing the color swapchain's last released image and
- * begins the next. Main thread only: the runtime may use the app's VkQueue inside
+ * A map load runs inside one Com_Frame for seconds. VR_Loading_Pump ends the frame in
+ * progress re-submitting the color swapchain's last released image, posed where it was drawn
+ * from, and begins the next. Main thread only: the runtime may use the app's VkQueue inside
  * xrBeginFrame and xrEndFrame, which must not overlap the renderer's submissions.
  */
 #include "vr_vk_loading.h"
@@ -19,8 +19,9 @@
 // Frame state owned by vr_vk_renderer.c
 extern XrTime lastPredictedDisplayTime;
 extern qboolean frameStarted;
-extern XrView views[2];
-extern uint32_t viewCount;
+extern XrView imageViews[2];
+extern uint32_t imageViewCount;
+void VR_Renderer_ReleaseImages( VR_SwapchainInfos *swapchains );
 
 // Frames the pump submits are at most this far apart
 #define PUMP_INTERVAL_MS 25
@@ -59,19 +60,20 @@ static void ReportFailure( const char *what, XrResult result )
 }
 
 
-// The virtual screen with the swapchain's last released image; nothing until there is one
+// The last released image, with the poses it was drawn from; nothing until there is one
 static XrResult SubmitLoadingLayers( VR_Engine *engine, XrTime displayTime )
 {
-	VR_ScreenLayer screen;
+	XrCompositionLayerProjectionView elements[2];
+	XrCompositionLayerProjection projection;
 	const XrCompositionLayerBaseHeader *layers[1];
 	uint32_t layerCount = 0;
 	XrFrameEndInfo endInfo = { XR_TYPE_FRAME_END_INFO, NULL };
 	VR_SwapchainInfos *swapchains = engine->appState.Renderer.Swapchains;
 
 	if ( swapchains && swapchains->color.everReleased &&
-		VR_BuildVirtualScreenLayer( swapchains, views, viewCount, engine->appState.CurrentSpace, &screen ) )
+		VR_BuildProjectionLayer( swapchains, imageViews, imageViewCount, engine->appState.CurrentSpace, &projection, elements ) )
 	{
-		layers[layerCount++] = &screen.header;
+		layers[layerCount++] = (const XrCompositionLayerBaseHeader *)&projection;
 	}
 
 	endInfo.displayTime = displayTime;
@@ -111,7 +113,7 @@ static void PumpFrame( VR_Engine *engine )
 			ReportFailure( "xrWaitFrame/xrBeginFrame", result );
 			if ( swapchains && ( swapchains->color.acquired || swapchains->depth.acquired ) )
 			{
-				VR_VK_Swapchains_Release( swapchains );
+				VR_Renderer_ReleaseImages( swapchains );
 			}
 			frameStarted = qfalse;
 		}

@@ -11,6 +11,7 @@
 #include "vr_graphics.h"
 #include "vr_haptics.h"
 #include "vr_macros.h"
+#include "vr_virtual_screen.h"
 #include "vr_math.h"
 
 #if __ANDROID__
@@ -97,6 +98,10 @@ static vrController_t rightController;
 static int in_vrEventTime = 0;
 static double lastframetime = 0;
 static qboolean wasInMenuMode = qfalse;
+
+// Aim poses in the world space, without vr_heightAdjust, for rays against the virtual screen
+static XrPosef aimPose[2];
+static qboolean aimPoseValid[2];
 
 extern cvar_t *vr_triggerSensitivity;
 static float IN_TriggerPressedThreshold(void) { return 1.0f - vr_triggerSensitivity->value; }
@@ -1206,6 +1211,33 @@ void VR_DestroySessionInput( VR_Engine* engine )
 	vrCurrentProfile[0] = vrCurrentProfile[1] = -1;
 }
 
+/*
+==================
+IN_VRScreenCursor
+
+Where a controller's aim ray meets the virtual screen, in 640x480 menu coordinates.
+==================
+*/
+static qboolean IN_VRScreenCursor( int hand, float *x, float *y )
+{
+	const XrVector3f ahead = { 0.0f, 0.0f, -1.0f };
+	XrVector3f direction;
+	float origin[3], dir[3];
+
+	if ( !aimPoseValid[hand] )
+	{
+		return qfalse;
+	}
+	XrQuaternionf_RotateVector3f( &direction, &aimPose[hand].orientation, &ahead );
+	origin[0] = aimPose[hand].position.x;
+	origin[1] = aimPose[hand].position.y;
+	origin[2] = aimPose[hand].position.z;
+	dir[0] = direction.x;
+	dir[1] = direction.y;
+	dir[2] = direction.z;
+	return VR_VirtualScreen_Hit( origin, dir, x, y );
+}
+
 static void IN_VRController( qboolean isRightController, XrPosef pose )
 {
 	//Set gun angles - We need to calculate all those we might need (including adjustments) for the client to then take its pick
@@ -1266,12 +1298,31 @@ static void IN_VRController( qboolean isRightController, XrPosef pose )
 			// During SP intermission, use the anchored yaw for cursor calculation
 			// since the HUD is world-fixed rather than head-locked
 			float referenceYaw = vr.sp_intermission_active ? vr.sp_intermission_yaw : vr.menuYaw;
-			int x = 320 - tan((yaw - referenceYaw) * (M_PI*2 / 360)) * 800;
-			// Aim-pose angles: no vr_weaponPitch term, the cursor is not the weapon
-			int y = 240 + tan(pitch * (M_PI*2 / 360)) * 800;
-
 			static int lastMenuCursorX = 320;
 			static int lastMenuCursorY = 240;
+			int x, y;
+
+			if (vr.virtual_screen)
+			{
+				// The menu hand's ray; a miss holds the cursor where it last was
+				float hitX, hitY;
+				if (IN_VRScreenCursor(vr.menuLeftHanded ? 0 : 1, &hitX, &hitY))
+				{
+					x = (int)hitX;
+					y = (int)hitY;
+				}
+				else
+				{
+					x = lastMenuCursorX;
+					y = lastMenuCursorY;
+				}
+			}
+			else
+			{
+				x = 320 - tan((yaw - referenceYaw) * (M_PI*2 / 360)) * 800;
+				// Aim-pose angles: no vr_weaponPitch term, the cursor is not the weapon
+				y = 240 + tan(pitch * (M_PI*2 / 360)) * 800;
+			}
 
 			// lepr from old position to new position by given factor
 			// this is needed to avoid artifacts when moving rapidly hand or HMD
@@ -1299,11 +1350,29 @@ static void IN_VRController( qboolean isRightController, XrPosef pose )
 					ohYaw = (vr_righthanded->integer != 0) ? vr.offhandaimangles[YAW] : vr.weaponaimangles[YAW];
 					ohPitch = (vr_righthanded->integer != 0) ? vr.offhandaimangles[PITCH] : vr.weaponaimangles[PITCH];
 				}
-				int ohx = 320 - tan((ohYaw - referenceYaw) * (M_PI*2 / 360)) * 800;
-				int ohy = 240 + tan(ohPitch * (M_PI*2 / 360)) * 800;
-
 				static int lastOffhandCursorX = 320;
 				static int lastOffhandCursorY = 240;
+				int ohx, ohy;
+
+				if (vr.virtual_screen)
+				{
+					float hitX, hitY;
+					if (IN_VRScreenCursor(vr.menuLeftHanded ? 1 : 0, &hitX, &hitY))
+					{
+						ohx = (int)hitX;
+						ohy = (int)hitY;
+					}
+					else
+					{
+						ohx = lastOffhandCursorX;
+						ohy = lastOffhandCursorY;
+					}
+				}
+				else
+				{
+					ohx = 320 - tan((ohYaw - referenceYaw) * (M_PI*2 / 360)) * 800;
+					ohy = 240 + tan(ohPitch * (M_PI*2 / 360)) * 800;
+				}
 				ohx = factor * ohx + (1.0f - factor) * lastOffhandCursorX;
 				ohy = factor * ohy + (1.0f - factor) * lastOffhandCursorY;
 				lastOffhandCursorX = vr.offhandCursorX = ohx;
@@ -2160,6 +2229,10 @@ static void IN_VRButtons( qboolean isRightController, uint32_t buttons )
 				IN_ActivateInput(&controller->buttons, VR_Button_B);
 				vr.recenter_follow_camera = qtrue;
 			}
+			else
+			{
+				VR_VirtualScreen_Reanchor();
+			}
 		}
 		IN_HandleActiveInput(&controller->buttons, VR_Button_B, "B", 0, qfalse);
 	}
@@ -2318,6 +2391,40 @@ static void IN_VRMenuThumbstickNav( qboolean menuActive, float lx, float ly, flo
 	}
 }
 
+// The runtime's FOV, before VR_PublishFov decides what the frame sees
+static float rawFovX, rawFovUp, rawFovDown;
+
+/*
+==================
+VR_PublishFov
+
+The virtual screen is a monitor: the player's cg_fov across a symmetric 4:3
+crop, so nothing on it follows the runtime's per-frame FOV.
+==================
+*/
+static void VR_PublishFov( void )
+{
+	if ( vr.virtual_screen )
+	{
+		const float halfSpan = 0.5f * ( rawFovUp - rawFovDown );
+		float fovX = Cvar_VariableValue( "cg_fov" );
+
+		if ( fovX < 1.0f )
+			fovX = 90.0f;
+		else if ( fovX > 160.0f )
+			fovX = 160.0f;
+		vr.fov_x = fovX;
+		vr.fov_angle_up = halfSpan;
+		vr.fov_angle_down = -halfSpan;
+	}
+	else
+	{
+		vr.fov_x = rawFovX;
+		vr.fov_angle_up = rawFovUp;
+		vr.fov_angle_down = rawFovDown;
+	}
+}
+
 void VR_RefreshDerivedModeState( void )
 {
 	// recompute continuously: single_player arrives via the modules' config
@@ -2328,6 +2435,8 @@ void VR_RefreshDerivedModeState( void )
 	vr.virtual_screen = VR_Gameplay_ShouldRenderInVirtualScreen();
 	vr.first_person_following = vr.virtual_screen && VR_IsFollowingInFirstPerson();
 	vr.in_menu = VR_IsInMenu();
+
+	VR_PublishFov();
 }
 
 void VR_ProcessInputActions( void )
@@ -2455,6 +2564,8 @@ static void IN_VRControllerAim( qboolean isRightController, XrPosef pose )
 {
 	vec3_t rotation = {0};
 
+	aimPose[isRightController ? 1 : 0] = pose;
+
 	if (isRightController == (vr_righthanded->integer != 0))
 	{
 		QuatToYawPitchRoll(pose.orientation, rotation, vr.weaponaimangles);
@@ -2499,6 +2610,8 @@ void IN_VRUpdateControllers( VR_Engine* engine, XrTime predictedDisplayTime )
 
 		for (i = 0; i < 2; i++)
 		{
+			aimPoseValid[i] = qfalse;
+
 			XrSpaceLocation loc = {};
 			loc.type = XR_TYPE_SPACE_LOCATION;
 
@@ -2511,6 +2624,9 @@ void IN_VRUpdateControllers( VR_Engine* engine, XrTime predictedDisplayTime )
 			{
 				IN_VRControllerAim(i == 1 ? qtrue : qfalse, loc.pose);
 			}
+			// The ray starts at the controller, so an untracked position would cast it from a stale origin
+			aimPoseValid[i] = (loc.locationFlags & (XR_SPACE_LOCATION_ORIENTATION_VALID_BIT | XR_SPACE_LOCATION_POSITION_VALID_BIT)) ==
+				(XR_SPACE_LOCATION_ORIENTATION_VALID_BIT | XR_SPACE_LOCATION_POSITION_VALID_BIT) ? qtrue : qfalse;
 		}
 	}
 
@@ -2536,11 +2652,12 @@ void IN_VRUpdateHMD( XrView* views, uint32_t viewCount, XrFovf* fov )
 		fov->angleUp += views[view].fov.angleUp / (float)(viewCount);
 		fov->angleDown += views[view].fov.angleDown / (float)(viewCount);
 	}
-	vr.fov_x = (fabs(fov->angleLeft) + fabs(fov->angleRight)) * 180.0f / M_PI;
+	rawFovX = (fabs(fov->angleLeft) + fabs(fov->angleRight)) * 180.0f / M_PI;
 	vr.fov_y = (fabs(fov->angleUp) + fabs(fov->angleDown)) * 180.0f / M_PI;
-	// Store raw FOV angles in radians for projection center calculations
-	vr.fov_angle_up = fov->angleUp;
-	vr.fov_angle_down = fov->angleDown;
+	// Store FOV angles in radians for projection center calculations
+	rawFovUp = fov->angleUp;
+	rawFovDown = fov->angleDown;
+	VR_PublishFov();
 	vr.fov_angle_left = fov->angleLeft;
 	vr.fov_angle_right = fov->angleRight;
 

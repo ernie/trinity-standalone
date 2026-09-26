@@ -19,8 +19,8 @@ VR_Bool VR_HasFrameControllers( void );
 // Whether XR_BD_controller_interaction was enabled on the instance.
 VR_Bool VR_HasPicoControllers( void );
 
-// Whether XR_KHR_composition_layer_cylinder was enabled; the virtual screen is a flat quad otherwise.
-VR_Bool VR_HasCylinderLayers( void );
+// Whether XR_META_vulkan_swapchain_create_info was enabled, so swapchain images can take extra Vulkan create flags.
+VR_Bool VR_HasSwapchainCreateFlags( void );
 
 void VR_Info_f( void );
 
