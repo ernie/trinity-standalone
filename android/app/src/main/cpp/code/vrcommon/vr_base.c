@@ -9,6 +9,7 @@
 
 #include "vr_bhaptics.h"
 #include "vr_debug.h"
+#include "vr_input.h"
 #include "vr_instance.h"
 #include "vr_macros.h"
 #include "vr_session.h"
@@ -30,6 +31,9 @@ qboolean vr_shutdown = qfalse;
 #define MAX_REQUIRED_EXTENSIONS 16
 static const char* requiredExtensionNames[MAX_REQUIRED_EXTENSIONS];
 static uint32_t numRequiredExtensions = 0;
+static qboolean frameControllersEnabled = qfalse;
+static qboolean cylinderLayersEnabled = qfalse;
+static qboolean picoControllersEnabled = qfalse;
 
 // Instance extensions the runtime advertises, enumerated once per VR_Init
 static XrExtensionProperties* s_instanceExtensions = NULL;
@@ -134,15 +138,14 @@ static void VR_BuildExtensionList(void)
 	requiredExtensionNames[numRequiredExtensions++] = VR_Graphics_GetExtensionName();
 	requiredExtensionNames[numRequiredExtensions++] = XR_EXT_DEBUG_UTILS_EXTENSION_NAME;
 	requiredExtensionNames[numRequiredExtensions++] = XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME;
-	// Cylinder layer for virtual screen (menus, spectator mode)
-	requiredExtensionNames[numRequiredExtensions++] = XR_KHR_COMPOSITION_LAYER_CYLINDER_EXTENSION_NAME;
 #if __ANDROID__
 	// Android requires this extension to pass Java context during instance creation
 	requiredExtensionNames[numRequiredExtensions++] = XR_KHR_ANDROID_CREATE_INSTANCE_EXTENSION_NAME;
-	// Performance and thread settings for Android
-	requiredExtensionNames[numRequiredExtensions++] = XR_EXT_PERFORMANCE_SETTINGS_EXTENSION_NAME;
-	requiredExtensionNames[numRequiredExtensions++] = XR_KHR_ANDROID_THREAD_SETTINGS_EXTENSION_NAME;
+	VR_AddOptionalExtension(XR_EXT_PERFORMANCE_SETTINGS_EXTENSION_NAME);
+	VR_AddOptionalExtension(XR_KHR_ANDROID_THREAD_SETTINGS_EXTENSION_NAME);
 #endif
+	// The virtual screen falls back to a flat quad where the runtime has no cylinder layers (Steam Frame)
+	cylinderLayersEnabled = VR_AddOptionalExtension(XR_KHR_COMPOSITION_LAYER_CYLINDER_EXTENSION_NAME);
 	// XR_KHR_vulkan_swapchain_format_list lets the runtime know which view formats
 	// we'll use for the swapchain images, so it can skip unnecessary usage flags
 	// (e.g. STORAGE_BIT). Only enable if the runtime advertises it: it is chained
@@ -164,7 +167,53 @@ static void VR_BuildExtensionList(void)
 	__android_log_print(ANDROID_LOG_INFO, "OpenXR", "XR_FB_color_space advertised: %s", haveColorSpace ? "yes" : "no");
 #endif
 
+	frameControllersEnabled = VR_AddOptionalExtension("XR_VALVE_frame_controller_interaction");
+	// Without it the PICO runtime treats the PICO profiles as unsupported and emulates Touch, as the engine avoids.
+	picoControllersEnabled = VR_AddOptionalExtension("XR_BD_controller_interaction");
+
 	VR_BuildFoveationExtensions(&vr_engine.foveation);
+}
+
+VR_Bool VR_HasFrameControllers(void)
+{
+	return frameControllersEnabled ? VR_TRUE : VR_FALSE;
+}
+
+VR_Bool VR_HasPicoControllers(void)
+{
+	return picoControllersEnabled ? VR_TRUE : VR_FALSE;
+}
+
+VR_Bool VR_HasCylinderLayers(void)
+{
+	return cylinderLayersEnabled ? VR_TRUE : VR_FALSE;
+}
+
+static void VR_PrintEyeInfo( void )
+{
+	Com_Printf("Eye-tracked foveation: %s\n", vr_engine.foveation.SystemEyeTracked ? "supported" : "not supported");
+}
+
+void VR_Info_f( void )
+{
+	XrInstanceProperties props;
+	if (vr_engine.appState.Instance == XR_NULL_HANDLE)
+	{
+		Com_Printf("OpenXR is not running\n");
+		return;
+	}
+	memset(&props, 0, sizeof(props));
+	props.type = XR_TYPE_INSTANCE_PROPERTIES;
+	if (XR_SUCCEEDED(xrGetInstanceProperties(vr_engine.appState.Instance, &props)))
+	{
+		Com_Printf("Runtime: %s %u.%u.%u\n", props.runtimeName, XR_VERSION_MAJOR(props.runtimeVersion),
+			XR_VERSION_MINOR(props.runtimeVersion), XR_VERSION_PATCH(props.runtimeVersion));
+	}
+	Com_Printf("Enabled extensions:\n");
+	for (uint32_t i = 0; i < numRequiredExtensions; i++)
+		Com_Printf("  %s\n", requiredExtensionNames[i]);
+	VR_PrintEyeInfo();
+	VR_PrintInputInfo();
 }
 
 static void VR_DecideFoveationCaps(void)

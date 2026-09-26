@@ -44,6 +44,7 @@ XrBool32 VR_ProcessXrEvents(VR_App* app)
 
 			case XR_TYPE_EVENT_DATA_INTERACTION_PROFILE_CHANGED:
 				printf("[OpenXR][EVT_INTERACTION_PROFILE_CHANGED]\n");
+				VR_UpdateInteractionProfiles();
 				break;
 
 			case XR_TYPE_EVENT_DATA_DISPLAY_REFRESH_RATE_CHANGED_FB: {

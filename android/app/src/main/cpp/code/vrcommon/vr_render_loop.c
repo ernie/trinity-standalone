@@ -3,10 +3,13 @@
 #include <string.h>
 #include <math.h>
 
+#include "../qcommon/qcommon.h"
 #include "vr_macros.h"
 #include "vr_clientinfo.h"
+#include "vr_rate_list.h"
 #include "vr_gameplay.h"
 #include "vr_cvars.h"
+#include "vr_base.h"
 #include "../vrvk/vr_vk_types.h"
 #include "common/xr_linear.h"
 
@@ -94,6 +97,26 @@ static void VR_LogFrameTiming( const XrFrameState *fs, qboolean enabled )
 	}
 }
 
+// SteamVR lists only its configured rate and refuses requests while the panel runs another; the
+// menus show the entry nearest the request, so the list must carry the rate the panel actually runs
+static void VR_OfferMeasuredRate( XrDuration period )
+{
+	static XrDuration lastPeriod = 0;
+	static int lastListModification = -1;
+	static cvar_t *rates;
+	char list[512];
+
+	if ( !rates )
+		rates = Cvar_Get( "vr_refreshrates", "", CVAR_ROM );
+	if ( period <= 0 || ( period == lastPeriod && rates->modificationCount == lastListModification ) )
+		return;
+	lastPeriod = period;
+	Q_strncpyz( list, rates->string, sizeof( list ) );
+	if ( VR_RateListOffer( list, sizeof( list ), 1e9 / period ) )
+		Cvar_Set2( "vr_refreshrates", list, qtrue );
+	lastListModification = rates->modificationCount;
+}
+
 XrFrameState VR_WaitFrame(XrSession session)
 {
 	XrFrameWaitInfo waitFrameInfo = {};
@@ -109,6 +132,7 @@ XrFrameState VR_WaitFrame(XrSession session)
 		"Failed to wait for XR frame");
 
 	VR_LogFrameTiming( &frameState, vr_frameTimingLog->integer != 0 );
+	VR_OfferMeasuredRate( frameState.predictedDisplayPeriod );
 
 	return frameState;
 }
@@ -226,10 +250,10 @@ void VR_EndFrame(XrSession session, VR_SwapchainInfos* swapchains, XrView* views
 	projection_layer.viewCount = viewCount;
 	projection_layer.views = projection_layer_elements;
 
-	// Cylinder layer for virtual screen (menus, spectator mode)
-	XrCompositionLayerCylinderKHR cylinder_layer = {};
+	// Virtual screen layer (menus, spectator mode)
+	VR_ScreenLayer screen_layer;
 	qboolean haveScreen = useVirtualScreen &&
-		VR_BuildVirtualScreenLayer(swapchains, views, viewCount, worldSpace, &cylinder_layer);
+		VR_BuildVirtualScreenLayer(swapchains, views, viewCount, worldSpace, &screen_layer);
 
 	// Submit layers
 	const XrCompositionLayerBaseHeader* layers[2];
@@ -242,8 +266,8 @@ void VR_EndFrame(XrSession session, VR_SwapchainInfos* swapchains, XrView* views
 	}
 	else if (haveScreen)
 	{
-		// Virtual screen mode: use cylinder layer instead of projection
-		layers[layerCount++] = (const XrCompositionLayerBaseHeader*)&cylinder_layer;
+		// Virtual screen mode: use the screen layer instead of projection
+		layers[layerCount++] = &screen_layer.header;
 	}
 	else
 	{
@@ -274,7 +298,7 @@ The cylinder showing the color swapchain's centered 4:3 crop as the virtual scre
 released image.
 ==================
 */
-qboolean VR_BuildVirtualScreenLayer(VR_SwapchainInfos* swapchains, const XrView* views, uint32_t viewCount, XrSpace worldSpace, XrCompositionLayerCylinderKHR* out)
+qboolean VR_BuildVirtualScreenLayer(VR_SwapchainInfos* swapchains, const XrView* views, uint32_t viewCount, XrSpace worldSpace, VR_ScreenLayer* out)
 {
 	extern vr_clientinfo_t vr;
 	extern cvar_t* vr_screenCurvature;
@@ -375,8 +399,29 @@ qboolean VR_BuildVirtualScreenLayer(VR_SwapchainInfos* swapchains, const XrView*
 		cylinder_layer.centralAngle = centralAngle;
 		// The crop is 4:3 in both pixels and angle; the eye-buffer aspect would stretch the screen
 		cylinder_layer.aspectRatio = (float)srcWidth / (float)srcHeight;
+
+		if (!VR_HasCylinderLayers())
+		{
+			// Flat stand-in at the arc's midpoint, which sits radius past the cylinder's axis
+			XrCompositionLayerQuad quad_layer = {};
+			float surfaceDistance = axisDistance + radius;
+
+			quad_layer.type = XR_TYPE_COMPOSITION_LAYER_QUAD;
+			quad_layer.layerFlags = cylinder_layer.layerFlags;
+			quad_layer.space = worldSpace;
+			quad_layer.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+			quad_layer.subImage = cylinder_layer.subImage;
+			quad_layer.pose.orientation = cylinder_layer.pose.orientation;
+			quad_layer.pose.position.x = views[0].pose.position.x - sinf(radians(vr.menuYaw)) * surfaceDistance;
+			quad_layer.pose.position.y = -0.25f;
+			quad_layer.pose.position.z = views[0].pose.position.z - cosf(radians(vr.menuYaw)) * surfaceDistance;
+			quad_layer.size.width = arcLength;
+			quad_layer.size.height = arcLength / cylinder_layer.aspectRatio;
+			out->quad = quad_layer;
+			return qtrue;
+		}
 	}
 
-	*out = cylinder_layer;
+	out->cylinder = cylinder_layer;
 	return qtrue;
 }

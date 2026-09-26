@@ -14,4 +14,14 @@ void VR_LeaveVR( VR_Engine* engine );
 // "none", "fixed" or "eyetracked": what vr_foveationCaps publishes to the UI
 const char* VR_FoveationCapsString( void );
 
+// Whether XR_VALVE_frame_controller_interaction was enabled on the instance.
+VR_Bool VR_HasFrameControllers( void );
+// Whether XR_BD_controller_interaction was enabled on the instance.
+VR_Bool VR_HasPicoControllers( void );
+
+// Whether XR_KHR_composition_layer_cylinder was enabled; the virtual screen is a flat quad otherwise.
+VR_Bool VR_HasCylinderLayers( void );
+
+void VR_Info_f( void );
+
 #endif

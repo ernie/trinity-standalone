@@ -61,7 +61,7 @@ void VR_InitCvars( void )
 	Cvar_CheckRange( vr_hudDepth, 0, 5, qtrue );
 	vr_righthanded = Cvar_Get ("vr_righthanded", "1", CVAR_ARCHIVE);
 	vr_switchThumbsticks = Cvar_Get ("vr_switchThumbsticks", "0", CVAR_ARCHIVE);
-	vr_snapturn = Cvar_Get ("vr_snapturn", "45", CVAR_ARCHIVE);
+	vr_snapturn = Cvar_Get ("vr_snapturn", "0", CVAR_ARCHIVE);
 	vr_sensitivity = Cvar_Get ("vr_sensitivity", "100", CVAR_ARCHIVE);
 	vr_directionMode = Cvar_Get ("vr_directionMode", "1", CVAR_ARCHIVE); // 0 = HMD, 1 = Off-hand
 	// Degrees on top of the fixed VR_GRIP_TO_AIM_PITCH correction; zero is no personal adjustment
@@ -82,7 +82,7 @@ void VR_InitCvars( void )
 	Cvar_Set2( "vr_foveationCaps", VR_FoveationCapsString(), qtrue );
 	vr_superSampling = Cvar_Get ("vr_superSampling", "1.0", CVAR_ARCHIVE);
 	vr_weaponScope = Cvar_Get ("vr_weaponScope", "1", CVAR_ARCHIVE);
-	vr_6dof = Cvar_Get ("vr_6dof", "1", CVAR_ARCHIVE); // 0 - fake 6DoF in SP, 1 - true 6DoF in SP (requires enhanced physics coefficients)
+	vr_6dof = Cvar_Get ("vr_6dof", "0", CVAR_ARCHIVE); // 0 - fake 6DoF in SP, 1 - true 6DoF in SP (requires enhanced physics coefficients)
 	vr_rollWhenHit = Cvar_Get ("vr_rollWhenHit", "0", CVAR_ARCHIVE);
 	vr_hudYOffset = Cvar_Get ("vr_hudYOffset", "0", CVAR_ARCHIVE);
 	vr_hudScale = Cvar_Get ("vr_hudScale", "1.0", CVAR_ARCHIVE);
@@ -129,7 +129,7 @@ void VR_InitCvars( void )
 
 	// Control schemas
 	Cvar_Get ("vr_uturn", "0", CVAR_ARCHIVE);
-	Cvar_Get ("vr_controlSchema", "1", CVAR_ARCHIVE);
+	Cvar_Get ("vr_controlSchema", "0", CVAR_ARCHIVE);
 	qboolean uturnEnabled = Cvar_VariableValue( "vr_uturn" ) != 0;
 	int controlSchema = (int)Cvar_VariableValue( "vr_controlSchema" ) % 3;
 	if (controlSchema == 0)
@@ -238,4 +238,22 @@ void VR_InitCvars( void )
 	Cvar_Get ("vr_button_map_PRIMARYTHUMBREST_ALT", "", CVAR_ARCHIVE); // unmapped
 	Cvar_Get ("vr_button_map_SECONDARYTHUMBREST", "+alt", CVAR_ARCHIVE); // Alt modifier
 	Cvar_Get ("vr_button_map_SECONDARYTHUMBREST_ALT", "", CVAR_ARCHIVE); // unmapped
+
+	// Steam Frame controls; other controllers never press these slots
+	Cvar_Get ("vr_button_map_LBUMPER", "+alt", CVAR_ARCHIVE);
+	Cvar_Get ("vr_button_map_LBUMPER_ALT", "", CVAR_ARCHIVE);
+	Cvar_Get ("vr_button_map_RBUMPER", "+alt", CVAR_ARCHIVE);
+	Cvar_Get ("vr_button_map_RBUMPER_ALT", "", CVAR_ARCHIVE);
+	Cvar_Get ("vr_button_map_DPAD_LEFT", "weapprev", CVAR_ARCHIVE);
+	Cvar_Get ("vr_button_map_DPAD_LEFT_ALT", "", CVAR_ARCHIVE);
+	Cvar_Get ("vr_button_map_DPAD_RIGHT", "weapnext", CVAR_ARCHIVE);
+	Cvar_Get ("vr_button_map_DPAD_RIGHT_ALT", "", CVAR_ARCHIVE);
+	Cvar_Get ("vr_button_map_DPAD_UP", "+button3", CVAR_ARCHIVE); // Gesture
+	Cvar_Get ("vr_button_map_DPAD_UP_ALT", "", CVAR_ARCHIVE);
+	Cvar_Get ("vr_button_map_DPAD_DOWN", "", CVAR_ARCHIVE);
+	Cvar_Get ("vr_button_map_DPAD_DOWN_ALT", "", CVAR_ARCHIVE);
+	Cvar_Get ("vr_button_map_PRIMARYGRIPCLICK", "", CVAR_ARCHIVE);
+	Cvar_Get ("vr_button_map_PRIMARYGRIPCLICK_ALT", "", CVAR_ARCHIVE);
+	Cvar_Get ("vr_button_map_SECONDARYGRIPCLICK", "", CVAR_ARCHIVE);
+	Cvar_Get ("vr_button_map_SECONDARYGRIPCLICK_ALT", "", CVAR_ARCHIVE);
 }

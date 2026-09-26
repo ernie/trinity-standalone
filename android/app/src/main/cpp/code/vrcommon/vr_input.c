@@ -36,6 +36,15 @@ XrAction aimPoseRightAction;
 XrAction indexLeftAction;
 XrAction indexRightAction;
 XrAction menuAction;
+XrAction bumperLeftAction;
+XrAction bumperRightAction;
+XrAction dpadUpAction;
+XrAction dpadDownAction;
+XrAction dpadLeftAction;
+XrAction dpadRightAction;
+XrAction viewAction;
+XrAction gripClickLeftAction;
+XrAction gripClickRightAction;
 XrAction buttonAAction;
 XrAction buttonBAction;
 XrAction buttonXAction;
@@ -126,6 +135,9 @@ extern cvar_t *m_yaw;
 #define EPSILON 0.001f
 #endif
 
+// Grip click has no VR_Button bit in the shared header, so it takes a free one locally
+#define VR_BUTTON_GRIP_CLICK 0x02000000
+
 extern cvar_t *vr_righthanded;
 extern cvar_t *vr_switchThumbsticks;
 extern cvar_t *vr_snapturn;
@@ -134,6 +146,68 @@ extern cvar_t *vr_weaponPitch;
 
 // The grip pose runs along the handle; this fixed pitch turns it into the pointing direction, vr_weaponPitch is the player's offset
 #define VR_GRIP_TO_AIM_PITCH (-90.0f)
+
+// Grip poses follow each handle's angle; measured on the headset, 0 until a controller needs one
+static const struct { const char* path; const char* name; float pitch; } vrProfiles[] = {
+	{ "/interaction_profiles/oculus/touch_controller", "Oculus Touch", 0.0f },
+	{ "/interaction_profiles/bytedance/pico4_controller", "PICO 4", 0.0f },
+	{ "/interaction_profiles/bytedance/pico4s_controller", "PICO 4 Ultra", 0.0f },
+	{ "/interaction_profiles/valve/index_controller", "Valve Index", 0.0f },
+	{ "/interaction_profiles/khr/simple_controller", "Simple", 0.0f },
+	{ "/interaction_profiles/valve/frame_controller_valve", "Steam Frame", 20.0f },
+};
+static int vrCurrentProfile[2] = { -1, -1 };
+
+static float VR_ProfilePitch( int hand )
+{
+	int p = vrCurrentProfile[hand];
+	return p >= 0 ? vrProfiles[p].pitch : 0.0f;
+}
+
+void VR_UpdateInteractionProfiles( void )
+{
+	VR_Engine* engine = VR_GetEngine();
+	XrPath hands[2] = { leftHandPath, rightHandPath };
+	for (int hand = 0; hand < 2; hand++)
+	{
+		XrInteractionProfileState state = {};
+		char path[XR_MAX_PATH_LENGTH];
+		uint32_t length = 0;
+		vrCurrentProfile[hand] = -1;
+		state.type = XR_TYPE_INTERACTION_PROFILE_STATE;
+		if (engine->appState.Session == XR_NULL_HANDLE || hands[hand] == XR_NULL_PATH ||
+			XR_FAILED(xrGetCurrentInteractionProfile(engine->appState.Session, hands[hand], &state)) ||
+			state.interactionProfile == XR_NULL_PATH ||
+			XR_FAILED(xrPathToString(engine->appState.Instance, state.interactionProfile, sizeof(path), &length, path)))
+		{
+			continue;
+		}
+		for (int p = 0; p < (int)(sizeof(vrProfiles) / sizeof(vrProfiles[0])); p++)
+		{
+			if (!strcmp(path, vrProfiles[p].path))
+				vrCurrentProfile[hand] = p;
+		}
+	}
+#if __ANDROID__
+	for (int hand = 0; hand < 2; hand++)
+	{
+		int p = vrCurrentProfile[hand];
+		__android_log_print(ANDROID_LOG_INFO, "OpenXR", "%s hand profile: %s", hand ? "right" : "left",
+			p >= 0 ? vrProfiles[p].name : "none");
+	}
+#endif
+}
+
+void VR_PrintInputInfo( void )
+{
+	for (int hand = 0; hand < 2; hand++)
+	{
+		int p = vrCurrentProfile[hand];
+		Com_Printf("%s hand: %s, pitch correction %g\n", hand ? "Right" : "Left",
+			p >= 0 ? vrProfiles[p].name : "none reported", (double)VR_ProfilePitch(hand));
+	}
+}
+
 extern cvar_t *vr_heightAdjust;
 extern cvar_t *vr_twoHandedWeapons;
 extern cvar_t *vr_refreshrate;
@@ -147,6 +221,7 @@ extern cvar_t *vr_weaponSelectorMode;
 extern cvar_t *vr_6dof;
 
 qboolean alt_key_mode_active = qfalse;
+static int altHeldCount = 0;
 
 void rotateAboutOrigin(float x, float y, float rotation, vec2_t out)
 {
@@ -290,7 +365,11 @@ static qboolean IN_SendInputAction(const char* action, qboolean inputActive, flo
 		}
 		else if (strcmp(action, "+alt") == 0)
 		{
-			alt_key_mode_active = inputActive;
+			// Either bumper (or thumbrest) holds alt; releasing one must not drop the other's hold
+			altHeldCount += inputActive ? 1 : -1;
+			if (altHeldCount < 0)
+				altHeldCount = 0;
+			alt_key_mode_active = altHeldCount > 0;
 		}
 		else if (strcmp(action, "+weapon_stabilise") == 0)
 		{
@@ -483,7 +562,9 @@ static void IN_VRDispatchScrubReleases(vrScrubRelease_t *releases, int count)
 
 static void IN_VRReleaseScrubActions(void)
 {
-	vrScrubRelease_t releases[2 * (9 + 1 + 8)];
+	// +8: PRIMARYGRIPCLICK/SECONDARYGRIPCLICK (1 per hand), RBUMPER, LBUMPER and
+	// the 4 D-pad slots (left hand only)
+	vrScrubRelease_t releases[2 * (9 + 1 + 8) + 8];
 	int count = 0;
 	const int flags[] = { VR_Button_GripTrigger, VR_Button_Trackpad,
 		VR_Button_LThumb, VR_Button_RThumb, VR_Button_A, VR_Button_B,
@@ -504,6 +585,20 @@ static void IN_VRReleaseScrubActions(void)
 			primary ? "PRIMARYTRIGGER" : "SECONDARYTRIGGER", qfalse);
 		for (int i = 0; i < 8; i++)
 			IN_VRCollectScrubRelease(releases, &count, &controller->axisButtons, 1 << i, axes[i], qtrue);
+		IN_VRCollectScrubRelease(releases, &count, &controller->buttons, VR_BUTTON_GRIP_CLICK,
+			primary ? "PRIMARYGRIPCLICK" : "SECONDARYGRIPCLICK", qfalse);
+		if (hand)
+		{
+			IN_VRCollectScrubRelease(releases, &count, &controller->buttons, VR_Button_RShoulder, "RBUMPER", qfalse);
+		}
+		else
+		{
+			IN_VRCollectScrubRelease(releases, &count, &controller->buttons, VR_Button_LShoulder, "LBUMPER", qfalse);
+			IN_VRCollectScrubRelease(releases, &count, &controller->buttons, VR_Button_Up, "DPAD_UP", qfalse);
+			IN_VRCollectScrubRelease(releases, &count, &controller->buttons, VR_Button_Down, "DPAD_DOWN", qfalse);
+			IN_VRCollectScrubRelease(releases, &count, &controller->buttons, VR_Button_Left, "DPAD_LEFT", qfalse);
+			IN_VRCollectScrubRelease(releases, &count, &controller->buttons, VR_Button_Right, "DPAD_RIGHT", qfalse);
+		}
 	}
 	IN_VRDispatchScrubReleases(releases, count);
 	for (int axis = 0; axis < 3; axis++)
@@ -787,6 +882,142 @@ XrActionStateVector2f GetActionStateVector2(XrAction action)
 	return state;
 }
 
+static int VR_SuggestBindings( VR_Engine* engine, const char* profile, const XrActionSuggestedBinding* bindings, int count )
+{
+	XrPath profilePath = XR_NULL_PATH;
+	OXR(xrStringToPath(engine->appState.Instance, profile, &profilePath));
+	XrInteractionProfileSuggestedBinding suggested = {};
+	suggested.type = XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING;
+	suggested.interactionProfile = profilePath;
+	suggested.suggestedBindings = bindings;
+	suggested.countSuggestedBindings = count;
+	XrResult result = xrSuggestInteractionProfileBindings(engine->appState.Instance, &suggested);
+	if (XR_FAILED(result))
+	{
+		// A runtime may not know every vendor's profile; the others still bind
+		printf("[OpenXR] %s bindings rejected (%d)\n", profile, (int)result);
+#if __ANDROID__
+		__android_log_print(ANDROID_LOG_INFO, "OpenXR", "%s bindings rejected (%d)", profile, (int)result);
+#endif
+		return 0;
+	}
+	printf("[OpenXR] %s bindings accepted\n", profile);
+#if __ANDROID__
+	__android_log_print(ANDROID_LOG_INFO, "OpenXR", "%s bindings accepted", profile);
+#endif
+	return 1;
+}
+
+// PICO's profiles expose the same paths as Touch
+static int VR_SuggestTouchBindings( VR_Engine* engine, const char* profile )
+{
+	XrActionSuggestedBinding bindings[32];
+	int n = 0;
+	bindings[n++] = ActionSuggestedBinding(indexLeftAction, "/user/hand/left/input/trigger");
+	bindings[n++] = ActionSuggestedBinding(indexRightAction, "/user/hand/right/input/trigger");
+	bindings[n++] = ActionSuggestedBinding(menuAction, "/user/hand/left/input/menu/click");
+	bindings[n++] = ActionSuggestedBinding(buttonXAction, "/user/hand/left/input/x/click");
+	bindings[n++] = ActionSuggestedBinding(buttonYAction, "/user/hand/left/input/y/click");
+	bindings[n++] = ActionSuggestedBinding(buttonAAction, "/user/hand/right/input/a/click");
+	bindings[n++] = ActionSuggestedBinding(buttonBAction, "/user/hand/right/input/b/click");
+	bindings[n++] = ActionSuggestedBinding(gripLeftAction, "/user/hand/left/input/squeeze/value");
+	bindings[n++] = ActionSuggestedBinding(gripRightAction, "/user/hand/right/input/squeeze/value");
+	bindings[n++] = ActionSuggestedBinding(moveOnLeftJoystickAction, "/user/hand/left/input/thumbstick");
+	bindings[n++] = ActionSuggestedBinding(moveOnRightJoystickAction, "/user/hand/right/input/thumbstick");
+	bindings[n++] = ActionSuggestedBinding(thumbstickLeftClickAction, "/user/hand/left/input/thumbstick/click");
+	bindings[n++] = ActionSuggestedBinding(thumbstickRightClickAction, "/user/hand/right/input/thumbstick/click");
+	bindings[n++] = ActionSuggestedBinding(thumbrestLeftTouchAction, "/user/hand/left/input/thumbrest/touch");
+	bindings[n++] = ActionSuggestedBinding(thumbrestRightTouchAction, "/user/hand/right/input/thumbrest/touch");
+	bindings[n++] = ActionSuggestedBinding(vibrateLeftFeedback, "/user/hand/left/output/haptic");
+	bindings[n++] = ActionSuggestedBinding(vibrateRightFeedback, "/user/hand/right/output/haptic");
+	bindings[n++] = ActionSuggestedBinding(handPoseLeftAction, "/user/hand/left/input/grip/pose");
+	bindings[n++] = ActionSuggestedBinding(handPoseRightAction, "/user/hand/right/input/grip/pose");
+	bindings[n++] = ActionSuggestedBinding(aimPoseLeftAction, "/user/hand/left/input/aim/pose");
+	bindings[n++] = ActionSuggestedBinding(aimPoseRightAction, "/user/hand/right/input/aim/pose");
+	return VR_SuggestBindings(engine, profile, bindings, n);
+}
+
+static int VR_SuggestIndexBindings( VR_Engine* engine )
+{
+	XrActionSuggestedBinding bindings[32];
+	int n = 0;
+	bindings[n++] = ActionSuggestedBinding(indexLeftAction, "/user/hand/left/input/trigger/value");
+	bindings[n++] = ActionSuggestedBinding(indexRightAction, "/user/hand/right/input/trigger/value");
+	bindings[n++] = ActionSuggestedBinding(menuAction, "/user/hand/left/input/system/click");
+	bindings[n++] = ActionSuggestedBinding(buttonXAction, "/user/hand/left/input/a/click");
+	bindings[n++] = ActionSuggestedBinding(buttonYAction, "/user/hand/left/input/b/click");
+	bindings[n++] = ActionSuggestedBinding(buttonAAction, "/user/hand/right/input/a/click");
+	bindings[n++] = ActionSuggestedBinding(buttonBAction, "/user/hand/right/input/b/click");
+	bindings[n++] = ActionSuggestedBinding(gripLeftAction, "/user/hand/left/input/squeeze/value");
+	bindings[n++] = ActionSuggestedBinding(gripRightAction, "/user/hand/right/input/squeeze/value");
+	bindings[n++] = ActionSuggestedBinding(trackpadLeftAction, "/user/hand/left/input/trackpad/force");
+	bindings[n++] = ActionSuggestedBinding(trackpadRightAction, "/user/hand/right/input/trackpad/force");
+	bindings[n++] = ActionSuggestedBinding(moveOnLeftJoystickAction, "/user/hand/left/input/thumbstick");
+	bindings[n++] = ActionSuggestedBinding(moveOnRightJoystickAction, "/user/hand/right/input/thumbstick");
+	bindings[n++] = ActionSuggestedBinding(thumbstickLeftClickAction, "/user/hand/left/input/thumbstick/click");
+	bindings[n++] = ActionSuggestedBinding(thumbstickRightClickAction, "/user/hand/right/input/thumbstick/click");
+	bindings[n++] = ActionSuggestedBinding(vibrateLeftFeedback, "/user/hand/left/output/haptic");
+	bindings[n++] = ActionSuggestedBinding(vibrateRightFeedback, "/user/hand/right/output/haptic");
+	bindings[n++] = ActionSuggestedBinding(handPoseLeftAction, "/user/hand/left/input/grip/pose");
+	bindings[n++] = ActionSuggestedBinding(handPoseRightAction, "/user/hand/right/input/grip/pose");
+	bindings[n++] = ActionSuggestedBinding(aimPoseLeftAction, "/user/hand/left/input/aim/pose");
+	bindings[n++] = ActionSuggestedBinding(aimPoseRightAction, "/user/hand/right/input/aim/pose");
+	return VR_SuggestBindings(engine, "/interaction_profiles/valve/index_controller", bindings, n);
+}
+
+static int VR_SuggestSimpleBindings( VR_Engine* engine )
+{
+	XrActionSuggestedBinding bindings[16];
+	int n = 0;
+	bindings[n++] = ActionSuggestedBinding(indexLeftAction, "/user/hand/left/input/select/click");
+	bindings[n++] = ActionSuggestedBinding(indexRightAction, "/user/hand/right/input/select/click");
+	bindings[n++] = ActionSuggestedBinding(buttonAAction, "/user/hand/left/input/menu/click");
+	bindings[n++] = ActionSuggestedBinding(buttonXAction, "/user/hand/right/input/menu/click");
+	bindings[n++] = ActionSuggestedBinding(vibrateLeftFeedback, "/user/hand/left/output/haptic");
+	bindings[n++] = ActionSuggestedBinding(vibrateRightFeedback, "/user/hand/right/output/haptic");
+	bindings[n++] = ActionSuggestedBinding(handPoseLeftAction, "/user/hand/left/input/grip/pose");
+	bindings[n++] = ActionSuggestedBinding(handPoseRightAction, "/user/hand/right/input/grip/pose");
+	bindings[n++] = ActionSuggestedBinding(aimPoseLeftAction, "/user/hand/left/input/aim/pose");
+	bindings[n++] = ActionSuggestedBinding(aimPoseRightAction, "/user/hand/right/input/aim/pose");
+	return VR_SuggestBindings(engine, "/interaction_profiles/khr/simple_controller", bindings, n);
+}
+
+// The Frame puts A/B/X/Y and Menu on the right controller, the D-pad and View on the left
+static int VR_SuggestFrameBindings( VR_Engine* engine )
+{
+	XrActionSuggestedBinding bindings[32];
+	int n = 0;
+	bindings[n++] = ActionSuggestedBinding(indexLeftAction, "/user/hand/left/input/trigger/value");
+	bindings[n++] = ActionSuggestedBinding(indexRightAction, "/user/hand/right/input/trigger/value");
+	bindings[n++] = ActionSuggestedBinding(menuAction, "/user/hand/right/input/menu/click");
+	bindings[n++] = ActionSuggestedBinding(buttonAAction, "/user/hand/right/input/a/click");
+	bindings[n++] = ActionSuggestedBinding(buttonBAction, "/user/hand/right/input/b/click");
+	bindings[n++] = ActionSuggestedBinding(buttonXAction, "/user/hand/right/input/x/click");
+	bindings[n++] = ActionSuggestedBinding(buttonYAction, "/user/hand/right/input/y/click");
+	bindings[n++] = ActionSuggestedBinding(gripLeftAction, "/user/hand/left/input/squeeze/value");
+	bindings[n++] = ActionSuggestedBinding(gripRightAction, "/user/hand/right/input/squeeze/value");
+	bindings[n++] = ActionSuggestedBinding(gripClickLeftAction, "/user/hand/left/input/squeeze/click");
+	bindings[n++] = ActionSuggestedBinding(gripClickRightAction, "/user/hand/right/input/squeeze/click");
+	bindings[n++] = ActionSuggestedBinding(bumperLeftAction, "/user/hand/left/input/bumper/click");
+	bindings[n++] = ActionSuggestedBinding(bumperRightAction, "/user/hand/right/input/bumper/click");
+	bindings[n++] = ActionSuggestedBinding(dpadUpAction, "/user/hand/left/input/dpad_up/click");
+	bindings[n++] = ActionSuggestedBinding(dpadDownAction, "/user/hand/left/input/dpad_down/click");
+	bindings[n++] = ActionSuggestedBinding(dpadLeftAction, "/user/hand/left/input/dpad_left/click");
+	bindings[n++] = ActionSuggestedBinding(dpadRightAction, "/user/hand/left/input/dpad_right/click");
+	bindings[n++] = ActionSuggestedBinding(viewAction, "/user/hand/left/input/view/click");
+	bindings[n++] = ActionSuggestedBinding(moveOnLeftJoystickAction, "/user/hand/left/input/thumbstick");
+	bindings[n++] = ActionSuggestedBinding(moveOnRightJoystickAction, "/user/hand/right/input/thumbstick");
+	bindings[n++] = ActionSuggestedBinding(thumbstickLeftClickAction, "/user/hand/left/input/thumbstick/click");
+	bindings[n++] = ActionSuggestedBinding(thumbstickRightClickAction, "/user/hand/right/input/thumbstick/click");
+	bindings[n++] = ActionSuggestedBinding(vibrateLeftFeedback, "/user/hand/left/output/haptic");
+	bindings[n++] = ActionSuggestedBinding(vibrateRightFeedback, "/user/hand/right/output/haptic");
+	bindings[n++] = ActionSuggestedBinding(handPoseLeftAction, "/user/hand/left/input/grip/pose");
+	bindings[n++] = ActionSuggestedBinding(handPoseRightAction, "/user/hand/right/input/grip/pose");
+	bindings[n++] = ActionSuggestedBinding(aimPoseLeftAction, "/user/hand/left/input/aim/pose");
+	bindings[n++] = ActionSuggestedBinding(aimPoseRightAction, "/user/hand/right/input/aim/pose");
+	return VR_SuggestBindings(engine, "/interaction_profiles/valve/frame_controller_valve", bindings, n);
+}
+
 void VR_InitInstanceInput( VR_Engine* engine )
 {
 	// Actions
@@ -810,6 +1041,15 @@ void VR_InitInstanceInput( VR_Engine* engine )
 	thumbrestRightTouchAction = CreateAction(runningActionSet, XR_ACTION_TYPE_BOOLEAN_INPUT, "thumbrest_right_touch", "Thumbrest Right Touch", 0, NULL);
 	vibrateLeftFeedback = CreateAction(runningActionSet, XR_ACTION_TYPE_VIBRATION_OUTPUT, "vibrate_left_feedback", "Vibrate Left Controller Feedback", 0, NULL);
 	vibrateRightFeedback = CreateAction(runningActionSet, XR_ACTION_TYPE_VIBRATION_OUTPUT, "vibrate_right_feedback", "Vibrate Right Controller Feedback", 0, NULL);
+	bumperLeftAction = CreateAction(runningActionSet, XR_ACTION_TYPE_BOOLEAN_INPUT, "bumper_left", "Bumper left", 0, NULL);
+	bumperRightAction = CreateAction(runningActionSet, XR_ACTION_TYPE_BOOLEAN_INPUT, "bumper_right", "Bumper right", 0, NULL);
+	dpadUpAction = CreateAction(runningActionSet, XR_ACTION_TYPE_BOOLEAN_INPUT, "dpad_up", "D-pad up", 0, NULL);
+	dpadDownAction = CreateAction(runningActionSet, XR_ACTION_TYPE_BOOLEAN_INPUT, "dpad_down", "D-pad down", 0, NULL);
+	dpadLeftAction = CreateAction(runningActionSet, XR_ACTION_TYPE_BOOLEAN_INPUT, "dpad_left", "D-pad left", 0, NULL);
+	dpadRightAction = CreateAction(runningActionSet, XR_ACTION_TYPE_BOOLEAN_INPUT, "dpad_right", "D-pad right", 0, NULL);
+	viewAction = CreateAction(runningActionSet, XR_ACTION_TYPE_BOOLEAN_INPUT, "view", "View", 0, NULL);
+	gripClickLeftAction = CreateAction(runningActionSet, XR_ACTION_TYPE_BOOLEAN_INPUT, "grip_click_left", "Grip click left", 0, NULL);
+	gripClickRightAction = CreateAction(runningActionSet, XR_ACTION_TYPE_BOOLEAN_INPUT, "grip_click_right", "Grip click right", 0, NULL);
 
 	OXR(xrStringToPath(engine->appState.Instance, "/user/hand/left", &leftHandPath));
 	OXR(xrStringToPath(engine->appState.Instance, "/user/hand/right", &rightHandPath));
@@ -818,188 +1058,28 @@ void VR_InitInstanceInput( VR_Engine* engine )
 	aimPoseLeftAction = CreateAction(runningActionSet, XR_ACTION_TYPE_POSE_INPUT, "aim_pose_left", NULL, 1, &leftHandPath);
 	aimPoseRightAction = CreateAction(runningActionSet, XR_ACTION_TYPE_POSE_INPUT, "aim_pose_right", NULL, 1, &rightHandPath);
 
-	XrPath interactionProfilePath = XR_NULL_PATH;
-	XrPath interactionProfilePathValveIndex = XR_NULL_PATH;
-	XrPath interactionProfilePathOculusTouch = XR_NULL_PATH;
-	XrPath interactionProfilePathKHRSimple = XR_NULL_PATH;
-	// PICO's native profiles (XR_BD_controller_interaction); same input paths as Touch.
-	XrPath interactionProfilePathPico4s = XR_NULL_PATH;
-	XrPath interactionProfilePathPico4 = XR_NULL_PATH;
-	OXR(xrStringToPath(engine->appState.Instance, "/interaction_profiles/valve/index_controller", &interactionProfilePathValveIndex));
-	OXR(xrStringToPath(engine->appState.Instance, "/interaction_profiles/oculus/touch_controller", &interactionProfilePathOculusTouch));
-	OXR(xrStringToPath(engine->appState.Instance, "/interaction_profiles/khr/simple_controller", &interactionProfilePathKHRSimple));
-	OXR(xrStringToPath(engine->appState.Instance, "/interaction_profiles/bytedance/pico4s_controller", &interactionProfilePathPico4s));
-	OXR(xrStringToPath(engine->appState.Instance, "/interaction_profiles/bytedance/pico4_controller", &interactionProfilePathPico4));
-
-	// Toggle this to force simple as a first choice, otherwise use it as a last resort
+	// Every profile is suggested; the runtime binds whichever matches the connected controllers
+	int accepted = 0;
 	if (useSimpleProfile)
 	{
-		printf("xrSuggestInteractionProfileBindings found bindings for Khronos SIMPLE controller");
-		interactionProfilePath = interactionProfilePathKHRSimple;
+		accepted += VR_SuggestSimpleBindings(engine);
 	}
 	else
 	{
-		// Query Set
-		XrActionSet queryActionSet = CreateActionSet(1, "query_action_set", "Action Set used to query device caps");
-		XrAction dummyAction = CreateAction(queryActionSet, XR_ACTION_TYPE_BOOLEAN_INPUT, "dummy_action", "Dummy Action", 0, NULL);
-
-		// Map bindings
-		XrActionSuggestedBinding bindings[1];
-		int currBinding = 0;
-		bindings[currBinding++] = ActionSuggestedBinding(dummyAction, "/user/hand/right/input/system/click");
-
-		XrInteractionProfileSuggestedBinding suggestedBindings = {};
-		suggestedBindings.type = XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING;
-		suggestedBindings.next = NULL;
-		suggestedBindings.suggestedBindings = bindings;
-		suggestedBindings.countSuggestedBindings = currBinding;
-
-		// Determine controller priority based on detected HMD
-		// This ensures we try the HMD's native controller first, which should
-		// cover the vast majority of use cases (Quest HMD with Quest controllers,
-		// Index HMD with Index controllers, etc.)
-		const char* systemName = engine->systemProperties.SystemProperties.systemName;
-
-		// The runtime name identifies the vendor when the system name does not.
-		XrInstanceProperties instanceProps;
-		memset(&instanceProps, 0, sizeof(instanceProps));
-		instanceProps.type = XR_TYPE_INSTANCE_PROPERTIES;
-		OXR(xrGetInstanceProperties(engine->appState.Instance, &instanceProps));
-		const char* runtimeName = instanceProps.runtimeName;
-
-		XrPath interactionProfiles[5];
-		const char* interactionProfileNames[5];
-
-		// Check for Valve Index HMD
-		if (strstr(systemName, "Index") != NULL)
+		accepted += VR_SuggestTouchBindings(engine, "/interaction_profiles/oculus/touch_controller");
+		if (VR_HasPicoControllers())
 		{
-			printf("[OpenXR] Detected Valve Index HMD (%s), prioritizing Index controllers\n", systemName);
-			const XrPath profiles[] = { interactionProfilePathValveIndex, interactionProfilePathOculusTouch, interactionProfilePathPico4s, interactionProfilePathPico4, interactionProfilePathKHRSimple };
-			const char* names[] = { "Valve Index", "Oculus Quest", "PICO 4 Ultra", "PICO 4", "Simple" };
-			memcpy(interactionProfiles, profiles, sizeof(interactionProfiles));
-			memcpy(interactionProfileNames, names, sizeof(interactionProfileNames));
+			accepted += VR_SuggestTouchBindings(engine, "/interaction_profiles/bytedance/pico4s_controller");
+			accepted += VR_SuggestTouchBindings(engine, "/interaction_profiles/bytedance/pico4_controller");
 		}
-		else if (Q_stristr(systemName, "pico") != NULL || Q_stristr(runtimeName, "pico") != NULL)
-		{
-			printf("[OpenXR] Detected PICO HMD (%s / %s), prioritizing PICO controllers\n", systemName, runtimeName);
-			const XrPath profiles[] = { interactionProfilePathPico4s, interactionProfilePathPico4, interactionProfilePathOculusTouch, interactionProfilePathValveIndex, interactionProfilePathKHRSimple };
-			const char* names[] = { "PICO 4 Ultra", "PICO 4", "Oculus Quest", "Valve Index", "Simple" };
-			memcpy(interactionProfiles, profiles, sizeof(interactionProfiles));
-			memcpy(interactionProfileNames, names, sizeof(interactionProfileNames));
-		}
-		else
-		{
-			// Default to Oculus Touch controllers for all other HMDs
-			const XrPath profiles[] = { interactionProfilePathOculusTouch, interactionProfilePathValveIndex, interactionProfilePathPico4s, interactionProfilePathPico4, interactionProfilePathKHRSimple };
-			const char* names[] = { "Oculus Quest", "Valve Index", "PICO 4 Ultra", "PICO 4", "Simple" };
-			memcpy(interactionProfiles, profiles, sizeof(interactionProfiles));
-			memcpy(interactionProfileNames, names, sizeof(interactionProfileNames));
-		}
-
-		const size_t profilesCount = sizeof(interactionProfiles)/sizeof(interactionProfiles[0]);
-
-		// Try until found supported one
-		for (size_t profileIdx = 0; profileIdx < profilesCount; ++profileIdx)
-		{
-			suggestedBindings.interactionProfile = interactionProfiles[profileIdx];
-			XrResult suggestTouchResult = xrSuggestInteractionProfileBindings(engine->appState.Instance, &suggestedBindings);
-			if (XR_SUCCESS == suggestTouchResult)
-			{
-				printf("[OpenXR] Found supported bindings for %s controller\n", interactionProfileNames[profileIdx]);
-#if __ANDROID__
-				__android_log_print(ANDROID_LOG_INFO, "OpenXR", "System \"%s\" on runtime \"%s\": using %s controller bindings", systemName, runtimeName, interactionProfileNames[profileIdx]);
-#endif
-				interactionProfilePath = interactionProfiles[profileIdx];
-				break;
-			}
-		}
-
-		if (interactionProfilePath == XR_NULL_PATH)
-		{
-			CHECK(XR_FALSE, "Failed to find supported controller bindings");
-		}
+		accepted += VR_SuggestIndexBindings(engine);
+		if (VR_HasFrameControllers())
+			accepted += VR_SuggestFrameBindings(engine);
+		accepted += VR_SuggestSimpleBindings(engine);
 	}
-
-	// Action creation
+	if (!accepted)
 	{
-		// Map bindings
-		XrActionSuggestedBinding bindings[32]; // large enough for all profiles
-		int currBinding = 0;
-
-		{
-			if (interactionProfilePath == interactionProfilePathValveIndex)
-			{
-				bindings[currBinding++] = ActionSuggestedBinding(indexLeftAction, "/user/hand/left/input/trigger/value");
-				bindings[currBinding++] = ActionSuggestedBinding(indexRightAction, "/user/hand/right/input/trigger/value");
-				bindings[currBinding++] = ActionSuggestedBinding(menuAction, "/user/hand/left/input/system/click");
-				bindings[currBinding++] = ActionSuggestedBinding(buttonXAction, "/user/hand/left/input/a/click");
-				bindings[currBinding++] = ActionSuggestedBinding(buttonYAction, "/user/hand/left/input/b/click");
-				bindings[currBinding++] = ActionSuggestedBinding(buttonAAction, "/user/hand/right/input/a/click");
-				bindings[currBinding++] = ActionSuggestedBinding(buttonBAction, "/user/hand/right/input/b/click");
-				bindings[currBinding++] = ActionSuggestedBinding(gripLeftAction, "/user/hand/left/input/squeeze/value");
-				bindings[currBinding++] = ActionSuggestedBinding(gripRightAction, "/user/hand/right/input/squeeze/value");
-				bindings[currBinding++] = ActionSuggestedBinding(trackpadLeftAction, "/user/hand/left/input/trackpad/force");
-				bindings[currBinding++] = ActionSuggestedBinding(trackpadRightAction, "/user/hand/right/input/trackpad/force");
-				bindings[currBinding++] = ActionSuggestedBinding(moveOnLeftJoystickAction, "/user/hand/left/input/thumbstick");
-				bindings[currBinding++] = ActionSuggestedBinding(moveOnRightJoystickAction, "/user/hand/right/input/thumbstick");
-				bindings[currBinding++] = ActionSuggestedBinding(thumbstickLeftClickAction, "/user/hand/left/input/thumbstick/click");
-				bindings[currBinding++] = ActionSuggestedBinding(thumbstickRightClickAction, "/user/hand/right/input/thumbstick/click");
-				bindings[currBinding++] = ActionSuggestedBinding(vibrateLeftFeedback, "/user/hand/left/output/haptic");
-				bindings[currBinding++] = ActionSuggestedBinding(vibrateRightFeedback, "/user/hand/right/output/haptic");
-				bindings[currBinding++] = ActionSuggestedBinding(handPoseLeftAction, "/user/hand/left/input/grip/pose");
-				bindings[currBinding++] = ActionSuggestedBinding(handPoseRightAction, "/user/hand/right/input/grip/pose");
-				bindings[currBinding++] = ActionSuggestedBinding(aimPoseLeftAction, "/user/hand/left/input/aim/pose");
-				bindings[currBinding++] = ActionSuggestedBinding(aimPoseRightAction, "/user/hand/right/input/aim/pose");
-			}
-			else if (interactionProfilePath == interactionProfilePathOculusTouch ||
-					 interactionProfilePath == interactionProfilePathPico4s ||
-					 interactionProfilePath == interactionProfilePathPico4)
-			{
-				// PICO's profiles expose the same paths as Touch
-				bindings[currBinding++] = ActionSuggestedBinding(indexLeftAction, "/user/hand/left/input/trigger");
-				bindings[currBinding++] = ActionSuggestedBinding(indexRightAction, "/user/hand/right/input/trigger");
-				bindings[currBinding++] = ActionSuggestedBinding(menuAction, "/user/hand/left/input/menu/click");
-				bindings[currBinding++] = ActionSuggestedBinding(buttonXAction, "/user/hand/left/input/x/click");
-				bindings[currBinding++] = ActionSuggestedBinding(buttonYAction, "/user/hand/left/input/y/click");
-				bindings[currBinding++] = ActionSuggestedBinding(buttonAAction, "/user/hand/right/input/a/click");
-				bindings[currBinding++] = ActionSuggestedBinding(buttonBAction, "/user/hand/right/input/b/click");
-				bindings[currBinding++] = ActionSuggestedBinding(gripLeftAction, "/user/hand/left/input/squeeze/value");
-				bindings[currBinding++] = ActionSuggestedBinding(gripRightAction, "/user/hand/right/input/squeeze/value");
-				bindings[currBinding++] = ActionSuggestedBinding(moveOnLeftJoystickAction, "/user/hand/left/input/thumbstick");
-				bindings[currBinding++] = ActionSuggestedBinding(moveOnRightJoystickAction, "/user/hand/right/input/thumbstick");
-				bindings[currBinding++] = ActionSuggestedBinding(thumbstickLeftClickAction, "/user/hand/left/input/thumbstick/click");
-				bindings[currBinding++] = ActionSuggestedBinding(thumbstickRightClickAction, "/user/hand/right/input/thumbstick/click");
-				bindings[currBinding++] = ActionSuggestedBinding(thumbrestLeftTouchAction, "/user/hand/left/input/thumbrest/touch");
-				bindings[currBinding++] = ActionSuggestedBinding(thumbrestRightTouchAction, "/user/hand/right/input/thumbrest/touch");
-				bindings[currBinding++] = ActionSuggestedBinding(vibrateLeftFeedback, "/user/hand/left/output/haptic");
-				bindings[currBinding++] = ActionSuggestedBinding(vibrateRightFeedback, "/user/hand/right/output/haptic");
-				bindings[currBinding++] = ActionSuggestedBinding(handPoseLeftAction, "/user/hand/left/input/grip/pose");
-				bindings[currBinding++] = ActionSuggestedBinding(handPoseRightAction, "/user/hand/right/input/grip/pose");
-				bindings[currBinding++] = ActionSuggestedBinding(aimPoseLeftAction, "/user/hand/left/input/aim/pose");
-				bindings[currBinding++] = ActionSuggestedBinding(aimPoseRightAction, "/user/hand/right/input/aim/pose");
-			}
-			else if (interactionProfilePath == interactionProfilePathKHRSimple)
-			{
-				bindings[currBinding++] = ActionSuggestedBinding(indexLeftAction, "/user/hand/left/input/select/click");
-				bindings[currBinding++] = ActionSuggestedBinding(indexRightAction, "/user/hand/right/input/select/click");
-				bindings[currBinding++] = ActionSuggestedBinding(buttonAAction, "/user/hand/left/input/menu/click");
-				bindings[currBinding++] = ActionSuggestedBinding(buttonXAction, "/user/hand/right/input/menu/click");
-				bindings[currBinding++] = ActionSuggestedBinding(vibrateLeftFeedback, "/user/hand/left/output/haptic");
-				bindings[currBinding++] = ActionSuggestedBinding(vibrateRightFeedback, "/user/hand/right/output/haptic");
-				bindings[currBinding++] = ActionSuggestedBinding(handPoseLeftAction, "/user/hand/left/input/grip/pose");
-				bindings[currBinding++] = ActionSuggestedBinding(handPoseRightAction, "/user/hand/right/input/grip/pose");
-				bindings[currBinding++] = ActionSuggestedBinding(aimPoseLeftAction, "/user/hand/left/input/aim/pose");
-				bindings[currBinding++] = ActionSuggestedBinding(aimPoseRightAction, "/user/hand/right/input/aim/pose");
-			}
-		}
-
-		XrInteractionProfileSuggestedBinding suggestedBindings = {};
-		suggestedBindings.type = XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING;
-		suggestedBindings.next = NULL;
-		suggestedBindings.interactionProfile = interactionProfilePath;
-		suggestedBindings.suggestedBindings = bindings;
-		suggestedBindings.countSuggestedBindings = currBinding;
-		OXR(xrSuggestInteractionProfileBindings(engine->appState.Instance, &suggestedBindings));
+		CHECK(XR_FALSE, "Failed to find supported controller bindings");
 	}
 }
 
@@ -1012,6 +1092,10 @@ void VR_InitSessionInput( VR_Engine* engine )
 
 	memset(&leftController, 0, sizeof(leftController));
 	memset(&rightController, 0, sizeof(rightController));
+	// The memsets above clear activated flags without releasing them; a bumper or
+	// thumbrest held across the rebuild must not leave alt stuck on
+	altHeldCount = 0;
+	alt_key_mode_active = qfalse;
 
 	leftControllerGripSpace = CreateActionSpace(handPoseLeftAction, leftHandPath);
 	rightControllerGripSpace = CreateActionSpace(handPoseRightAction, rightHandPath);
@@ -1042,7 +1126,16 @@ void VR_InitSessionInput( VR_Engine* engine )
 		vibrateLeftFeedback,
 		vibrateRightFeedback,
 		handPoseLeftAction,
-		handPoseRightAction
+		handPoseRightAction,
+		bumperLeftAction,
+		bumperRightAction,
+		dpadUpAction,
+		dpadDownAction,
+		dpadLeftAction,
+		dpadRightAction,
+		viewAction,
+		gripClickLeftAction,
+		gripClickRightAction
 	};
 	for (size_t i = 0; i < sizeof(actionsToEnumerate) / sizeof(actionsToEnumerate[0]); ++i)
 	{
@@ -1100,6 +1193,8 @@ void VR_InitSessionInput( VR_Engine* engine )
 	attachInfo.actionSets = &runningActionSet;
 	XR_CHECK(xrAttachSessionActionSets(engine->appState.Session, &attachInfo), "");
 
+	VR_UpdateInteractionProfiles();
+
 	inputInitialized = qtrue;
 }
 
@@ -1108,6 +1203,7 @@ void VR_DestroySessionInput( VR_Engine* engine )
 	VR_CancelTVDInput();
 	// This will allow to recreate session-specific OpenXR input objects
 	inputInitialized = qfalse;
+	vrCurrentProfile[0] = vrCurrentProfile[1] = -1;
 }
 
 static void IN_VRController( qboolean isRightController, XrPosef pose )
@@ -1117,7 +1213,7 @@ static void IN_VRController( qboolean isRightController, XrPosef pose )
 	if (isRightController == (vr_righthanded->integer != 0))
 	{
 		//Set gun angles - We need to calculate all those we might need (including adjustments) for the client to then take its pick
-		rotation[PITCH] = VR_GRIP_TO_AIM_PITCH + vr_weaponPitch->value;
+		rotation[PITCH] = VR_GRIP_TO_AIM_PITCH + VR_ProfilePitch(isRightController ? 1 : 0) + vr_weaponPitch->value;
 		QuatToYawPitchRoll(pose.orientation, rotation, vr.weaponangles);
 
 		VectorSubtract(vr.weaponangles_last, vr.weaponangles, vr.weaponangles_delta);
@@ -1134,7 +1230,7 @@ static void IN_VRController( qboolean isRightController, XrPosef pose )
 	}
 	else
 	{
-		rotation[PITCH] = VR_GRIP_TO_AIM_PITCH + vr_weaponPitch->value;
+		rotation[PITCH] = VR_GRIP_TO_AIM_PITCH + VR_ProfilePitch(isRightController ? 1 : 0) + vr_weaponPitch->value;
 		QuatToYawPitchRoll(pose.orientation, rotation, vr.offhandangles);
 		// Steering follows the corrected grip angles too: "forward" is how the hand is held, not the aim ray
 		VectorCopy(vr.offhandangles, vr.offhandangles2);
@@ -1784,6 +1880,18 @@ static void IN_VRTriggers( qboolean isRightController, float triggerValue )
 	}
 }
 
+static void IN_VRButtonSlot( vrController_t* controller, uint32_t buttons, int flag, char* slot )
+{
+	if (buttons & flag)
+	{
+		IN_HandleActiveInput(&controller->buttons, flag, slot, 0, qfalse);
+	}
+	else
+	{
+		IN_HandleInactiveInput(&controller->buttons, flag, slot, 0, qfalse);
+	}
+}
+
 static void IN_VRButtons( qboolean isRightController, uint32_t buttons )
 {
 	vrController_t* controller = isRightController == qtrue ? &rightController : &leftController;
@@ -1871,6 +1979,17 @@ static void IN_VRButtons( qboolean isRightController, uint32_t buttons )
 		Com_QueueEvent(in_vrEventTime, SE_KEY, K_ESCAPE, qfalse, 0, NULL);
 	}
 
+	// View (Steam Frame) is hard-wired like Menu so it can close the console it opened
+	if ((buttons & VR_Button_Back) && !IN_InputActivated(&controller->buttons, VR_Button_Back))
+	{
+		IN_ActivateInput(&controller->buttons, VR_Button_Back);
+		Cbuf_AddText("toggleconsole\n");
+	}
+	else if (!(buttons & VR_Button_Back))
+	{
+		IN_DeactivateInput(&controller->buttons, VR_Button_Back);
+	}
+
 	/* IN_VRTVScrub settles grip ownership for both hands before either dispatches. */
 	if (tvdInput.blocked)
 	{
@@ -1912,6 +2031,21 @@ static void IN_VRButtons( qboolean isRightController, uint32_t buttons )
 		{
 			IN_HandleInactiveInput(&controller->buttons, VR_Button_Trackpad, "PRIMARYTRACKPAD", 0, qfalse);
 		}
+	}
+
+	IN_VRButtonSlot(controller, buttons, VR_BUTTON_GRIP_CLICK,
+		isRightController == !vr_righthanded->integer ? "SECONDARYGRIPCLICK" : "PRIMARYGRIPCLICK");
+	if (isRightController)
+	{
+		IN_VRButtonSlot(controller, buttons, VR_Button_RShoulder, "RBUMPER");
+	}
+	else
+	{
+		IN_VRButtonSlot(controller, buttons, VR_Button_LShoulder, "LBUMPER");
+		IN_VRButtonSlot(controller, buttons, VR_Button_Up, "DPAD_UP");
+		IN_VRButtonSlot(controller, buttons, VR_Button_Down, "DPAD_DOWN");
+		IN_VRButtonSlot(controller, buttons, VR_Button_Left, "DPAD_LEFT");
+		IN_VRButtonSlot(controller, buttons, VR_Button_Right, "DPAD_RIGHT");
 	}
 
 	if (isRightController == !vr_righthanded->integer)
@@ -2218,6 +2352,13 @@ void VR_ProcessInputActions( void )
 	if (GetActionStateFloat(trackpadLeftAction).currentState > 0.3f) lButtons |= VR_Button_Trackpad;
 	if (GetActionStateBoolean(thumbstickLeftClickAction).currentState) lButtons |= VR_Button_LThumb;
 	if (GetActionStateBoolean(thumbrestLeftTouchAction).currentState) lButtons |= VR_Button_Thumbrest;
+	if (GetActionStateBoolean(bumperLeftAction).currentState) lButtons |= VR_Button_LShoulder;
+	if (GetActionStateBoolean(dpadUpAction).currentState) lButtons |= VR_Button_Up;
+	if (GetActionStateBoolean(dpadDownAction).currentState) lButtons |= VR_Button_Down;
+	if (GetActionStateBoolean(dpadLeftAction).currentState) lButtons |= VR_Button_Left;
+	if (GetActionStateBoolean(dpadRightAction).currentState) lButtons |= VR_Button_Right;
+	if (GetActionStateBoolean(viewAction).currentState) lButtons |= VR_Button_Back;
+	if (GetActionStateBoolean(gripClickLeftAction).currentState) lButtons |= VR_BUTTON_GRIP_CLICK;
 	uint32_t rButtons = 0;
 	if (GetActionStateBoolean(buttonAAction).currentState) rButtons |= VR_Button_A;
 	if (GetActionStateBoolean(buttonBAction).currentState) rButtons |= VR_Button_B;
@@ -2226,6 +2367,8 @@ void VR_ProcessInputActions( void )
 	if (GetActionStateFloat(trackpadRightAction).currentState > 0.3f) rButtons |= VR_Button_Trackpad;
 	if (GetActionStateBoolean(thumbstickRightClickAction).currentState) rButtons |= VR_Button_RThumb;
 	if (GetActionStateBoolean(thumbrestRightTouchAction).currentState) rButtons |= VR_Button_Thumbrest;
+	if (GetActionStateBoolean(bumperRightAction).currentState) rButtons |= VR_Button_RShoulder;
+	if (GetActionStateBoolean(gripClickRightAction).currentState) rButtons |= VR_BUTTON_GRIP_CLICK;
 	IN_VRTVScrub(lButtons, rButtons, leftGrip, rightGrip);
 	IN_VRButtons(qfalse, lButtons);
 	IN_VRButtons(qtrue, rButtons);

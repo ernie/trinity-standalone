@@ -8,6 +8,14 @@ XrFrameState VR_WaitFrame(XrSession session);
 void VR_BeginFrame(XrSession session);
 XrViewState VR_LocateViews(XrSession session, XrTime predictedDisplayTime, XrSpace space, XrView* views, uint32_t* viewCount);
 void VR_EndFrame(XrSession session, VR_SwapchainInfos* swapchains, XrView* views, uint32_t viewCount, XrSpace worldSpace, XrSpace viewSpace, XrTime predictedDisplayTime);
-qboolean VR_BuildVirtualScreenLayer(VR_SwapchainInfos* swapchains, const XrView* views, uint32_t viewCount, XrSpace worldSpace, XrCompositionLayerCylinderKHR* out);
+// A cylinder where the runtime supports it, otherwise a flat quad; submit it through header
+typedef union
+{
+	XrCompositionLayerBaseHeader header;
+	XrCompositionLayerCylinderKHR cylinder;
+	XrCompositionLayerQuad quad;
+} VR_ScreenLayer;
+
+qboolean VR_BuildVirtualScreenLayer(VR_SwapchainInfos* swapchains, const XrView* views, uint32_t viewCount, XrSpace worldSpace, VR_ScreenLayer* out);
 
 #endif

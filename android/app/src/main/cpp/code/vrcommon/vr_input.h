@@ -19,6 +19,9 @@ void IN_VRUpdateControllers( VR_Engine* engine, XrTime predictedDisplayTime );
 
 void VR_HapticEvent(const char* event, int position, int flags, int intensity, float angle, float yHeight );
 
+void VR_UpdateInteractionProfiles( void );
+void VR_PrintInputInfo( void );
+
 const char* VR_GetMenuSkipButtonName( void );
 const char* VR_GetMenuCancelButtonName( void );
 

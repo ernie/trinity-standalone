@@ -62,7 +62,7 @@ static void ReportFailure( const char *what, XrResult result )
 // The virtual screen with the swapchain's last released image; nothing until there is one
 static XrResult SubmitLoadingLayers( VR_Engine *engine, XrTime displayTime )
 {
-	XrCompositionLayerCylinderKHR screen;
+	VR_ScreenLayer screen;
 	const XrCompositionLayerBaseHeader *layers[1];
 	uint32_t layerCount = 0;
 	XrFrameEndInfo endInfo = { XR_TYPE_FRAME_END_INFO, NULL };
@@ -71,7 +71,7 @@ static XrResult SubmitLoadingLayers( VR_Engine *engine, XrTime displayTime )
 	if ( swapchains && swapchains->color.everReleased &&
 		VR_BuildVirtualScreenLayer( swapchains, views, viewCount, engine->appState.CurrentSpace, &screen ) )
 	{
-		layers[layerCount++] = (const XrCompositionLayerBaseHeader *)&screen;
+		layers[layerCount++] = &screen.header;
 	}
 
 	endInfo.displayTime = displayTime;

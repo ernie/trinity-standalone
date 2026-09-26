@@ -23,6 +23,7 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 
 #include "client.h"
 
+#include "../vrcommon/vr_base.h"
 #include "../vrcommon/vr_input.h"
 #include "../vrcommon/vr_clientinfo.h"
 
@@ -987,6 +988,7 @@ CL_InitInput
 */
 void CL_InitInput( void ) {
 	Cmd_AddCommand ("centerview",IN_CenterView);
+	Cmd_AddCommand ("xr_info", VR_Info_f);
 
 	Cmd_AddCommand ("+moveup",IN_UpDown);
 	Cmd_AddCommand ("-moveup",IN_UpUp);
@@ -1064,6 +1066,7 @@ CL_ShutdownInput
 void CL_ShutdownInput(void)
 {
 	Cmd_RemoveCommand("centerview");
+	Cmd_RemoveCommand("xr_info");
 
 	Cmd_RemoveCommand("+moveup");
 	Cmd_RemoveCommand("-moveup");
