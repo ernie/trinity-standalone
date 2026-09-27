@@ -59,7 +59,8 @@ vec3 dither(vec3 color) {
 
 void main() {
 	float layer = float(view_index);
-	vec3 base = texture(sceneColor, vec3(frag_tex_coord, layer)).rgb;
+	vec4 scene = texture(sceneColor, vec3(frag_tex_coord, layer));
+	vec3 base = scene.rgb;
 
 	// Blur is from this frame's scene, so it lines up and needs no reprojection
 	vec3 bloom = texture(texture0, vec3(frag_tex_coord, layer)).rgb
@@ -67,8 +68,8 @@ void main() {
 	           + texture(texture2, vec3(frag_tex_coord, layer)).rgb
 	           + texture(texture3, vec3(frag_tex_coord, layer)).rgb;
 
-	// Additive blend with bloom factor (same as blend.frag)
-	base = base + bloom * bloomFactor;
+	// bloom lands under the post-scene draws: the scene's alpha is what they let through
+	base = base + bloom * bloomFactor * scene.a;
 
 	// Greyscale conversion (from gamma.frag)
 	if ( greyscale == 1 )

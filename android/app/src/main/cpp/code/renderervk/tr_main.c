@@ -639,31 +639,48 @@ static void R_SetupFrustum( void )
 		fovUp = fovDown = tr.viewParms.fovY * 0.5f;
 	}
 
-	ang = fovX / 180 * M_PI * 0.5f;
-	xs = sinf( ang );
-	xc = cosf( ang );
+	if ( tr.viewParms.cullTangentsSet ) {
+		const float *t = tr.viewParms.cullTangents;
 
-	VectorScale( tr.viewParms.or.axis[0], xs, tr.viewParms.frustum[0].normal );
-	VectorMA( tr.viewParms.frustum[0].normal, xc, tr.viewParms.or.axis[1], tr.viewParms.frustum[0].normal );
+		// right, left, bottom, top, leaning as the full planes below do
+		VectorScale( tr.viewParms.or.axis[0], t[0], tr.viewParms.frustum[0].normal );
+		VectorAdd( tr.viewParms.frustum[0].normal, tr.viewParms.or.axis[1], tr.viewParms.frustum[0].normal );
+		VectorScale( tr.viewParms.or.axis[0], -t[1], tr.viewParms.frustum[1].normal );
+		VectorSubtract( tr.viewParms.frustum[1].normal, tr.viewParms.or.axis[1], tr.viewParms.frustum[1].normal );
+		VectorScale( tr.viewParms.or.axis[0], -t[3], tr.viewParms.frustum[2].normal );
+		VectorAdd( tr.viewParms.frustum[2].normal, tr.viewParms.or.axis[2], tr.viewParms.frustum[2].normal );
+		VectorScale( tr.viewParms.or.axis[0], t[2], tr.viewParms.frustum[3].normal );
+		VectorSubtract( tr.viewParms.frustum[3].normal, tr.viewParms.or.axis[2], tr.viewParms.frustum[3].normal );
+		for ( i = 0; i < 4; i++ ) {
+			VectorNormalize( tr.viewParms.frustum[i].normal );
+		}
+	} else {
+		ang = fovX / 180 * M_PI * 0.5f;
+		xs = sinf( ang );
+		xc = cosf( ang );
 
-	VectorScale( tr.viewParms.or.axis[0], xs, tr.viewParms.frustum[1].normal );
-	VectorMA( tr.viewParms.frustum[1].normal, -xc, tr.viewParms.or.axis[1], tr.viewParms.frustum[1].normal );
+		VectorScale( tr.viewParms.or.axis[0], xs, tr.viewParms.frustum[0].normal );
+		VectorMA( tr.viewParms.frustum[0].normal, xc, tr.viewParms.or.axis[1], tr.viewParms.frustum[0].normal );
 
-	// Bottom plane (normal leans up)
-	ang = fovDown / 180 * M_PI;
-	xs = sinf( ang );
-	xc = cosf( ang );
+		VectorScale( tr.viewParms.or.axis[0], xs, tr.viewParms.frustum[1].normal );
+		VectorMA( tr.viewParms.frustum[1].normal, -xc, tr.viewParms.or.axis[1], tr.viewParms.frustum[1].normal );
 
-	VectorScale( tr.viewParms.or.axis[0], xs, tr.viewParms.frustum[2].normal );
-	VectorMA( tr.viewParms.frustum[2].normal, xc, tr.viewParms.or.axis[2], tr.viewParms.frustum[2].normal );
+		// Bottom plane (normal leans up)
+		ang = fovDown / 180 * M_PI;
+		xs = sinf( ang );
+		xc = cosf( ang );
 
-	// Top plane (normal leans down)
-	ang = fovUp / 180 * M_PI;
-	xs = sinf( ang );
-	xc = cosf( ang );
+		VectorScale( tr.viewParms.or.axis[0], xs, tr.viewParms.frustum[2].normal );
+		VectorMA( tr.viewParms.frustum[2].normal, xc, tr.viewParms.or.axis[2], tr.viewParms.frustum[2].normal );
 
-	VectorScale( tr.viewParms.or.axis[0], xs, tr.viewParms.frustum[3].normal );
-	VectorMA( tr.viewParms.frustum[3].normal, -xc, tr.viewParms.or.axis[2], tr.viewParms.frustum[3].normal );
+		// Top plane (normal leans down)
+		ang = fovUp / 180 * M_PI;
+		xs = sinf( ang );
+		xc = cosf( ang );
+
+		VectorScale( tr.viewParms.or.axis[0], xs, tr.viewParms.frustum[3].normal );
+		VectorMA( tr.viewParms.frustum[3].normal, -xc, tr.viewParms.or.axis[2], tr.viewParms.frustum[3].normal );
+	}
 
 	for ( i = 0; i < 4; i++ ) {
 		tr.viewParms.frustum[i].type = PLANE_NON_AXIAL;
@@ -1311,6 +1328,84 @@ static void R_GetModelViewBounds( int *mins, int *maxs )
 }
 
 
+/* Multiview shares one scissor, so take the union of the surface's pixel bounds in both eyes;
+ * a vertex behind either eye widens to the whole viewport. */
+static void R_GetEyeModelViewBounds( int *mins, int *maxs )
+{
+	float minn[2] = { 1.0f, 1.0f };
+	float maxn[2] = { -1.0f, -1.0f };
+	vec4_t eye, clip;
+	int e, i, j;
+
+	for ( e = 0; e < 2; e++ ) {
+		for ( i = 0; i < tess.numVertexes; i++ ) {
+			R_TransformModelToClip( tess.xyz[i], tr.or.eyeViewMatrix[e], tr.vrParms.projectionEye[e], eye, clip );
+			if ( clip[3] <= 0.0f ) {
+				minn[0] = minn[1] = -1.0f;
+				maxn[0] = maxn[1] = 1.0f;
+				break;
+			}
+			for ( j = 0; j < 2; j++ ) {
+				float n = clip[j] / clip[3];
+				if ( n < -1.0f ) n = -1.0f; else if ( n > 1.0f ) n = 1.0f;
+				if ( n < minn[j] ) minn[j] = n;
+				if ( n > maxn[j] ) maxn[j] = n;
+			}
+		}
+	}
+
+	// the eye projections put +y down, and the scissor counts up from the bottom
+	mins[0] = (int)(-0.5 + 0.5 * ( 1.0 + minn[0] ) * tr.viewParms.viewportWidth);
+	mins[1] = (int)(-0.5 + 0.5 * ( 1.0 - maxn[1] ) * tr.viewParms.viewportHeight);
+	maxs[0] = (int)(0.5 + 0.5 * ( 1.0 + maxn[0] ) * tr.viewParms.viewportWidth);
+	maxs[1] = (int)(0.5 + 0.5 * ( 1.0 - minn[1] ) * tr.viewParms.viewportHeight);
+}
+
+
+/* The surface's tangent bounds from both eyes, in the view's axes, for culling the view
+ * drawn through it; qfalse when a vertex is near or behind an eye. The frustum's half-IPD
+ * push covers the eyes sitting off its origin. */
+static qboolean R_GetPortalCullTangents( float t[4] )
+{
+	const float margin = 0.02f; // of the tangent range, so rounding never culls the surface's own edge
+	const float xFull = tanf( DEG2RAD( tr.vrParms.combinedFovX * 0.5f ) );
+	const float upFull = tanf( DEG2RAD( tr.vrParms.fovUp ) );
+	const float downFull = tanf( DEG2RAD( tr.vrParms.fovDown ) );
+	vec3_t *axis = tr.viewParms.or.axis;
+	float right = -1e9f, left = 1e9f, up = -1e9f, down = 1e9f;
+	float mx, my;
+	int e, i;
+
+	for ( e = 0; e < 2; e++ ) {
+		vec3_t origin, eyeAxis[3];
+		R_EyeOrientation( &tr.viewParms, e, origin, eyeAxis );
+		for ( i = 0; i < tess.numVertexes; i++ ) {
+			vec3_t d;
+			float f, tx, ty;
+			VectorSubtract( tess.xyz[i], origin, d );
+			f = DotProduct( d, axis[0] );
+			if ( f < 1.0f ) {
+				return qfalse;
+			}
+			tx = -DotProduct( d, axis[1] ) / f;
+			ty = DotProduct( d, axis[2] ) / f;
+			if ( tx > right ) right = tx;
+			if ( tx < left ) left = tx;
+			if ( ty > up ) up = ty;
+			if ( ty < down ) down = ty;
+		}
+	}
+
+	mx = margin * ( right - left );
+	my = margin * ( up - down );
+	t[0] = MIN( xFull, right + mx );
+	t[1] = MAX( -xFull, left - mx );
+	t[2] = MIN( upFull, up + my );
+	t[3] = MAX( -downFull, down - my );
+	return qtrue;
+}
+
+
 /*
 ========================
 R_MirrorViewBySurface
@@ -1324,6 +1419,7 @@ static qboolean R_MirrorViewBySurface( const drawSurf_t *drawSurf, int entityNum
 	viewParms_t		oldParms;
 	orientation_t	surface, camera;
 	qboolean		isMirror;
+	qboolean		stereo;
 
 	// don't recursively mirror
 	if ( tr.viewParms.portalView != PV_NONE ) {
@@ -1355,6 +1451,23 @@ static qboolean R_MirrorViewBySurface( const drawSurf_t *drawSurf, int entityNum
 		return qfalse;		// bad portal, no portalentity
 	}
 
+	// the reflected view renders only where either eye can see the surface
+	stereo = tr.vrParms.valid && !VR_ShouldDisableStereo();
+	if ( stereo && tess.numVertexes > 2 ) {
+		int mins[2], maxs[2];
+		R_GetEyeModelViewBounds( mins, maxs );
+		if ( maxs[0] <= mins[0] || maxs[1] <= mins[1] ) {
+			return qfalse;
+		}
+		newParms.scissorX = newParms.viewportX + mins[0];
+		newParms.scissorY = newParms.viewportY + mins[1];
+		newParms.scissorWidth = maxs[0] - mins[0];
+		newParms.scissorHeight = maxs[1] - mins[1];
+		if ( tr.vrParms.combinedFovX > 0 ) {
+			newParms.cullTangentsSet = R_GetPortalCullTangents( newParms.cullTangents );
+		}
+	}
+
 #ifdef USE_PMLIGHT
 	// create dedicated set for each view
 	if ( r_numdlights + oldParms.num_dlights <= ARRAY_LEN( backEndData->dlights ) ) {
@@ -1368,9 +1481,9 @@ static qboolean R_MirrorViewBySurface( const drawSurf_t *drawSurf, int entityNum
 #endif
 
 #if defined (USE_VULKAN) && !defined (USE_BUFFER_CLEAR)
-	if ( tess.numVertexes > 2 && r_fastsky->integer && vk.clearAttachment ) {
+	if ( !stereo && tess.numVertexes > 2 && r_fastsky->integer && vk.clearAttachment ) {
 #else
-	if ( tess.numVertexes > 2 && r_fastsky->integer ) {
+	if ( !stereo && tess.numVertexes > 2 && r_fastsky->integer ) {
 #endif
 		int mins[2], maxs[2];
 		R_GetModelViewBounds( mins, maxs );
@@ -1388,8 +1501,6 @@ static qboolean R_MirrorViewBySurface( const drawSurf_t *drawSurf, int entityNum
 	R_MirrorVector (oldParms.or.axis[0], &surface, &camera, newParms.or.axis[0]);
 	R_MirrorVector (oldParms.or.axis[1], &surface, &camera, newParms.or.axis[1]);
 	R_MirrorVector (oldParms.or.axis[2], &surface, &camera, newParms.or.axis[2]);
-
-	// OPTIMIZE: restrict the viewport on the mirrored view
 
 	// render the mirror view
 	R_RenderView( &newParms );

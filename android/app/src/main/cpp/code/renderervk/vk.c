@@ -1,5 +1,7 @@
 #include "tr_local.h"
 #include "vk_hud_coverage.h"
+#include "vk_transmittance.h"
+#include "vk_fdm_math.h"
 #include "vk.h"
 #include "../vrvk/vr_vk.h"  // For VR_VulkanDeviceInfo (pull model)
 #include "../vrcommon/vr_clientinfo.h"
@@ -11,7 +13,7 @@ extern vr_clientinfo_t vr;
 
 // Forward declarations for subpass post-processing
 void vk_finish_subpass_post( void );
-void vk_end_post_scene_subpass( void );
+void vk_end_post_scene_pass( void );
 
 #if defined (_DEBUG)
 #if defined (__ANDROID__)
@@ -528,9 +530,9 @@ static void vk_chain_fdm_attachment( VkRenderPassCreateInfo *desc, VkRenderPassF
 
 
 /*
- * The scene draws alone in fov_scene and is stored; the post pass samples it --
- * sampled, not an input attachment, because Adreno displaces input-attachment
- * reads under a density map. The post pass carries no map and measured the same.
+ * The scene draws alone in fov_scene and is stored; post_scene draws coronas, HUD and 2D into it in
+ * place; the post pass samples it (an input attachment read is displaced by Adreno under a density map).
+ * The post passes carry no map.
  */
 static void vk_create_fov_split_render_passes( void )
 {
@@ -673,6 +675,60 @@ static void vk_create_fov_split_render_passes( void )
 	VK_CHECK( qvkCreateRenderPass( device, &desc, NULL, &vk.render_pass.fov_scene ) );
 	SET_OBJECT_NAME( vk.render_pass.fov_scene, "render pass - foveated scene", VK_DEBUG_REPORT_OBJECT_TYPE_RENDER_PASS_EXT );
 
+	// --- Post-scene pass: coronas, HUD and 2D blend into the stored scene image, in place ---
+	// Nothing full-screen happens here: no clear, no quad, no depth, no second attachment
+	Com_Memset( attachments, 0, sizeof( attachments ) );
+	Com_Memset( subpasses, 0, sizeof( subpasses ) );
+	Com_Memset( dependencies, 0, sizeof( dependencies ) );
+
+	attachments[0].format = vk.color_format;
+	attachments[0].samples = VK_SAMPLE_COUNT_1_BIT;
+	attachments[0].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+	attachments[0].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+	attachments[0].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+	attachments[0].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+	attachments[0].initialLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+	attachments[0].finalLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+	colorRef.attachment = 0;
+	colorRef.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+	subpasses[0].pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+	subpasses[0].colorAttachmentCount = 1;
+	subpasses[0].pColorAttachments = &colorRef;
+
+	// The scene pass stored it and the blur chain sampled it
+	dependencies[0].srcSubpass = VK_SUBPASS_EXTERNAL;
+	dependencies[0].dstSubpass = 0;
+	dependencies[0].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+	dependencies[0].dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+	dependencies[0].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT;
+	dependencies[0].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+	dependencies[0].dependencyFlags = VK_DEPENDENCY_BY_REGION_BIT;
+
+	// The output pass samples the finished scene
+	dependencies[1].srcSubpass = 0;
+	dependencies[1].dstSubpass = VK_SUBPASS_EXTERNAL;
+	dependencies[1].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+	dependencies[1].dstStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+	dependencies[1].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+	dependencies[1].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+	dependencies[1].dependencyFlags = VK_DEPENDENCY_BY_REGION_BIT;
+
+	multiviewInfo.subpassCount = 1;
+
+	Com_Memset( &desc, 0, sizeof( desc ) );
+	desc.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+	desc.pNext = &multiviewInfo;
+	desc.attachmentCount = 1;
+	desc.pAttachments = attachments;
+	desc.subpassCount = 1;
+	desc.pSubpasses = subpasses;
+	desc.dependencyCount = 2;
+	desc.pDependencies = dependencies;
+
+	VK_CHECK( qvkCreateRenderPass( device, &desc, NULL, &vk.render_pass.post_scene ) );
+	SET_OBJECT_NAME( vk.render_pass.post_scene, "render pass - post scene", VK_DEBUG_REPORT_OBJECT_TYPE_RENDER_PASS_EXT );
+
 	// --- Post pass: samples the stored scene ---
 	Com_Memset( attachments, 0, sizeof( attachments ) );
 	Com_Memset( subpasses, 0, sizeof( subpasses ) );
@@ -694,17 +750,12 @@ static void vk_create_fov_split_render_passes( void )
 	finalColorRef.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
 	attachmentCount++;
 
-	// Subpass 0: composite + gamma with bloom, gamma alone without (sampled scene -> swapchain)
+	// One subpass: the composite (bloom) or gamma quad, sampled scene -> swapchain
 	subpasses[0].pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
 	subpasses[0].colorAttachmentCount = 1;
 	subpasses[0].pColorAttachments = &finalColorRef;
 
-	// Subpass 1: post 2D (alpha blend onto swapchain)
-	subpasses[1].pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
-	subpasses[1].colorAttachmentCount = 1;
-	subpasses[1].pColorAttachments = &finalColorRef;
-
-	// External -> 0: the scene pass finished storing before the first sample of it
+	// External -> 0: the post-scene pass finished storing before the quad samples the scene
 	dependencies[0].srcSubpass = VK_SUBPASS_EXTERNAL;
 	dependencies[0].dstSubpass = 0;
 	dependencies[0].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
@@ -713,26 +764,17 @@ static void vk_create_fov_split_render_passes( void )
 	dependencies[0].dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
 	dependencies[0].dependencyFlags = VK_DEPENDENCY_BY_REGION_BIT;
 
-	// 0 -> 1 keeps the 2D writes ordered behind the composite or gamma quad
 	dependencies[1].srcSubpass = 0;
-	dependencies[1].dstSubpass = 1;
+	dependencies[1].dstSubpass = VK_SUBPASS_EXTERNAL;
 	dependencies[1].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-	dependencies[1].dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+	dependencies[1].dstStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
 	dependencies[1].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-	dependencies[1].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+	dependencies[1].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
 	dependencies[1].dependencyFlags = VK_DEPENDENCY_BY_REGION_BIT;
 
-	dependencies[2].srcSubpass = 1;
-	dependencies[2].dstSubpass = VK_SUBPASS_EXTERNAL;
-	dependencies[2].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-	dependencies[2].dstStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
-	dependencies[2].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-	dependencies[2].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-	dependencies[2].dependencyFlags = VK_DEPENDENCY_BY_REGION_BIT;
-
-	multiviewInfo.subpassCount = 2;
-	desc.subpassCount = 2;
-	desc.dependencyCount = 3;
+	multiviewInfo.subpassCount = 1;
+	desc.subpassCount = 1;
+	desc.dependencyCount = 2;
 
 	desc.pNext = &multiviewInfo;
 	desc.attachmentCount = attachmentCount;
@@ -748,8 +790,8 @@ static void vk_create_fov_split_render_passes( void )
 		SET_OBJECT_NAME( vk.render_pass.main_with_gamma, "render pass - foveated post with gamma", VK_DEBUG_REPORT_OBJECT_TYPE_RENDER_PASS_EXT );
 	}
 
-	ri.Printf( PRINT_ALL, "...split render passes created (scene: %u attachments%s, post: %u attachments, %u subpasses)\n",
-		vk.msaaActive ? 3u : 2u, foveated ? " plus density map" : "", attachmentCount, desc.subpassCount );
+	ri.Printf( PRINT_ALL, "...split render passes created (scene: %u attachments%s, post-scene: 1 attachment, post: %u attachments)\n",
+		vk.msaaActive ? 3u : 2u, foveated ? " plus density map" : "", attachmentCount );
 }
 
 
@@ -2545,7 +2587,7 @@ void vk_init_descriptors( void )
 
 	info.buffer = vk.storage.buffer;
 	info.offset = 0;
-	info.range = 2 * sizeof( uint32_t );  // passed and total, see dot.frag
+	info.range = 4 * sizeof( uint32_t );  // passed and total per eye, see dot.frag
 
 	desc.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
 	desc.dstSet = vk.storage.descriptor;
@@ -2991,12 +3033,10 @@ static void vk_create_shader_modules( void )
 	SET_OBJECT_NAME( vk.modules.dot_vs, "dot vertex module", VK_DEBUG_REPORT_OBJECT_TYPE_SHADER_MODULE_EXT );
 	SET_OBJECT_NAME( vk.modules.dot_fs, "dot fragment module", VK_DEBUG_REPORT_OBJECT_TYPE_SHADER_MODULE_EXT );
 
-	vk.modules.bloom_fs = SHADER_MODULE( bloom_frag_spv );
 	vk.modules.blur_fs = SHADER_MODULE( blur_frag_spv );
 	vk.modules.blur_extract_fs = SHADER_MODULE( blur_extract_frag_spv );
 	vk.modules.blend_fs = SHADER_MODULE( blend_frag_spv );
 
-	SET_OBJECT_NAME( vk.modules.bloom_fs, "bloom extraction fragment module", VK_DEBUG_REPORT_OBJECT_TYPE_SHADER_MODULE_EXT );
 	SET_OBJECT_NAME( vk.modules.blur_fs, "gaussian blur fragment module", VK_DEBUG_REPORT_OBJECT_TYPE_SHADER_MODULE_EXT );
 	SET_OBJECT_NAME( vk.modules.blend_fs, "final bloom blend fragment module", VK_DEBUG_REPORT_OBJECT_TYPE_SHADER_MODULE_EXT );
 
@@ -3271,31 +3311,10 @@ static void vk_alloc_persistent_pipelines( void )
 	}
 }
 
-static void vk_invalidate_post_bloom_2d_pipelines( void )
-{
-	uint32_t i, invalidated = 0;
-
-	// Wait for GPU to finish using any pipelines we're about to destroy
-	vk_wait_idle();
-
-	for ( i = 0; i < vk.pipelines_count; i++ ) {
-		if ( vk.pipelines[i].handle[RENDER_PASS_POST_SCENE_2D] != VK_NULL_HANDLE ) {
-			qvkDestroyPipeline( vk.device, vk.pipelines[i].handle[RENDER_PASS_POST_SCENE_2D], NULL );
-			vk.pipelines[i].handle[RENDER_PASS_POST_SCENE_2D] = VK_NULL_HANDLE;
-			invalidated++;
-		}
-	}
-
-	if ( invalidated > 0 ) {
-		ri.Printf( PRINT_ALL, "Invalidated %u post-bloom 2D pipelines for post-process update\n", invalidated );
-	}
-}
-
 void vk_update_post_process_pipelines( void )
 {
 	if ( vk.xr.initialized ) {
 		vk_create_post_process_pipelines();
-		vk_invalidate_post_bloom_2d_pipelines();
 	}
 }
 
@@ -3672,7 +3691,7 @@ static void vk_create_framebuffers( void )
 		VK_CHECK( qvkCreateFramebuffer( vk.device, &desc, NULL, &vk.framebuffers.screenmap ) );
 		SET_OBJECT_NAME( vk.framebuffers.screenmap, "framebuffer - screenmap", VK_DEBUG_REPORT_OBJECT_TYPE_FRAMEBUFFER_EXT );
 
-		// Blur framebuffers: still used by vk_finish_subpass_post() to prepare bloom for next frame
+		// Blur framebuffers: the chain runs before the post-scene pass
 		if ( r_bloom->integer )
 		{
 			uint32_t width = gls.captureWidth;
@@ -3924,7 +3943,7 @@ void vk_initialize( void )
 	vk.uniform_item_size = PAD( (uint32_t)sizeof( vkUniform_t ), vk.uniform_alignment );
 
 	// for flare visibility tests: two counters a flare, passed and total
-	vk.storage_alignment = MAX( props.limits.minStorageBufferOffsetAlignment, 2 * sizeof( uint32_t ) );
+	vk.storage_alignment = MAX( props.limits.minStorageBufferOffsetAlignment, 4 * sizeof( uint32_t ) );
 
 	vk.maxAnisotropy = props.limits.maxSamplerAnisotropy;
 	ri.Printf( PRINT_ALL, "...max anisotropy: %.0f\n", vk.maxAnisotropy );
@@ -4564,6 +4583,11 @@ static void vk_destroy_subpass_render_passes( void )
 		vk.render_pass.fov_scene = VK_NULL_HANDLE;
 	}
 
+	if ( vk.render_pass.post_scene != VK_NULL_HANDLE ) {
+		qvkDestroyRenderPass( vk.device, vk.render_pass.post_scene, NULL );
+		vk.render_pass.post_scene = VK_NULL_HANDLE;
+	}
+
 	if ( vk.render_pass.main_with_bloom != VK_NULL_HANDLE ) {
 		qvkDestroyRenderPass( vk.device, vk.render_pass.main_with_bloom, NULL );
 		vk.render_pass.main_with_bloom = VK_NULL_HANDLE;
@@ -4747,7 +4771,6 @@ void vk_shutdown( refShutdownCode_t code )
 	qvkDestroyShaderModule(vk.device, vk.modules.dot_vs, NULL);
 	qvkDestroyShaderModule(vk.device, vk.modules.dot_fs, NULL);
 
-	qvkDestroyShaderModule(vk.device, vk.modules.bloom_fs, NULL);
 	qvkDestroyShaderModule(vk.device, vk.modules.blur_fs, NULL);
 	qvkDestroyShaderModule(vk.device, vk.modules.blur_extract_fs, NULL);
 	qvkDestroyShaderModule(vk.device, vk.modules.blend_fs, NULL);
@@ -5862,8 +5885,8 @@ VkPipeline create_pipeline( const Vk_Pipeline_Def *def, renderPass_t renderPassI
 	VkShaderModule *vs_module = NULL;
 	VkShaderModule *fs_module = NULL;
 	//int32_t vert_spec_data[1]; // clippping
-	floatint_t frag_spec_data[19]; // 0:alpha-test-func, 1:alpha-test-value, 2:depth-fragment, 3:alpha-to-coverage, 4:color_mode, 5:abs_light, 6:multitexture mode, 7:discard mode, 8: ident.color, 9 - ident.alpha, 10 - acff, 11 - force_opaque_alpha (HUD 3D), 12 - post_bloom_gamma, 13 - post_bloom_obScale, 14 - post_bloom_greyscale, 15 - post_bloom_dither, 16-18 - post_bloom_depth_rgb
-	VkSpecializationMapEntry spec_entries[20];
+	floatint_t frag_spec_data[13]; // 0:alpha-test-func, 1:alpha-test-value, 2:depth-fragment, 3:alpha-to-coverage, 4:color_mode, 5:abs_light, 6:multitexture mode, 7:discard mode, 8: ident.color, 9 - ident.alpha, 10 - acff, 11 - force_opaque_alpha (HUD 3D), 12 - transmit_output (post-scene)
+	VkSpecializationMapEntry spec_entries[14];
 	//VkSpecializationInfo vert_spec_info;
 	VkSpecializationInfo frag_spec_info;
 	VkPipelineVertexInputStateCreateInfo vertex_input_state;
@@ -6274,33 +6297,9 @@ VkPipeline create_pipeline( const Vk_Pipeline_Def *def, renderPass_t renderPassI
 	spec_entries[12].offset = 11 * sizeof( int32_t );
 	spec_entries[12].size = sizeof( int32_t );
 
-	spec_entries[13].constantID = 12; // post_bloom_gamma
+	spec_entries[13].constantID = 12; // transmit_output
 	spec_entries[13].offset = 12 * sizeof( int32_t );
-	spec_entries[13].size = sizeof( float );
-
-	spec_entries[14].constantID = 13; // post_bloom_obScale
-	spec_entries[14].offset = 13 * sizeof( int32_t );
-	spec_entries[14].size = sizeof( float );
-
-	spec_entries[15].constantID = 14; // post_bloom_greyscale
-	spec_entries[15].offset = 14 * sizeof( int32_t );
-	spec_entries[15].size = sizeof( float );
-
-	spec_entries[16].constantID = 15; // post_bloom_dither
-	spec_entries[16].offset = 15 * sizeof( int32_t );
-	spec_entries[16].size = sizeof( int32_t );
-
-	spec_entries[17].constantID = 16; // post_bloom_depth_r
-	spec_entries[17].offset = 16 * sizeof( int32_t );
-	spec_entries[17].size = sizeof( int32_t );
-
-	spec_entries[18].constantID = 17; // post_bloom_depth_g
-	spec_entries[18].offset = 17 * sizeof( int32_t );
-	spec_entries[18].size = sizeof( int32_t );
-
-	spec_entries[19].constantID = 18; // post_bloom_depth_b
-	spec_entries[19].offset = 18 * sizeof( int32_t );
-	spec_entries[19].size = sizeof( int32_t );
+	spec_entries[13].size = sizeof( int32_t );
 
 	// This ensures 3D models (player heads, weapon icons) are fully opaque
 	if (renderPassIndex == RENDER_PASS_HUD && def->hud_coverage == 1) {
@@ -6309,35 +6308,11 @@ VkPipeline create_pipeline( const Vk_Pipeline_Def *def, renderPass_t renderPassI
 		frag_spec_data[11].i = 0;
 	}
 
-	// For post-bloom 2D subpass, apply full post-processing in fragment shader
-	// since this content bypasses the gamma subpass
-	// Matches gamma subpass: greyscale -> pow(color, 1/r_gamma) * obScale -> dither
-	if (renderPassIndex == RENDER_PASS_POST_SCENE_2D) {
-		frag_spec_data[12].f = 1.0f / r_gamma->value;
-		frag_spec_data[13].f = (float)(1 << tr.overbrightBits);
-		frag_spec_data[14].f = r_greyscale->value;
-		frag_spec_data[15].i = r_dither->integer;
-		// Get color depth from XR swapchain format for dithering
-		int depth_r, depth_g, depth_b;
-		if (!vk.xr.colorInfo || !vk_surface_format_color_depth(vk.xr.colorInfo->format, &depth_r, &depth_g, &depth_b)) {
-			depth_r = depth_g = depth_b = 255;
-		}
-		frag_spec_data[16].i = depth_r;
-		frag_spec_data[17].i = depth_g;
-		frag_spec_data[18].i = depth_b;
-	} else {
-		frag_spec_data[12].f = 1.0f; // No gamma correction for other passes
-		frag_spec_data[13].f = 1.0f;
-		frag_spec_data[14].f = 0.0f; // No greyscale
-		frag_spec_data[15].i = 0;    // No dithering
-		frag_spec_data[16].i = 255;  // Default color depth
-		frag_spec_data[17].i = 255;
-		frag_spec_data[18].i = 255;
-	}
+	frag_spec_data[12].i = 0; // the post-scene blend below may raise it
 
-	frag_spec_info.mapEntryCount = 19;
+	frag_spec_info.mapEntryCount = 13;
 	frag_spec_info.pMapEntries = spec_entries + 1;
-	frag_spec_info.dataSize = sizeof( int32_t ) * 19;
+	frag_spec_info.dataSize = sizeof( int32_t ) * 13;
 	frag_spec_info.pData = &frag_spec_data[0];
 	shader_stages[1].pSpecializationInfo = &frag_spec_info;
 
@@ -6678,12 +6653,12 @@ VkPipeline create_pipeline( const Vk_Pipeline_Def *def, renderPass_t renderPassI
 	// Set sample count based on render pass:
 	// - SCREENMAP uses its own sample count
 	// - MAIN and MAIN_WITH_POST subpass 0 use vkSamples (MSAA when active)
-	// - POST_BLOOM_2D renders to swapchain which is always 1 sample
+	// - POST_SCENE draws into the stored scene image, which is always 1 sample
 	// - HUD always uses 1 sample (its render pass is non-MSAA)
 	if ( renderPassIndex == RENDER_PASS_SCREENMAP ) {
 		multisample_state.rasterizationSamples = vk.screenMapSamples;
-	} else if ( renderPassIndex == RENDER_PASS_HUD || renderPassIndex == RENDER_PASS_POST_SCENE_2D ) {
-		// HUD and post-bloom 2D render to non-MSAA targets (HUD buffer, swapchain)
+	} else if ( renderPassIndex == RENDER_PASS_HUD || renderPassIndex == RENDER_PASS_POST_SCENE ) {
+		// HUD and post-scene render to single-sample targets (HUD buffer, stored scene image)
 		multisample_state.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
 	} else {
 		// MAIN, MAIN_WITH_POST (subpass 0), and default use vkSamples
@@ -6701,8 +6676,8 @@ VkPipeline create_pipeline( const Vk_Pipeline_Def *def, renderPass_t renderPassI
 	depth_stencil_state.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
 	depth_stencil_state.pNext = NULL;
 	depth_stencil_state.flags = 0;
-	// For subpasses without depth attachment (RENDER_PASS_POST_SCENE_2D), force depth disabled
-	if ( renderPassIndex == RENDER_PASS_POST_SCENE_2D ) {
+	// The post-scene pass has no depth attachment
+	if ( renderPassIndex == RENDER_PASS_POST_SCENE ) {
 		depth_stencil_state.depthTestEnable = VK_FALSE;
 		depth_stencil_state.depthWriteEnable = VK_FALSE;
 	} else {
@@ -6848,6 +6823,32 @@ VkPipeline create_pipeline( const Vk_Pipeline_Def *def, renderPass_t renderPassI
 		}
 	}
 
+	if ( renderPassIndex == RENDER_PASS_POST_SCENE ) {
+		// the shader's alpha feeds the scene image's transmittance, which gates bloom in the composite
+		frag_spec_data[12].i = 1 + VK_TransmittanceBlend( &attachment_blend_state );
+	} else if ( renderPassIndex == RENDER_PASS_MAIN_WITH_POST ) {
+		// the scene image's alpha is 1 after the scene, full transmittance until post-scene draws lower it.
+		// Stages feeding a later destination-alpha blend keep writing it, and their shader's last stage
+		// writes 1 back through the shader, or its own alpha when its color blend needs the real one
+		switch ( def->scene_alpha ) {
+		case 1:
+			break;
+		case 2:
+			if ( attachment_blend_state.srcColorBlendFactor != VK_BLEND_FACTOR_SRC_ALPHA &&
+				 attachment_blend_state.srcColorBlendFactor != VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA &&
+				 attachment_blend_state.dstColorBlendFactor != VK_BLEND_FACTOR_SRC_ALPHA &&
+				 attachment_blend_state.dstColorBlendFactor != VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA )
+				frag_spec_data[11].i = 1;
+			attachment_blend_state.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+			attachment_blend_state.dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
+			attachment_blend_state.alphaBlendOp = VK_BLEND_OP_ADD;
+			break;
+		default:
+			attachment_blend_state.colorWriteMask &= ~VK_COLOR_COMPONENT_A_BIT;
+			break;
+		}
+	}
+
 	blend_state.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
 	blend_state.pNext = NULL;
 	blend_state.flags = 0;
@@ -6905,19 +6906,13 @@ VkPipeline create_pipeline( const Vk_Pipeline_Def *def, renderPass_t renderPassI
 			create_info.renderPass = vk.render_pass.main;
 		}
 		create_info.subpass = 0;
-	} else if ( renderPassIndex == RENDER_PASS_POST_SCENE_2D ) {
-		// Post-scene 2D: the post pass's second subpass, after the composite or gamma quad
-		if ( r_bloom && r_bloom->integer && vk.render_pass.main_with_bloom != VK_NULL_HANDLE ) {
-			create_info.renderPass = vk.render_pass.main_with_bloom;
-			create_info.subpass = 1;
-		} else if ( vk.render_pass.main_with_gamma != VK_NULL_HANDLE ) {
-			create_info.renderPass = vk.render_pass.main_with_gamma;
-			create_info.subpass = 1;
+	} else if ( renderPassIndex == RENDER_PASS_POST_SCENE ) {
+		if ( vk.render_pass.post_scene != VK_NULL_HANDLE ) {
+			create_info.renderPass = vk.render_pass.post_scene;
 		} else {
-			// Fallback to main if subpass render passes not available
 			create_info.renderPass = vk.render_pass.main;
-			create_info.subpass = 0;
 		}
+		create_info.subpass = 0;
 	} else {
 		// RENDER_PASS_MAIN or any other value defaults to main
 		create_info.renderPass = vk.render_pass.main;
@@ -7075,10 +7070,21 @@ static void get_scissor_rect(VkRect2D *r) {
 
 	if ( backEnd.viewParms.portalView != PV_NONE )
 	{
-		r->offset.x = backEnd.viewParms.scissorX;
-		r->offset.y = glConfig.vidHeight - backEnd.viewParms.scissorY - backEnd.viewParms.scissorHeight;
-		r->extent.width = backEnd.viewParms.scissorWidth;
-		r->extent.height = backEnd.viewParms.scissorHeight;
+		int x = backEnd.viewParms.scissorX;
+		int y = glConfig.vidHeight - backEnd.viewParms.scissorY - backEnd.viewParms.scissorHeight;
+		int w = backEnd.viewParms.scissorWidth;
+		int h = backEnd.viewParms.scissorHeight;
+
+		// Vulkan rejects a negative offset, and a rect past the target is undefined
+		if ( x < 0 ) { w += x; x = 0; }
+		if ( y < 0 ) { h += y; y = 0; }
+		w = MIN( w, glConfig.vidWidth - x );
+		h = MIN( h, glConfig.vidHeight - y );
+
+		r->offset.x = x;
+		r->offset.y = y;
+		r->extent.width = MAX( w, 0 );
+		r->extent.height = MAX( h, 0 );
 	}
 	else
 	{
@@ -7138,7 +7144,8 @@ void vk_clear_color( const vec4_t color ) {
 	attachment.clearValue.color.float32[0] = color[0];
 	attachment.clearValue.color.float32[1] = color[1];
 	attachment.clearValue.color.float32[2] = color[2];
-	attachment.clearValue.color.float32[3] = color[3];
+	// the stored scene's alpha is transmittance: a clear hides the scene in the post-scene pass
+	attachment.clearValue.color.float32[3] = VK_IN_POST_SCENE() ? 0.0f : color[3];
 	attachment.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
 
 	get_scissor_rect( &clear_rect.rect );
@@ -7207,6 +7214,7 @@ static void Matrix4x4_OrthonormalInvert( const float in[16], float out[16] )
 
 
 float vk_view_eyeproj[2][16];
+static float vk_view_2d[16];  // the 2D modelview vk_update_mvp last pushed
 
 void vk_set_view_eyeproj( void )
 {
@@ -7388,6 +7396,7 @@ void vk_update_mvp( const float *m ) {
 		push_constants[10] = 1.0f;
 #endif
 		push_constants[15] = 1.0f;
+		Com_Memcpy( vk_view_2d, push_constants, sizeof( vk_view_2d ) );
 
 		// Per-eye part -> view slot: the plane through each eye, or the convergence shift alone
 		Com_Memset( vk_view_eyeproj, 0, sizeof( vk_view_eyeproj ) );
@@ -7895,21 +7904,21 @@ void vk_begin_main_render_pass( void )
 
 	// End current render pass if active
 	if ( vk.inRenderPass ) {
-		// If we're in the post-bloom 2D subpass, end it properly
-		if ( VK_IN_POST_SCENE_2D() ) {
-			vk_end_post_scene_subpass();
+		// A post-scene pass still open closes and writes the swapchain first
+		if ( VK_IN_POST_SCENE() ) {
+			vk_end_post_scene_pass();
 		} else {
-			// Need to advance through remaining subpasses before ending
+			// The scene pass is still open: open the post-scene pass first, then close it
 			// Use vk_finish_subpass_post if we haven't done the post processing yet,
-			// then vk_end_post_scene_subpass to finish cleanly
+			// then vk_end_post_scene_pass to finish cleanly
 			if ( vk.renderPassIndex == RENDER_PASS_MAIN_WITH_POST ) {
 				if ( !vk.subpassPostDone ) {
-					vk_finish_subpass_post();  // Advances to post-bloom/gamma 2D subpass
+					vk_finish_subpass_post();  // opens the post-scene pass
 				}
-				vk_end_post_scene_subpass();  // Ends the render pass properly
-			} else if ( vk.renderPassIndex == RENDER_PASS_POST_SCENE_2D ) {
-				// Already transitioned to post-bloom 2D (vk_finish_subpass_post changed renderPassIndex)
-				vk_end_post_scene_subpass();
+				vk_end_post_scene_pass();  // closes it and runs the output pass
+			} else if ( vk.renderPassIndex == RENDER_PASS_POST_SCENE ) {
+				// The post-scene pass is open
+				vk_end_post_scene_pass();
 			} else {
 				vk_cmd_end_render_pass();
 				vk.inRenderPass = qfalse;
@@ -7965,7 +7974,7 @@ void vk_begin_main_render_pass( void )
 	}
 
 	// Rewrite this image's density map, if anything moved, while no render pass is open
-	vk_update_authored_fdm( vk.xr.colorIndex );
+	vk_update_authored_fdm();
 
 	// Use XR dimensions
 	// Note: glConfig.vidWidth/Height = vk.xr.width/height in VR
@@ -7988,6 +7997,13 @@ void vk_begin_main_render_pass( void )
 		// Clear values: [0] = color/resolve (black), [1] = depth (0.0 for reversed depth)
 		// With MSAA: [2] = MSAA color (black)
 		Com_Memset( clear_values, 0, sizeof( clear_values ) );
+		if ( vk.renderPassIndex == RENDER_PASS_MAIN_WITH_POST ) {
+			// the stored scene's alpha starts at full transmittance for the post-scene draws
+			clear_values[0].color.float32[3] = 1.0f;
+			if ( vk.msaaActive ) {
+				clear_values[1].color.float32[3] = 1.0f; // fov_scene: [msaa, scene, depth]
+			}
+		}
 #ifndef USE_REVERSED_DEPTH
 		clear_values[1].depthStencil.depth = 1.0f;
 #endif
@@ -8025,23 +8041,6 @@ void vk_begin_main_render_pass( void )
 }
 
 
-void vk_begin_blur_render_pass( uint32_t index )
-{
-	VkFramebuffer frameBuffer = vk.framebuffers.blur[ index ];
-
-	//vk.renderPassIndex = RENDER_PASS_BLOOM_EXTRACT; // doesn't matter, we will use dedicated pipelines
-
-	vk.renderWidth = gls.captureWidth / ( 2 << ( index / 2 ) );
-	vk.renderHeight = gls.captureHeight / ( 2 << ( index / 2 ) );
-
-	//vk.renderScaleX = (float)vk.renderWidth / (float)glConfig.vidWidth;
-	//vk.renderScaleY = (float)vk.renderHeight / (float)glConfig.vidHeight;
-	vk.renderScaleX = vk.renderScaleY = 1.0f;
-
-	vk_begin_render_pass( vk.render_pass.blur[ index ], frameBuffer, qfalse, vk.renderWidth, vk.renderHeight );
-}
-
-
 void vk_end_render_pass( void )
 {
 	if ( !vk.inRenderPass ) {
@@ -8051,19 +8050,19 @@ void vk_end_render_pass( void )
 	// Direct mode ends its scene pass here; vk_draw_foveation_debug skips every other pass
 	vk_draw_foveation_debug();
 
-	// For subpass-based render passes, need to advance to final subpass before ending
+	// The FBO scene pass hands over to the post-scene pass, which the output pass follows
 	if ( vk.renderPassIndex == RENDER_PASS_MAIN_WITH_POST ) {
-		if ( VK_IN_POST_SCENE_2D() ) {
-			vk_end_post_scene_subpass();
+		if ( VK_IN_POST_SCENE() ) {
+			vk_end_post_scene_pass();
 		} else {
 			if ( !vk.subpassPostDone ) {
-				vk_finish_subpass_post();  // Advances to post-bloom/gamma 2D subpass
+				vk_finish_subpass_post();  // opens the post-scene pass
 			}
-			vk_end_post_scene_subpass();  // Ends the render pass properly
+			vk_end_post_scene_pass();  // closes it and runs the output pass
 		}
-	} else if ( vk.renderPassIndex == RENDER_PASS_POST_SCENE_2D ) {
-		// Already in post-bloom 2D subpass (vk_finish_subpass_post changed renderPassIndex)
-		vk_end_post_scene_subpass();
+	} else if ( vk.renderPassIndex == RENDER_PASS_POST_SCENE ) {
+		// The post-scene pass is open
+		vk_end_post_scene_pass();
 	} else {
 		vk_cmd_end_render_pass();
 		vk.inRenderPass = qfalse;
@@ -8346,6 +8345,12 @@ void vk_begin_frame( uint32_t colorIndex, uint32_t depthIndex )
 	// Always start fresh: increment frame count
 	vk.frame_count++;
 
+	// This frame's maps keep sharp what the last frame drew inside the map's pass
+	if ( vk.xr.fdmSharpMarked != NULL ) {
+		Com_Memcpy( vk.xr.fdmSharpHeld, vk.xr.fdmSharpMarked, vk.xr.fdmSharpBytes );
+		Com_Memset( vk.xr.fdmSharpMarked, 0, vk.xr.fdmSharpBytes );
+	}
+
 #ifdef USE_UPLOAD_QUEUE
 	vk_flush_staging_buffer( qtrue );
 #endif
@@ -8586,18 +8591,18 @@ void vk_end_frame( void )
 	if ( vk.xr.initialized ) {
 		// Check if we're using subpass optimization
 		if ( vk.renderPassIndex == RENDER_PASS_MAIN_WITH_POST && vk.inRenderPass ) {
-			// Subpass path: need to finish subpasses and end render pass
-			if ( VK_IN_POST_SCENE_2D() ) {
-				// Already in post-bloom 2D subpass, just end it
-				vk_end_post_scene_subpass();
+			// FBO path: the scene pass is open
+			if ( VK_IN_POST_SCENE() ) {
+				// The post-scene pass is open: close it and run the output pass
+				vk_end_post_scene_pass();
 			} else if ( vk.subpassPostDone ) {
-				// Subpass post done but not in post-bloom 2D (shouldn't happen, but handle it)
+				// The scene pass ended without the post-scene pass opening; nothing to composite
 				vk_end_render_pass();
 			} else {
-				// Need to transition through subpasses first
+				// Open the post-scene pass first
 				vk.cmd->last_pipeline = VK_NULL_HANDLE;
 				vk_finish_subpass_post();
-				// vk_finish_subpass_post transitions to post-bloom 2D subpass but doesn't end it
+				// vk_finish_subpass_post leaves the post-scene pass open
 
 				// Fallback deferred-corona site for frames without an RC_SCENE_COMPLETE
 				// command; doneFlares makes this a no-op once the tr_backend hook ran.
@@ -8606,13 +8611,13 @@ void vk_end_frame( void )
 				// makes this a no-op once the tr_backend hook already replayed it.
 				RB_DrawDeferredHud();
 
-				// Now end the post-bloom 2D subpass
-				vk_end_post_scene_subpass();
+				// Close it and run the output pass
+				vk_end_post_scene_pass();
 			}
 		}
-		else if ( vk.renderPassIndex == RENDER_PASS_POST_SCENE_2D && vk.inRenderPass ) {
-			// Already transitioned to post-bloom 2D subpass (vk_finish_subpass_post changed renderPassIndex)
-			vk_end_post_scene_subpass();
+		else if ( vk.renderPassIndex == RENDER_PASS_POST_SCENE && vk.inRenderPass ) {
+			// The post-scene pass is open
+			vk_end_post_scene_pass();
 		}
 		else if ( vk.subpassPostDone ) {
 			// Subpass post was already done earlier (e.g., before HUD/overlay rendering)
@@ -8691,18 +8696,14 @@ static qboolean vk_end_interrupted_pass( void )
 
 	// If we're in a render pass, end it first
 	if ( vk.inRenderPass && vk.recordingCommands ) {
-		// Only the post pass needs advancing, and only when the composite ran without the 2D subpass being entered.
-		if ( vk.renderPassIndex == RENDER_PASS_MAIN_WITH_POST ) {
-			if ( vk.subpassPostDone && !VK_IN_POST_SCENE_2D() ) {
-				qvkCmdNextSubpass( vk.cmd->command_buffer, VK_SUBPASS_CONTENTS_INLINE );  // to 1 (post-scene 2D)
-			}
-		} else if ( vk.renderPassIndex == RENDER_PASS_POST_SCENE_2D ) {
-			// Already in post-bloom 2D subpass (vk_finish_subpass_post changed renderPassIndex)
-			// Already in final subpass, safe to end
+		if ( VK_IN_POST_SCENE() ) {
+			// The output pass has not run yet; it writes the swapchain the finish path submits
+			vk_end_post_scene_pass();
+		} else {
+			// The scene pass or any other ends directly; the swapchain stays as it was
+			vk_cmd_end_render_pass();
+			vk.inRenderPass = qfalse;
 		}
-		// All other render pass types (RENDER_PASS_MAIN, HUD, etc.) just end directly
-		vk_cmd_end_render_pass();
-		vk.inRenderPass = qfalse;
 		vk.subpassPostDone = qfalse;
 	}
 	return vk.recordingCommands;
@@ -8770,10 +8771,9 @@ The frame is incomplete and its output is irrelevant at teardown; submitting
 it would hand the queue draws referencing resources RE_Shutdown is about to
 destroy, with attachments possibly left mid-pass (VUID-vkCmdDraw-None-09600).
 
-Uses the shared vk_end_interrupted_pass() helper for the subpass-advance
-logic (required by the subpass optimization path: the recorded
-EndRenderPass is validated at record time even though the buffer is never
-submitted) but skips the queue submit.
+Uses the shared vk_end_interrupted_pass() helper to close whichever pass is
+open (the recorded EndRenderPass is validated at record time even though the
+buffer is never submitted) but skips the queue submit.
 
 ==============================================================================
 */
@@ -9059,10 +9059,6 @@ void vk_read_pixels( byte *buffer, uint32_t width, uint32_t height )
 }
 
 
-// Legacy vk_bloom() function removed: bloom is now handled by subpass optimization
-// in vk_finish_subpass_post() which uses tile-local memory for bandwidth savings
-
-
 /*
  * vk_run_bloom_blur_chain - Blur the bright pass into vk.bloom_image, horizontal then vertical, at 1/2 down to 1/16
  *
@@ -9116,10 +9112,10 @@ static void vk_run_bloom_blur_chain( void )
 
 
 /*
- * vk_begin_fov_post_pass - End the scene pass, blur, begin the post pass
+ * vk_begin_fov_post_pass - End the scene pass, blur, open the post-scene pass over the stored scene
  *
- * No clear values: every attachment of the post pass is LOAD or DONT_CARE. The blur
- * chain runs here, so the composite gets this frame's blur and needs no reprojection.
+ * The blur chain runs here, so the composite gets this frame's blur and needs no reprojection.
+ * The post-scene pass loads the scene and stores it: no clear values.
  */
 static void vk_begin_fov_post_pass( void )
 {
@@ -9148,8 +9144,8 @@ static void vk_begin_fov_post_pass( void )
 
 	Com_Memset( &beginInfo, 0, sizeof( beginInfo ) );
 	beginInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
-	beginInfo.renderPass = useBloom ? vk.render_pass.main_with_bloom : vk.render_pass.main_with_gamma;
-	beginInfo.framebuffer = useBloom ? vk.framebuffers.main_with_bloom[vk.xr.colorIndex] : vk.framebuffers.main_with_gamma[vk.xr.colorIndex];
+	beginInfo.renderPass = vk.render_pass.post_scene;
+	beginInfo.framebuffer = vk.framebuffers.post_scene;
 	beginInfo.renderArea.offset.x = 0;
 	beginInfo.renderArea.offset.y = 0;
 	beginInfo.renderArea.extent.width = vk.renderWidth;
@@ -9161,14 +9157,50 @@ static void vk_begin_fov_post_pass( void )
 }
 
 /*
- * vk_finish_subpass_post - End the scene pass, run the post pass's first subpass
+ * vk_run_output_pass - The composite (bloom) or gamma quad from the finished scene into the swapchain
+ */
+static void vk_run_output_pass( void )
+{
+	VkRenderPassBeginInfo beginInfo;
+	const qboolean useBloom = ( r_bloom && r_bloom->integer && vk.final_composite_subpass_pipeline != VK_NULL_HANDLE );
+
+	if ( !useBloom && vk.gamma_subpass_pipeline == VK_NULL_HANDLE ) {
+		ri.Printf( PRINT_WARNING, "vk_run_output_pass: post pipelines not ready\n" );
+		return;
+	}
+
+	Com_Memset( &beginInfo, 0, sizeof( beginInfo ) );
+	beginInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+	beginInfo.renderPass = useBloom ? vk.render_pass.main_with_bloom : vk.render_pass.main_with_gamma;
+	beginInfo.framebuffer = useBloom ? vk.framebuffers.main_with_bloom[vk.xr.colorIndex] : vk.framebuffers.main_with_gamma[vk.xr.colorIndex];
+	beginInfo.renderArea.extent.width = vk.renderWidth;
+	beginInfo.renderArea.extent.height = vk.renderHeight;
+	qvkCmdBeginRenderPass( vk.cmd->command_buffer, &beginInfo, VK_SUBPASS_CONTENTS_INLINE );
+
+	if ( useBloom ) {
+		// Stored scene (set 0) and the combined bloom blur textures (set 1)
+		VkDescriptorSet descriptorSets[2];
+		descriptorSets[0] = vk.transient.scene_descriptor;
+		descriptorSets[1] = vk.bloom_blur_combined_descriptor;
+		qvkCmdBindPipeline( vk.cmd->command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, vk.final_composite_subpass_pipeline );
+		qvkCmdBindDescriptorSets( vk.cmd->command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+			vk.pipeline_layout_fov_composite, 0, 2, descriptorSets, 0, NULL );
+	} else {
+		qvkCmdBindPipeline( vk.cmd->command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, vk.gamma_subpass_pipeline );
+		qvkCmdBindDescriptorSets( vk.cmd->command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+			vk.pipeline_layout_fov_gamma, 0, 1, &vk.transient.scene_descriptor, 0, NULL );
+	}
+	qvkCmdDraw( vk.cmd->command_buffer, 4, 1, 0, 0 );
+	qvkCmdEndRenderPass( vk.cmd->command_buffer );
+}
+
+/*
+ * vk_finish_subpass_post - End the scene pass, blur, and open the post-scene pass
  *
- * Leaves the post pass open in its 2D subpass; vk_end_post_scene_subpass() completes it.
+ * vk_end_post_scene_pass() closes it and runs the output pass.
  */
 void vk_finish_subpass_post( void )
 {
-	qboolean useBloom;
-
 	if ( !vk.inRenderPass ) {
 		ri.Printf( PRINT_WARNING, "vk_finish_subpass_post: not in render pass\n" );
 		return;
@@ -9184,176 +9216,78 @@ void vk_finish_subpass_post( void )
 	// The scene subpass ends here, at the 3D to 2D boundary, so this is the tint's last chance
 	vk_draw_foveation_debug();
 
-	useBloom = ( r_bloom && r_bloom->integer );
-
-	if ( useBloom && vk.final_composite_subpass_pipeline != VK_NULL_HANDLE ) {
-		// End the scene pass, blur it, and open the post pass on the composite
-		vk_begin_fov_post_pass();
-
-		qvkCmdBindPipeline( vk.cmd->command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
-			vk.final_composite_subpass_pipeline );
-
-		// Stored scene (set 0) and the combined bloom blur textures (set 1)
-		{
-			VkDescriptorSet descriptorSets[2];
-			descriptorSets[0] = vk.transient.scene_descriptor;
-			descriptorSets[1] = vk.bloom_blur_combined_descriptor;
-
-			qvkCmdBindDescriptorSets( vk.cmd->command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
-				vk.pipeline_layout_fov_composite, 0, 2, descriptorSets, 0, NULL );
-		}
-
-		qvkCmdDraw( vk.cmd->command_buffer, 4, 1, 0, 0 );
-
-		// Transition to the post-scene 2D subpass
-		// Don't end the render pass: 2D content will render in this subpass
-		qvkCmdNextSubpass( vk.cmd->command_buffer, VK_SUBPASS_CONTENTS_INLINE );
-
-		ri.Printf( PRINT_DEVELOPER, "vk_finish_subpass_post: transitioned to the post-scene 2D subpass\n" );
-
-		vk.renderPassIndex = RENDER_PASS_POST_SCENE_2D;  // Use special pass for 2D pipelines in subpass 3
-		vk.subpassPostDone = qtrue;  // Mark bloom/gamma subpasses as done
-		backEnd.doneBloom = qtrue;
-		vk.cmd->last_pipeline = VK_NULL_HANDLE;  // Force pipeline rebind for subpass 3
-		vk.cmd->depth_range = DEPTH_RANGE_COUNT;  // Force viewport/scissor reset
-
-		// Reset descriptor set tracking for 2D rendering
-		// The composite pass bound descriptors with pipeline_layout_fov_composite,
-		// but 2D rendering uses pipeline_layout: must clear stale bindings
-		Com_Memset( vk.cmd->descriptor_set.current, 0, sizeof( vk.cmd->descriptor_set.current ) );
-		vk.cmd->descriptor_set.start = ~0U;
-		vk.cmd->descriptor_set.end = 0;
-
-		// Reset scissor rect tracking to force recalculation for 2D rendering
-		Com_Memset( &vk.cmd->scissor_rect, 0, sizeof( vk.cmd->scissor_rect ) );
-
-		// Reset vertex buffer offset tracking for fresh 2D geometry
-		// The composite pass doesn't bind vertex buffers, but 3D scene rendering in subpass 0
-		// left stale offsets that could cause vertex data to be read from wrong locations
-		Com_Memset( vk.cmd->buf_offset, 0, sizeof( vk.cmd->buf_offset ) );
-
-		// Explicitly set viewport and scissor for the full render area
-		// This ensures we have valid dynamic state for 2D rendering in subpass 3
-		{
-			VkViewport viewport;
-			VkRect2D scissor;
-			viewport.x = 0;
-			viewport.y = 0;
-			viewport.width = (float)vk.renderWidth;
-			viewport.height = (float)vk.renderHeight;
-			viewport.minDepth = 0.0f;
-			viewport.maxDepth = 1.0f;
-			qvkCmdSetViewport( vk.cmd->command_buffer, 0, 1, &viewport );
-
-			scissor.offset.x = 0;
-			scissor.offset.y = 0;
-			scissor.extent.width = vk.renderWidth;
-			scissor.extent.height = vk.renderHeight;
-			qvkCmdSetScissor( vk.cmd->command_buffer, 0, 1, &scissor );
-		}
-
-		// NOTE: Render pass is NOT ended here.
-		// 2D rendering happens in subpass 3, then vk_end_post_scene_subpass() finishes.
-	}
-	else if ( vk.gamma_subpass_pipeline != VK_NULL_HANDLE ) {
-		// === No bloom: gamma alone in the post pass's subpass 0 ===
-
-		vk_begin_fov_post_pass();
-
-		qvkCmdBindPipeline( vk.cmd->command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
-			vk.gamma_subpass_pipeline );
-		qvkCmdBindDescriptorSets( vk.cmd->command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
-			vk.pipeline_layout_fov_gamma, 0, 1, &vk.transient.scene_descriptor, 0, NULL );
-		qvkCmdDraw( vk.cmd->command_buffer, 4, 1, 0, 0 );
-
-		// Transition to subpass 2 (post-gamma 2D)
-		// Don't end the render pass: 2D content will render in this subpass
-		qvkCmdNextSubpass( vk.cmd->command_buffer, VK_SUBPASS_CONTENTS_INLINE );
-
-		vk.renderPassIndex = RENDER_PASS_POST_SCENE_2D;  // Use special pass for 2D pipelines in subpass 2
-		vk.subpassPostDone = qtrue;  // Mark gamma subpass as done
-		vk.cmd->last_pipeline = VK_NULL_HANDLE;  // Force pipeline rebind for subpass 2
-		vk.cmd->depth_range = DEPTH_RANGE_COUNT;  // Force viewport/scissor reset
-
-		// Reset descriptor set tracking for 2D rendering
-		// The gamma pass bound descriptors with pipeline_layout_fov_gamma,
-		// but 2D rendering uses pipeline_layout: must clear stale bindings
-		Com_Memset( vk.cmd->descriptor_set.current, 0, sizeof( vk.cmd->descriptor_set.current ) );
-		vk.cmd->descriptor_set.start = ~0U;
-		vk.cmd->descriptor_set.end = 0;
-
-		// Reset scissor rect tracking to force recalculation for 2D rendering
-		Com_Memset( &vk.cmd->scissor_rect, 0, sizeof( vk.cmd->scissor_rect ) );
-
-		// Reset vertex buffer offset tracking for fresh 2D geometry
-		Com_Memset( vk.cmd->buf_offset, 0, sizeof( vk.cmd->buf_offset ) );
-
-		// Explicitly set viewport and scissor for the full render area
-		{
-			VkViewport viewport;
-			VkRect2D scissor;
-			viewport.x = 0;
-			viewport.y = 0;
-			viewport.width = (float)vk.renderWidth;
-			viewport.height = (float)vk.renderHeight;
-			viewport.minDepth = 0.0f;
-			viewport.maxDepth = 1.0f;
-			qvkCmdSetViewport( vk.cmd->command_buffer, 0, 1, &viewport );
-
-			scissor.offset.x = 0;
-			scissor.offset.y = 0;
-			scissor.extent.width = vk.renderWidth;
-			scissor.extent.height = vk.renderHeight;
-			qvkCmdSetScissor( vk.cmd->command_buffer, 0, 1, &scissor );
-		}
-	}
-	else {
-		// Subpass pipelines not available, fall back to ending render pass normally
-		ri.Printf( PRINT_WARNING, "vk_finish_subpass_post: subpass pipelines not ready\n" );
+	if ( vk.render_pass.post_scene == VK_NULL_HANDLE || vk.framebuffers.post_scene == VK_NULL_HANDLE ) {
+		// Post resources missing: end the scene pass and leave the swapchain alone
+		ri.Printf( PRINT_WARNING, "vk_finish_subpass_post: post-scene pass not ready\n" );
 		vk_cmd_end_render_pass();
-		vk.inRenderPass = qfalse;
-		vk.renderPassIndex = RENDER_PASS_MAIN;  // Reset for subsequent rendering
-		// Note: don't set subpassPostDone: the subpass wasn't actually done
-	}
-}
-
-
-/*
- * vk_end_post_scene_subpass - End the post-scene 2D subpass and finish the pass
- *
- * Called after all post-scene 2D rendering; the blur chain ran when the scene pass ended.
- */
-void vk_end_post_scene_subpass( void )
-{
-
-	if ( !vk.inRenderPass ) {
-		ri.Printf( PRINT_WARNING, "vk_end_post_scene_subpass: not in render pass\n" );
-		return;
-	}
-
-	if ( !VK_IN_POST_SCENE_2D() ) {
-		// Not in the post-bloom 2D subpass, but we're in some render pass
-		// End it anyway to maintain state consistency
-		ri.Printf( PRINT_WARNING, "vk_end_post_scene_subpass: not in post-bloom 2D subpass, ending render pass anyway\n" );
-		if ( vk.cmd && vk.cmd->command_buffer != VK_NULL_HANDLE ) {
-			vk_cmd_end_render_pass();
-		}
 		vk.inRenderPass = qfalse;
 		vk.renderPassIndex = RENDER_PASS_MAIN;
 		return;
 	}
 
-	// Safety check for valid command buffer (during map loads/shutdowns vk.cmd may be NULL)
+	// End the scene pass, blur it, and open the post-scene pass over the stored scene
+	vk_begin_fov_post_pass();
+
+	vk.renderPassIndex = RENDER_PASS_POST_SCENE;
+	vk.subpassPostDone = qtrue;  // the scene pass is over; the output pass runs when this one ends
+	backEnd.doneBloom = qtrue;
+	vk.cmd->last_pipeline = VK_NULL_HANDLE;
+	vk.cmd->depth_range = DEPTH_RANGE_COUNT;
+
+	// The blur bound other layouts and the scene pipelines don't fit this pass, so draws rebind everything
+	Com_Memset( vk.cmd->descriptor_set.current, 0, sizeof( vk.cmd->descriptor_set.current ) );
+	vk.cmd->descriptor_set.start = ~0U;
+	vk.cmd->descriptor_set.end = 0;
+	Com_Memset( &vk.cmd->scissor_rect, 0, sizeof( vk.cmd->scissor_rect ) );
+	Com_Memset( vk.cmd->buf_offset, 0, sizeof( vk.cmd->buf_offset ) );
+
+	{
+		VkViewport viewport;
+		VkRect2D scissor;
+		viewport.x = 0;
+		viewport.y = 0;
+		viewport.width = (float)vk.renderWidth;
+		viewport.height = (float)vk.renderHeight;
+		viewport.minDepth = 0.0f;
+		viewport.maxDepth = 1.0f;
+		qvkCmdSetViewport( vk.cmd->command_buffer, 0, 1, &viewport );
+
+		scissor.offset.x = 0;
+		scissor.offset.y = 0;
+		scissor.extent.width = vk.renderWidth;
+		scissor.extent.height = vk.renderHeight;
+		qvkCmdSetScissor( vk.cmd->command_buffer, 0, 1, &scissor );
+	}
+}
+
+
+/*
+ * vk_end_post_scene_pass - Close the post-scene pass and write the swapchain through the output pass
+ */
+void vk_end_post_scene_pass( void )
+{
+	if ( !vk.inRenderPass ) {
+		ri.Printf( PRINT_WARNING, "vk_end_post_scene_pass: not in render pass\n" );
+		return;
+	}
 	if ( !vk.cmd || vk.cmd->command_buffer == VK_NULL_HANDLE ) {
-		ri.Printf( PRINT_WARNING, "vk_end_post_scene_subpass: no valid command buffer\n" );
+		ri.Printf( PRINT_WARNING, "vk_end_post_scene_pass: no valid command buffer\n" );
 		vk.inRenderPass = qfalse;
 		return;
 	}
+	if ( !VK_IN_POST_SCENE() ) {
+		// Some other pass is open; end it to keep the state consistent, the swapchain is not written
+		ri.Printf( PRINT_WARNING, "vk_end_post_scene_pass: not in the post-scene pass, ending render pass anyway\n" );
+		vk_cmd_end_render_pass();
+		vk.inRenderPass = qfalse;
+		vk.renderPassIndex = RENDER_PASS_MAIN;
+		return;
+	}
 
-	// End the render pass
 	vk_cmd_end_render_pass();
+	vk_run_output_pass();
 	vk.inRenderPass = qfalse;
-	vk.renderPassIndex = RENDER_PASS_MAIN;  // Reset for subsequent rendering
+	vk.renderPassIndex = RENDER_PASS_MAIN;
 }
 
 
@@ -9374,9 +9308,9 @@ The runtime's map stops at its High level and sits on the lens rather than follo
 the eyes, so we write our own. R8G8_UNORM texels are the fraction of a fragment to
 shade per pixel. The tiler reads one texel per bin and holds it across the bin, and
 scales a bin by at most four per axis, so the map carries three levels at the
-resolution of bins. One map per swapchain image, rewritten in the frame that renders
-into it -- or, where the device takes density map offsets, drawn once around a fixed
-point and slid onto the gaze as each scene pass ends.
+resolution of bins. One map serves every swapchain image. It is redrawn each frame and
+copied in only when it changes: drawn around the gaze, or, where the device takes
+density map offsets, around a fixed point and slid onto the gaze as each scene pass ends.
 ================================================================================
 */
 
@@ -9387,7 +9321,7 @@ void vk_destroy_authored_fdm( void )
 {
 	uint32_t i;
 
-	for ( i = 0; i < MAX_SWAPCHAIN_IMAGES; i++ ) {
+	for ( i = 0; i < NUM_COMMAND_BUFFERS; i++ ) {
 		if ( vk.xr.fdmStagingMapped[i] != NULL ) {
 			qvkUnmapMemory( vk.device, vk.xr.fdmStagingMemory[i] );
 			vk.xr.fdmStagingMapped[i] = NULL;
@@ -9400,21 +9334,27 @@ void vk_destroy_authored_fdm( void )
 			qvkFreeMemory( vk.device, vk.xr.fdmStagingMemory[i], NULL );
 			vk.xr.fdmStagingMemory[i] = VK_NULL_HANDLE;
 		}
-		if ( vk.xr.fdmImage[i] != VK_NULL_HANDLE ) {
-			qvkDestroyImage( vk.device, vk.xr.fdmImage[i], NULL );
-			vk.xr.fdmImage[i] = VK_NULL_HANDLE;
-		}
-		if ( vk.xr.fdmMemory[i] != VK_NULL_HANDLE ) {
-			qvkFreeMemory( vk.device, vk.xr.fdmMemory[i], NULL );
-			vk.xr.fdmMemory[i] = VK_NULL_HANDLE;
-		}
-		vk.xr.fdmUploaded[i] = qfalse;
-		vk.xr.fdmAppliedLevel[i] = -1;
+	}
+	if ( vk.xr.fdmImage != VK_NULL_HANDLE ) {
+		qvkDestroyImage( vk.device, vk.xr.fdmImage, NULL );
+		vk.xr.fdmImage = VK_NULL_HANDLE;
+	}
+	if ( vk.xr.fdmMemory != VK_NULL_HANDLE ) {
+		qvkFreeMemory( vk.device, vk.xr.fdmMemory, NULL );
+		vk.xr.fdmMemory = VK_NULL_HANDLE;
 	}
 	if ( vk.xr.fdmScratch != NULL ) {
 		ri.Free( vk.xr.fdmScratch );
 		vk.xr.fdmScratch = NULL;
+		vk.xr.fdmCurrent = NULL;
 	}
+	if ( vk.xr.fdmSharpMarked != NULL ) {
+		ri.Free( vk.xr.fdmSharpMarked );
+		vk.xr.fdmSharpMarked = NULL;
+	}
+	vk.xr.fdmSharpHeld = NULL;
+	vk.xr.fdmSharpBytes = 0;
+	vk.xr.fdmUploaded = qfalse;
 	vk.xr.fdmAuthored = qfalse;
 	vk.xr.fdmOffsets = qfalse;
 	Com_Memset( vk.xr.fdmOffset, 0, sizeof( vk.xr.fdmOffset ) );
@@ -9427,13 +9367,13 @@ vk_create_authored_fdm
 Fails clean so the caller can fall back to the runtime's map.
 ==================
 */
-static qboolean vk_create_authored_fdm( uint32_t imageCount, uint32_t layers, uint32_t fbWidth, uint32_t fbHeight,
-	qboolean swapchainOffsets )
+static qboolean vk_create_authored_fdm( uint32_t layers, uint32_t fbWidth, uint32_t fbHeight, qboolean swapchainOffsets )
 {
 	VkImageCreateInfo imageInfo;
 	VkBufferCreateInfo bufferInfo;
 	VkMemoryRequirements memReqs;
 	VkMemoryAllocateInfo allocInfo;
+	VkPhysicalDeviceProperties props;
 	// Finest granularity the device reads: a coarser grid measured no faster, and this gives smoother density steps
 	const uint32_t texelW = vk.xr.fdmTexelWidth ? vk.xr.fdmTexelWidth : VK_FDM_TEXEL_SIZE;
 	const uint32_t texelH = vk.xr.fdmTexelHeight ? vk.xr.fdmTexelHeight : VK_FDM_TEXEL_SIZE;
@@ -9442,7 +9382,7 @@ static qboolean vk_create_authored_fdm( uint32_t imageCount, uint32_t layers, ui
 	uint32_t mapWidth, mapHeight, memoryType, i;
 	VkDeviceSize bufferSize;
 
-	if ( imageCount == 0 || imageCount > MAX_SWAPCHAIN_IMAGES || layers == 0 || fbWidth == 0 || fbHeight == 0 ) {
+	if ( layers == 0 || fbWidth == 0 || fbHeight == 0 ) {
 		return qfalse;
 	}
 
@@ -9475,24 +9415,23 @@ static qboolean vk_create_authored_fdm( uint32_t imageCount, uint32_t layers, ui
 	Com_Memset( &allocInfo, 0, sizeof( allocInfo ) );
 	allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
 
-	for ( i = 0; i < imageCount; i++ ) {
-		void *mapped = NULL;
+	if ( qvkCreateImage( vk.device, &imageInfo, NULL, &vk.xr.fdmImage ) != VK_SUCCESS ) {
+		vk_destroy_authored_fdm();
+		return qfalse;
+	}
+	qvkGetImageMemoryRequirements( vk.device, vk.xr.fdmImage, &memReqs );
+	memoryType = find_memory_type( memReqs.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT );
+	allocInfo.allocationSize = memReqs.size;
+	allocInfo.memoryTypeIndex = memoryType;
+	if ( qvkAllocateMemory( vk.device, &allocInfo, NULL, &vk.xr.fdmMemory ) != VK_SUCCESS ||
+		qvkBindImageMemory( vk.device, vk.xr.fdmImage, vk.xr.fdmMemory, 0 ) != VK_SUCCESS ) {
+		vk_destroy_authored_fdm();
+		return qfalse;
+	}
+	SET_OBJECT_NAME( vk.xr.fdmImage, "authored fragment density map", VK_DEBUG_REPORT_OBJECT_TYPE_IMAGE_EXT );
 
-		if ( qvkCreateImage( vk.device, &imageInfo, NULL, &vk.xr.fdmImage[i] ) != VK_SUCCESS ) {
-			vk_destroy_authored_fdm();
-			return qfalse;
-		}
-		qvkGetImageMemoryRequirements( vk.device, vk.xr.fdmImage[i], &memReqs );
-		memoryType = find_memory_type( memReqs.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT );
-		allocInfo.allocationSize = memReqs.size;
-		allocInfo.memoryTypeIndex = memoryType;
-		if ( qvkAllocateMemory( vk.device, &allocInfo, NULL, &vk.xr.fdmMemory[i] ) != VK_SUCCESS ||
-			qvkBindImageMemory( vk.device, vk.xr.fdmImage[i], vk.xr.fdmMemory[i], 0 ) != VK_SUCCESS ) {
-			vk_destroy_authored_fdm();
-			return qfalse;
-		}
-		SET_OBJECT_NAME( vk.xr.fdmImage[i], va( "authored fragment density map %u", i ),
-			VK_DEBUG_REPORT_OBJECT_TYPE_IMAGE_EXT );
+	for ( i = 0; i < NUM_COMMAND_BUFFERS; i++ ) {
+		void *mapped = NULL;
 
 		if ( qvkCreateBuffer( vk.device, &bufferInfo, NULL, &vk.xr.fdmStaging[i] ) != VK_SUCCESS ) {
 			vk_destroy_authored_fdm();
@@ -9510,14 +9449,19 @@ static qboolean vk_create_authored_fdm( uint32_t imageCount, uint32_t layers, ui
 			return qfalse;
 		}
 		vk.xr.fdmStagingMapped[i] = mapped;
-		vk.xr.fdmUploaded[i] = qfalse;
-		vk.xr.fdmAppliedLevel[i] = -1;
 	}
 
-	if ( offsets ) {
-		vk.xr.fdmScratch = (byte*)ri.Malloc( (int)bufferSize );
-	}
+	vk.xr.fdmScratch = (byte*)ri.Malloc( (int)( bufferSize * 2 ) );
+	vk.xr.fdmCurrent = vk.xr.fdmScratch + bufferSize;
+	vk.xr.fdmUploaded = qfalse;
 
+	vk.xr.fdmSharpBytes = (size_t)mapWidth * mapHeight * layers;
+	vk.xr.fdmSharpMarked = (byte*)ri.Malloc( (int)( vk.xr.fdmSharpBytes * 2 ) );
+	Com_Memset( vk.xr.fdmSharpMarked, 0, vk.xr.fdmSharpBytes * 2 );
+	vk.xr.fdmSharpHeld = vk.xr.fdmSharpMarked + vk.xr.fdmSharpBytes;
+
+	qvkGetPhysicalDeviceProperties( vk.physical_device, &props );
+	vk.xr.fdmHostRead = strstr( props.deviceName, "Turnip" ) ? qtrue : qfalse;
 	vk.xr.fdmAuthored = qtrue;
 	vk.xr.fdmOffsets = offsets;
 	vk.xr.fdmLayers = layers;
@@ -9562,328 +9506,155 @@ static void vk_foveation_level_angles( int level, qboolean eyeTracked, float *sh
 	}
 }
 
-/*
-==================
-vk_fdm_gaze_texel
-
-The gaze in map texels. The map only ever changes when this does, so the upload test
-compares these rather than the centers that produce them.
-==================
-*/
-static void vk_fdm_gaze_texel( const float center[2], uint32_t width, uint32_t height,
-	uint32_t *tx, uint32_t *ty )
+static void vk_fdm_geometry( vkFdmGeometry_t *g )
 {
-	// Centers arrive with y already running down the image, so neither axis flips; fixed sits on the optical axis
-	float cx = ( center[0] + 1.0f ) * 0.5f;
-	float cy = ( center[1] + 1.0f ) * 0.5f;
+	g->width = vk.xr.width;
+	g->height = vk.xr.height;
+	g->texelWidth = vk.xr.fdmTexelWidth;
+	g->texelHeight = vk.xr.fdmTexelHeight;
+	g->mapWidth = vk.xr.foveationWidth;
+	g->mapHeight = vk.xr.foveationHeight;
+	g->layers = vk.xr.fdmLayers;
+	g->tileWidth = ( vk.xr.tileWidth && vk.xr.tileHeight ) ? vk.xr.tileWidth : 0;
+	g->tileHeight = ( vk.xr.tileWidth && vk.xr.tileHeight ) ? vk.xr.tileHeight : 0;
+}
 
-	if ( cx < 0.0f ) cx = 0.0f; else if ( cx > 1.0f ) cx = 1.0f;
-	if ( cy < 0.0f ) cy = 0.0f; else if ( cy > 1.0f ) cy = 1.0f;
-
-	*tx = (uint32_t)( cx * (float)width );
-	*ty = (uint32_t)( cy * (float)height );
-	if ( *tx >= width ) *tx = width - 1;
-	if ( *ty >= height ) *ty = height - 1;
+// The scope's map holds still wherever the eyes go
+static qboolean vk_fdm_follows_gaze( void )
+{
+	return ( vk.xr.fdmEyeTracked && !vk.xr.fdmScope ) ? qtrue : qfalse;
 }
 
 /*
 ==================
-vk_write_fdm_texels
+vk_fdm_sharp_mask
 
-A map per eye, each drawn in that eye's own frustum, since the angle a texel subtends
-depends on where in the frustum it sits.
-
-A texel and the gaze are both directions, (tan x, tan y, 1), and the eccentricity is the
-angle between them. Comparing the cosine squared against the two thresholds keeps that to
-a few multiplies a texel.
+What the last frame drew inside the map's pass, to carve at full density; NULL for a
+gaze-driven map, whose fovea lands on the HUD whenever the eyes do.
 ==================
 */
-static void vk_write_fdm_texels( byte *dst, uint32_t width, uint32_t height, uint32_t layers,
-	int level, qboolean eyeTracked, const float center[2][2], const float fovTan[2][4] )
+static const byte *vk_fdm_sharp_mask( void )
 {
-	const float invFbWidth = ( vk.xr.width > 0 ) ? 1.0f / (float)vk.xr.width : 0.0f;
-	const float invFbHeight = ( vk.xr.height > 0 ) ? 1.0f / (float)vk.xr.height : 0.0f;
-	const float texelW = (float)vk.xr.fdmTexelWidth;
-	const float texelH = (float)vk.xr.fdmTexelHeight;
-	float sharpDeg, coarseDeg, midDeg, cosSharp, cosMid, cosCoarse;
-	uint32_t layer, y, x;
+	if ( vk.xr.fdmSharpHeld == NULL || vk.xr.fdmLevel <= 0 || vk_fdm_follows_gaze() ) {
+		return NULL;
+	}
+	return vk.xr.fdmSharpHeld;
+}
 
-	vk_foveation_level_angles( level, eyeTracked, &sharpDeg, &coarseDeg );
-	// The outer half of the quarter-density band goes to a fragment twice its area
-	midDeg = 0.5f * ( sharpDeg + coarseDeg );
-	cosSharp = cosf( (float)DEG2RAD( sharpDeg ) );
-	cosMid = cosf( (float)DEG2RAD( midDeg ) );
-	cosCoarse = cosf( (float)DEG2RAD( coarseDeg ) );
+static void vk_fdm_carve_sharp( byte *map, const vkFdmGeometry_t *g, const byte *mask, const int32_t offset[2][2] )
+{
+	uint32_t layer;
 
-	for ( layer = 0; layer < layers; layer++ ) {
-		const int eye = ( layer < 2 ) ? (int)layer : 0;
-		const float tanL = fovTan[eye][0], tanR = fovTan[eye][1];
-		const float tanU = fovTan[eye][2], tanD = fovTan[eye][3];
-		const float spanX = tanR - tanL, spanY = tanU - tanD;
-		// The gaze in the same tangent space. Fixed foveation names the optical axis, which lands on zero
-		const float gx = tanL + ( center[eye][0] + 1.0f ) * 0.5f * spanX;
-		const float gy = tanU - ( center[eye][1] + 1.0f ) * 0.5f * spanY;
-		const float gazeLen2 = gx * gx + gy * gy + 1.0f;
-		const float sharpK = cosSharp * cosSharp * gazeLen2;
-		const float midK = cosMid * cosMid * gazeLen2;
-		const float coarseK = cosCoarse * cosCoarse * gazeLen2;
-
-		for ( y = 0; y < height; y++ ) {
-			// A bin past the buffer's edge is sampled at its own center, so the falloff carries on to meet it
-			const float ty = tanU - ( ( (float)y + 0.5f ) * texelH * invFbHeight ) * spanY;
-
-			for ( x = 0; x < width; x++ ) {
-				const float tx = tanL + ( ( (float)x + 0.5f ) * texelW * invFbWidth ) * spanX;
-				const float dot = tx * gx + ty * gy + 1.0f;
-				const float cosNum = dot * dot;
-				const float texelLen2 = tx * tx + ty * ty + 1.0f;
-				byte value;
-
-				// The device reads one texel a bin and scales it by at most four an axis, rounding
-				// one axis up inside whatever area the two channels leave spare. 255, 127 and 63
-				// sit far enough inside their areas to land square; 64 leaves room for the round-up
-				if ( cosNum > sharpK * texelLen2 ) {
-					value = 255;  // 1x1
-				} else if ( cosNum > midK * texelLen2 ) {
-					value = 127;  // 2x2
-				} else if ( cosNum > coarseK * texelLen2 ) {
-					value = 64;   // 2x4
-				} else {
-					value = 63;   // 4x4
-				}
-				dst[0] = value;   // x density
-				dst[1] = value;   // y density
-				dst += 2;
-			}
-		}
+	for ( layer = 0; layer < g->layers && layer < 2; layer++ ) {
+		VK_FdmCarveMask( map, g, layer, mask + (size_t)layer * g->mapWidth * g->mapHeight, offset[layer] );
 	}
 }
 
 /*
 ==================
-vk_fdm_reference_points
+vk_upload_fdm
 
-Each eye's map is drawn around its optical axis. With the bin known, the point moves to
-the middle of the bin holding the axis: the tiler samples the map at bin centers, and the
-offsets keep that lattice fixed in the map, so the gaze always lands mid-bin.
+Copies the held map into the image through this frame's staging buffer. Recorded into the
+frame, the copy lands before the scene pass reads the map, except where the driver reads
+the map as the pass is recorded: there it shows a frame late unless waited on out of band.
 ==================
 */
-static void vk_fdm_reference_points( void )
-{
-	const float width = (float)vk.xr.width;
-	const float height = (float)vk.xr.height;
-	int eye;
-
-	for ( eye = 0; eye < 2; eye++ ) {
-		const float spanX = vk.xr.fdmFovTan[eye][1] - vk.xr.fdmFovTan[eye][0];
-		const float spanY = vk.xr.fdmFovTan[eye][2] - vk.xr.fdmFovTan[eye][3];
-		float axisX = ( spanX > 1e-6f ) ? -vk.xr.fdmFovTan[eye][0] / spanX * width : 0.5f * width;
-		float axisY = ( spanY > 1e-6f ) ? vk.xr.fdmFovTan[eye][2] / spanY * height : 0.5f * height;
-
-		if ( axisX < 0.0f ) axisX = 0.0f; else if ( axisX > width - 1.0f ) axisX = width - 1.0f;
-		if ( axisY < 0.0f ) axisY = 0.0f; else if ( axisY > height - 1.0f ) axisY = height - 1.0f;
-
-		if ( vk.xr.tileWidth > 0 && vk.xr.tileHeight > 0 ) {
-			vk.xr.fdmRef[eye][0] = (int32_t)( ( (uint32_t)axisX / vk.xr.tileWidth ) * vk.xr.tileWidth + vk.xr.tileWidth / 2 );
-			vk.xr.fdmRef[eye][1] = (int32_t)( ( (uint32_t)axisY / vk.xr.tileHeight ) * vk.xr.tileHeight + vk.xr.tileHeight / 2 );
-		} else {
-			vk.xr.fdmRef[eye][0] = (int32_t)axisX;
-			vk.xr.fdmRef[eye][1] = (int32_t)axisY;
-		}
-	}
-}
-
-/*
-==================
-vk_write_fdm_texels_fixed
-
-The offset map, drawn with the gaze on each eye's reference point. Eccentricity is taken
-as if that point were the optical axis, which only overstates the sharp region once the
-eye turns. With the bin known, a texel takes the level its bin's nearest point to the
-gaze asks for, so a bin the sharp region reaches is sharp all through: the levels are
-the least resolution out to their angle, however coarse the bins.
-==================
-*/
-static void vk_write_fdm_texels_fixed( byte *dst, uint32_t width, uint32_t height, uint32_t layers,
-	int level, qboolean eyeTracked )
-{
-	const float texelW = (float)vk.xr.fdmTexelWidth;
-	const float texelH = (float)vk.xr.fdmTexelHeight;
-	const float tileW = (float)vk.xr.tileWidth;
-	const float tileH = (float)vk.xr.tileHeight;
-	const qboolean binned = ( vk.xr.tileWidth > 0 && vk.xr.tileHeight > 0 ) ? qtrue : qfalse;
-	float sharpDeg, coarseDeg, midDeg, sharp2, mid2, coarse2, t;
-	uint32_t layer, y, x;
-
-	vk_foveation_level_angles( level, eyeTracked, &sharpDeg, &coarseDeg );
-	midDeg = 0.5f * ( sharpDeg + coarseDeg );
-	t = tanf( (float)DEG2RAD( sharpDeg ) ); sharp2 = t * t;
-	t = tanf( (float)DEG2RAD( midDeg ) ); mid2 = t * t;
-	t = tanf( (float)DEG2RAD( coarseDeg ) ); coarse2 = t * t;
-
-	for ( layer = 0; layer < layers; layer++ ) {
-		const int eye = ( layer < 2 ) ? (int)layer : 0;
-		const float spanX = vk.xr.fdmFovTan[eye][1] - vk.xr.fdmFovTan[eye][0];
-		const float spanY = vk.xr.fdmFovTan[eye][2] - vk.xr.fdmFovTan[eye][3];
-		const float tanPerPxX = ( vk.xr.width > 0 ) ? spanX / (float)vk.xr.width : 0.0f;
-		const float tanPerPxY = ( vk.xr.height > 0 ) ? spanY / (float)vk.xr.height : 0.0f;
-		const float refX = (float)vk.xr.fdmRef[eye][0];
-		const float refY = (float)vk.xr.fdmRef[eye][1];
-
-		for ( y = 0; y < height; y++ ) {
-			float py = ( (float)y + 0.5f ) * texelH;
-			float dy;
-
-			if ( binned ) {
-				const float y0 = floorf( py / tileH ) * tileH;
-				py = ( refY < y0 ) ? y0 : ( refY > y0 + tileH ) ? y0 + tileH : refY;
-			}
-			dy = ( py - refY ) * tanPerPxY;
-
-			for ( x = 0; x < width; x++ ) {
-				float px = ( (float)x + 0.5f ) * texelW;
-				float dx, r2;
-				byte value;
-
-				if ( binned ) {
-					const float x0 = floorf( px / tileW ) * tileW;
-					px = ( refX < x0 ) ? x0 : ( refX > x0 + tileW ) ? x0 + tileW : refX;
-				}
-				dx = ( px - refX ) * tanPerPxX;
-				r2 = dx * dx + dy * dy;
-
-				// Same four values as the gaze-drawn map, for the same reasons
-				if ( r2 < sharp2 ) {
-					value = 255;  // 1x1
-				} else if ( r2 < mid2 ) {
-					value = 127;  // 2x2
-				} else if ( r2 < coarse2 ) {
-					value = 64;   // 2x4
-				} else {
-					value = 63;   // 4x4
-				}
-				dst[0] = value;
-				dst[1] = value;
-				dst += 2;
-			}
-		}
-	}
-}
-
-/*
-==================
-vk_update_fixed_fdm
-
-Turnip reads the map on the host as the pass is recorded, so a copy recorded into the
-frame would land after the read. The map changes only with the level, the field of
-view or the bins, so it is uploaded and waited on out of band, and never mid-flight.
-==================
-*/
-static void vk_update_fixed_fdm( void )
+static void vk_upload_fdm( qboolean wait )
 {
 	const size_t size = (size_t)vk.xr.foveationWidth * vk.xr.foveationHeight * vk.xr.fdmLayers * 2;
-	const int level = ( vk.xr.fdmLevel > 0 ) ? vk.xr.fdmLevel : 0;
-	qboolean changed = qfalse;
-	uint32_t count = 0, i;
-	int eye;
+	const uint32_t slot = (uint32_t)vk.cmd_index;
+	VkCommandBuffer commandBuffer = wait ? begin_command_buffer() : vk.cmd->command_buffer;
+	VkImageMemoryBarrier barrier;
+	VkBufferImageCopy region;
 
-	if ( vk.xr.fdmScratch == NULL ) {
-		return;
-	}
+	Com_Memcpy( vk.xr.fdmStagingMapped[slot], vk.xr.fdmCurrent, size );
 
-	vk_fdm_reference_points();
-	if ( level == 0 ) {
-		Com_Memset( vk.xr.fdmScratch, 0xFF, size );
-	} else {
-		vk_write_fdm_texels_fixed( vk.xr.fdmScratch, vk.xr.foveationWidth, vk.xr.foveationHeight,
-			vk.xr.fdmLayers, level, vk.xr.fdmEyeTracked );
-	}
+	Com_Memset( &barrier, 0, sizeof( barrier ) );
+	barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+	barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barrier.image = vk.xr.fdmImage;
+	barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+	barrier.subresourceRange.levelCount = 1;
+	barrier.subresourceRange.layerCount = vk.xr.fdmLayers;
 
-	for ( i = 0; i < MAX_SWAPCHAIN_IMAGES && vk.xr.fdmImage[i] != VK_NULL_HANDLE; i++ ) {
-		if ( !vk.xr.fdmUploaded[i] ) {
-			changed = qtrue;
-		}
-		count++;
-	}
-	if ( count == 0 ) {
-		return;
-	}
-	if ( !changed && memcmp( vk.xr.fdmScratch, vk.xr.fdmStagingMapped[0], size ) != 0 ) {
-		changed = qtrue;
-	}
+	// Whatever it held is not worth keeping, so come from UNDEFINED
+	barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+	barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+	barrier.srcAccessMask = 0;
+	barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+	qvkCmdPipelineBarrier( commandBuffer,
+		VK_PIPELINE_STAGE_FRAGMENT_DENSITY_PROCESS_BIT_EXT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+		0, 0, NULL, 0, NULL, 1, &barrier );
 
-	if ( changed ) {
-		VkCommandBuffer commandBuffer = begin_command_buffer();
-		VkImageMemoryBarrier barrier;
-		VkBufferImageCopy region;
+	Com_Memset( &region, 0, sizeof( region ) );
+	region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+	region.imageSubresource.layerCount = vk.xr.fdmLayers;
+	region.imageExtent.width = vk.xr.foveationWidth;
+	region.imageExtent.height = vk.xr.foveationHeight;
+	region.imageExtent.depth = 1;
+	qvkCmdCopyBufferToImage( commandBuffer, vk.xr.fdmStaging[slot], vk.xr.fdmImage,
+		VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region );
 
-		Com_Memset( &barrier, 0, sizeof( barrier ) );
-		barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-		barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-		barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-		barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-		barrier.subresourceRange.levelCount = 1;
-		barrier.subresourceRange.layerCount = vk.xr.fdmLayers;
+	barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+	barrier.newLayout = VK_IMAGE_LAYOUT_FRAGMENT_DENSITY_MAP_OPTIMAL_EXT;
+	barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+	barrier.dstAccessMask = VK_ACCESS_FRAGMENT_DENSITY_MAP_READ_BIT_EXT;
+	qvkCmdPipelineBarrier( commandBuffer,
+		VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_DENSITY_PROCESS_BIT_EXT,
+		0, 0, NULL, 0, NULL, 1, &barrier );
 
-		Com_Memset( &region, 0, sizeof( region ) );
-		region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-		region.imageSubresource.layerCount = vk.xr.fdmLayers;
-		region.imageExtent.width = vk.xr.foveationWidth;
-		region.imageExtent.height = vk.xr.foveationHeight;
-		region.imageExtent.depth = 1;
-
-		for ( i = 0; i < count; i++ ) {
-			Com_Memcpy( vk.xr.fdmStagingMapped[i], vk.xr.fdmScratch, size );
-
-			barrier.image = vk.xr.fdmImage[i];
-			barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-			barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-			barrier.srcAccessMask = 0;
-			barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-			qvkCmdPipelineBarrier( commandBuffer,
-				VK_PIPELINE_STAGE_FRAGMENT_DENSITY_PROCESS_BIT_EXT, VK_PIPELINE_STAGE_TRANSFER_BIT,
-				0, 0, NULL, 0, NULL, 1, &barrier );
-
-			qvkCmdCopyBufferToImage( commandBuffer, vk.xr.fdmStaging[i], vk.xr.fdmImage[i],
-				VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region );
-
-			barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-			barrier.newLayout = VK_IMAGE_LAYOUT_FRAGMENT_DENSITY_MAP_OPTIMAL_EXT;
-			barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-			barrier.dstAccessMask = VK_ACCESS_FRAGMENT_DENSITY_MAP_READ_BIT_EXT;
-			qvkCmdPipelineBarrier( commandBuffer,
-				VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_DENSITY_PROCESS_BIT_EXT,
-				0, 0, NULL, 0, NULL, 1, &barrier );
-
-			vk.xr.fdmUploaded[i] = qtrue;
-			vk.xr.fdmAppliedLevel[i] = level;
-			vk.xr.fdmAppliedEyeTracked[i] = vk.xr.fdmEyeTracked;
-		}
-
+	if ( wait ) {
 		end_command_buffer( commandBuffer, __func__ );
-		ri.Printf( PRINT_DEVELOPER, "Density map redrawn for offsets: level %d%s, references %d,%d and %d,%d\n",
-			level, vk.xr.fdmEyeTracked ? " eye tracked" : "",
-			vk.xr.fdmRef[0][0], vk.xr.fdmRef[0][1], vk.xr.fdmRef[1][0], vk.xr.fdmRef[1][1] );
+	}
+	vk.xr.fdmUploaded = qtrue;
+}
+
+/*
+==================
+vk_fdm_draw
+
+This frame's map into scratch: all ones when off, the scope's opening while zoomed, the
+fixed map with the gaze as offsets, or the map drawn around the gaze; then the HUD carve.
+==================
+*/
+static void vk_fdm_draw( int level, const vkFdmGeometry_t *g )
+{
+	const size_t size = (size_t)vk.xr.foveationWidth * vk.xr.foveationHeight * vk.xr.fdmLayers * 2;
+	const byte *sharp;
+
+	Com_Memset( vk.xr.fdmOffset, 0, sizeof( vk.xr.fdmOffset ) );
+	if ( vk.xr.fdmOffsets ) {
+		VK_FdmReference( g, (const float (*)[4])vk.xr.fdmFovTan, vk.xr.fdmRef );
+		// the scope's map is drawn where the scope is, so it never slides
+		if ( level > 0 && !vk.xr.fdmScope ) {
+			VK_FdmOffsets( g, (const float (*)[2])vk.xr.fdmCenter, (const int32_t (*)[2])vk.xr.fdmRef,
+				vk.xr.fdmOffsetGranularity[0], vk.xr.fdmOffsetGranularity[1], vk.xr.fdmOffset );
+		}
 	}
 
-	// Where the gaze sits relative to each reference point, in whole steps of the granularity
-	for ( eye = 0; eye < 2; eye++ ) {
-		const int32_t granX = (int32_t)vk.xr.fdmOffsetGranularity[0];
-		const int32_t granY = (int32_t)vk.xr.fdmOffsetGranularity[1];
-		float gx = ( vk.xr.fdmCenter[eye][0] + 1.0f ) * 0.5f * (float)vk.xr.width;
-		float gy = ( vk.xr.fdmCenter[eye][1] + 1.0f ) * 0.5f * (float)vk.xr.height;
-		float dx, dy;
+	if ( level == 0 ) {
+		// Off still needs a map, since the render pass always carries one: all ones
+		Com_Memset( vk.xr.fdmScratch, 0xFF, size );
+	} else if ( vk.xr.fdmScope ) {
+		VK_FdmWriteScope( vk.xr.fdmScratch, g, VR_SCOPE_CIRCLE_WIDTH );
+	} else {
+		float sharpDeg, coarseDeg;
 
-		if ( level == 0 ) {
-			vk.xr.fdmOffset[eye][0] = vk.xr.fdmOffset[eye][1] = 0;
-			continue;
+		vk_foveation_level_angles( level, vk.xr.fdmEyeTracked, &sharpDeg, &coarseDeg );
+		if ( vk.xr.fdmOffsets ) {
+			VK_FdmWriteFixed( vk.xr.fdmScratch, g, sharpDeg, coarseDeg, (const int32_t (*)[2])vk.xr.fdmRef,
+				(const float (*)[4])vk.xr.fdmFovTan );
+		} else {
+			VK_FdmWriteGaze( vk.xr.fdmScratch, g, sharpDeg, coarseDeg,
+				(const float (*)[2])vk.xr.fdmCenter, (const float (*)[4])vk.xr.fdmFovTan );
 		}
-		if ( gx < 0.0f ) gx = 0.0f; else if ( gx > (float)vk.xr.width ) gx = (float)vk.xr.width;
-		if ( gy < 0.0f ) gy = 0.0f; else if ( gy > (float)vk.xr.height ) gy = (float)vk.xr.height;
-		dx = ( gx - (float)vk.xr.fdmRef[eye][0] ) / (float)granX;
-		dy = ( gy - (float)vk.xr.fdmRef[eye][1] ) / (float)granY;
-		vk.xr.fdmOffset[eye][0] = (int32_t)floorf( dx + 0.5f ) * granX;
-		vk.xr.fdmOffset[eye][1] = (int32_t)floorf( dy + 0.5f ) * granY;
+	}
+
+	// The map slides by the offset, so the HUD is carved where the offset brings it
+	sharp = vk_fdm_sharp_mask();
+	if ( sharp != NULL ) {
+		vk_fdm_carve_sharp( vk.xr.fdmScratch, g, sharp, (const int32_t (*)[2])vk.xr.fdmOffset );
 	}
 }
 
@@ -9929,113 +9700,47 @@ static void vk_cmd_end_render_pass( void )
 ==================
 vk_update_authored_fdm
 
-Recorded before the scene render pass opens, and only when the map changed.
+Recorded before the scene render pass opens. The map is redrawn every frame and copied in
+only when it changed. A change the gaze or the HUD carve made rides in the frame; a toggle
+(level, mode, scope, field of view, bins) is waited on where the driver reads the map as
+the pass is recorded, so the frame that toggles already shows it.
 ==================
 */
-void vk_update_authored_fdm( uint32_t index )
+void vk_update_authored_fdm( void )
 {
-	VkImageMemoryBarrier barrier;
-	VkBufferImageCopy region;
-	int level;
-	qboolean eyeTracked;
-	qboolean changed;
+	const size_t size = (size_t)vk.xr.foveationWidth * vk.xr.foveationHeight * vk.xr.fdmLayers * 2;
+	const int level = ( vk.xr.fdmLevel > 0 ) ? vk.xr.fdmLevel : 0;
+	vkFdmInputs_t drawn;
+	vkFdmGeometry_t g;
+	qboolean toggled;
 
-	if ( !vk.xr.fdmAuthored || index >= MAX_SWAPCHAIN_IMAGES || vk.xr.fdmImage[index] == VK_NULL_HANDLE ) {
+	if ( !vk.xr.fdmAuthored || vk.xr.fdmScratch == NULL ) {
 		return;
 	}
 	if ( !vk.cmd || vk.cmd->command_buffer == VK_NULL_HANDLE ) {
 		return;
 	}
-	if ( vk.xr.fdmOffsets ) {
-		vk_update_fixed_fdm();
+	// Read as the frame renders: the zoom changes after the VR layer pushes the rest
+	vk.xr.fdmScope = vr.weapon_zoomed ? qtrue : qfalse;
+
+	vk_fdm_geometry( &g );
+	vk_fdm_draw( level, &g );
+	if ( vk.xr.fdmUploaded && memcmp( vk.xr.fdmScratch, vk.xr.fdmCurrent, size ) == 0 ) {
 		return;
 	}
 
-	level = vk.xr.fdmLevel;
-	eyeTracked = vk.xr.fdmEyeTracked;
-	if ( level <= 0 ) {
-		// Off still needs a map, since the render pass always carries one: all ones
-		level = 0;
-	}
+	Com_Memset( &drawn, 0, sizeof( drawn ) );
+	drawn.level = level;
+	drawn.eyeTracked = vk.xr.fdmEyeTracked;
+	drawn.scope = vk.xr.fdmScope;
+	Com_Memcpy( drawn.fovTan, vk.xr.fdmFovTan, sizeof( drawn.fovTan ) );
+	drawn.tileWidth = g.tileWidth;
+	drawn.tileHeight = g.tileHeight;
+	toggled = ( !vk.xr.fdmUploaded || memcmp( &drawn, &vk.xr.fdmDrawn, sizeof( drawn ) ) != 0 ) ? qtrue : qfalse;
+	vk.xr.fdmDrawn = drawn;
 
-	changed = ( !vk.xr.fdmUploaded[index] ||
-		vk.xr.fdmAppliedLevel[index] != level ||
-		vk.xr.fdmAppliedEyeTracked[index] != eyeTracked );
-	if ( !changed && level > 0 ) {
-		// Same level and mode, so only a gaze that has moved a whole texel can change a byte.
-		// Level 0 is all ones and reads no center at all.
-		const uint32_t eyes = ( vk.xr.fdmLayers < 2 ) ? 1 : 2;
-		uint32_t eye;
-
-		for ( eye = 0; eye < eyes; eye++ ) {
-			uint32_t ox, oy;
-
-			vk_fdm_gaze_texel( vk.xr.fdmCenter[eye], vk.xr.foveationWidth, vk.xr.foveationHeight, &ox, &oy );
-			if ( vk.xr.fdmAppliedOffset[index][eye][0] != ox || vk.xr.fdmAppliedOffset[index][eye][1] != oy ) {
-				changed = qtrue;
-				break;
-			}
-		}
-	}
-	if ( !changed ) {
-		return;
-	}
-
-	if ( level == 0 ) {
-		Com_Memset( vk.xr.fdmStagingMapped[index], 0xFF,
-			(size_t)vk.xr.foveationWidth * vk.xr.foveationHeight * vk.xr.fdmLayers * 2 );
-	} else {
-		vk_write_fdm_texels( (byte*)vk.xr.fdmStagingMapped[index],
-			vk.xr.foveationWidth, vk.xr.foveationHeight, vk.xr.fdmLayers,
-			level, eyeTracked, (const float (*)[2])vk.xr.fdmCenter,
-			(const float (*)[4])vk.xr.fdmFovTan );
-	}
-
-	Com_Memset( &barrier, 0, sizeof( barrier ) );
-	barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-	barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-	barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-	barrier.image = vk.xr.fdmImage[index];
-	barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-	barrier.subresourceRange.levelCount = 1;
-	barrier.subresourceRange.layerCount = vk.xr.fdmLayers;
-
-	// Whatever it held is not worth keeping, so come from UNDEFINED
-	barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-	barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-	barrier.srcAccessMask = 0;
-	barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-	qvkCmdPipelineBarrier( vk.cmd->command_buffer,
-		VK_PIPELINE_STAGE_FRAGMENT_DENSITY_PROCESS_BIT_EXT, VK_PIPELINE_STAGE_TRANSFER_BIT,
-		0, 0, NULL, 0, NULL, 1, &barrier );
-
-	Com_Memset( &region, 0, sizeof( region ) );
-	region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-	region.imageSubresource.layerCount = vk.xr.fdmLayers;
-	region.imageExtent.width = vk.xr.foveationWidth;
-	region.imageExtent.height = vk.xr.foveationHeight;
-	region.imageExtent.depth = 1;
-	qvkCmdCopyBufferToImage( vk.cmd->command_buffer, vk.xr.fdmStaging[index], vk.xr.fdmImage[index],
-		VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region );
-
-	barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-	barrier.newLayout = VK_IMAGE_LAYOUT_FRAGMENT_DENSITY_MAP_OPTIMAL_EXT;
-	barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-	barrier.dstAccessMask = VK_ACCESS_FRAGMENT_DENSITY_MAP_READ_BIT_EXT;
-	qvkCmdPipelineBarrier( vk.cmd->command_buffer,
-		VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_DENSITY_PROCESS_BIT_EXT,
-		0, 0, NULL, 0, NULL, 1, &barrier );
-
-	vk.xr.fdmUploaded[index] = qtrue;
-	vk.xr.fdmAppliedLevel[index] = level;
-	vk.xr.fdmAppliedEyeTracked[index] = eyeTracked;
-	{
-		uint32_t eye;
-		for ( eye = 0; eye < 2; eye++ ) {
-			vk_fdm_gaze_texel( vk.xr.fdmCenter[eye], vk.xr.foveationWidth, vk.xr.foveationHeight,
-				&vk.xr.fdmAppliedOffset[index][eye][0], &vk.xr.fdmAppliedOffset[index][eye][1] );
-		}
-	}
+	Com_Memcpy( vk.xr.fdmCurrent, vk.xr.fdmScratch, size );
+	vk_upload_fdm( toggled && vk.xr.fdmHostRead );
 }
 
 /*
@@ -10057,14 +9762,129 @@ void vk_set_foveation( int level, qboolean eyeTracked, const float centers[2][2]
 	}
 }
 
+// The HUD buffer's own pass records while the scene pass is still open
+static qboolean vk_foveation_marking( void )
+{
+	return ( vk.xr.fdmSharpMarked != NULL && vk.xr.mapPassOpen && vk.inRenderPass && !vk.inHudCommandBuffer &&
+		vk.xr.fdmLevel > 0 && !vk_fdm_follows_gaze() ) ? qtrue : qfalse;
+}
+
+/*
+==================
+vk_foveation_keep_sharp
+
+Marks a draw's NDC bounds in one eye for the next frame's map, when it lands in the pass
+carrying a fixed map.
+==================
+*/
+void vk_foveation_keep_sharp( int eye, const float rect[4] )
+{
+	vkFdmGeometry_t g;
+
+	if ( !vk_foveation_marking() || eye < 0 || (uint32_t)eye >= vk.xr.fdmLayers || eye > 1 ) {
+		return;
+	}
+	vk_fdm_geometry( &g );
+	VK_FdmMarkNdc( vk.xr.fdmSharpMarked + (size_t)eye * g.mapWidth * g.mapHeight, &g, rect );
+}
+
+// Each eye's NDC bounds of what the open HUD bracket has drawn in 2D; min above max while empty
+static float vk_fdm_hud_box[2][4];
+
+void vk_foveation_hud_begin( void )
+{
+	int e;
+
+	for ( e = 0; e < 2; e++ ) {
+		vk_fdm_hud_box[e][0] = vk_fdm_hud_box[e][1] = 1e9f;
+		vk_fdm_hud_box[e][2] = vk_fdm_hud_box[e][3] = -1e9f;
+	}
+}
+
+/*
+==================
+vk_foveation_keep_sharp_hud
+
+A HUD element's 2D rectangle through the transforms its draw uses: the pushed 2D
+modelview, then each eye's slot. An eye that sees a corner behind it keeps nothing of it.
+==================
+*/
+void vk_foveation_keep_sharp_hud( float x, float y, float w, float h )
+{
+	vec4_t eye, clip;
+	vec3_t corner;
+	float rect[4];
+	int e, i;
+
+	if ( !vk_foveation_marking() ) {
+		return;
+	}
+	for ( e = 0; e < 2; e++ ) {
+		rect[0] = rect[1] = 1e9f;
+		rect[2] = rect[3] = -1e9f;
+		for ( i = 0; i < 4; i++ ) {
+			corner[0] = ( i & 1 ) ? x + w : x;
+			corner[1] = ( i & 2 ) ? y + h : y;
+			corner[2] = 0.0f;
+			R_TransformModelToClip( corner, vk_view_2d, vk_view_eyeproj[e], eye, clip );
+			if ( clip[3] <= 0.001f ) {
+				break;
+			}
+			rect[0] = MIN( rect[0], clip[0] / clip[3] );
+			rect[1] = MIN( rect[1], clip[1] / clip[3] );
+			rect[2] = MAX( rect[2], clip[0] / clip[3] );
+			rect[3] = MAX( rect[3], clip[1] / clip[3] );
+		}
+		if ( i == 4 ) {
+			vk_fdm_hud_box[e][0] = MIN( vk_fdm_hud_box[e][0], rect[0] );
+			vk_fdm_hud_box[e][1] = MIN( vk_fdm_hud_box[e][1], rect[1] );
+			vk_fdm_hud_box[e][2] = MAX( vk_fdm_hud_box[e][2], rect[2] );
+			vk_fdm_hud_box[e][3] = MAX( vk_fdm_hud_box[e][3], rect[3] );
+		}
+	}
+}
+
+// The HUD reads as one surface, so the bracket keeps its whole extent sharp, gaps included
+void vk_foveation_hud_end( void )
+{
+	int e;
+
+	for ( e = 0; e < 2; e++ ) {
+		if ( vk_fdm_hud_box[e][2] > vk_fdm_hud_box[e][0] ) {
+			vk_foveation_keep_sharp( e, vk_fdm_hud_box[e] );
+		}
+	}
+	vk_foveation_hud_begin();
+}
+
+// A view's viewport, in both eyes: the 3D icons a HUD draws as their own scenes
+void vk_foveation_keep_sharp_view( void )
+{
+	VkRect2D r;
+	float rect[4];
+	int e;
+
+	if ( !vk_foveation_marking() || !vk.renderWidth || !vk.renderHeight ) {
+		return;
+	}
+	get_viewport_rect( &r );
+	rect[0] = (float)r.offset.x / vk.renderWidth * 2.0f - 1.0f;
+	rect[1] = (float)r.offset.y / vk.renderHeight * 2.0f - 1.0f;
+	rect[2] = (float)( r.offset.x + (int32_t)r.extent.width ) / vk.renderWidth * 2.0f - 1.0f;
+	rect[3] = (float)( r.offset.y + (int32_t)r.extent.height ) / vk.renderHeight * 2.0f - 1.0f;
+	for ( e = 0; e < 2; e++ ) {
+		vk_foveation_keep_sharp( e, rect );
+	}
+}
+
 /*
 ==================
 vk_foveation_block_at
 
 Fragment edge in pixels the map asks for at a normalized device position. The device
 rounds density to a fragment area no larger than 1/density, so the largest power of two
-that fits. Reads the staging copy, which holds what the frame's map holds; the runtime's
-own map cannot be read here and counts as its coarsest.
+that fits. Reads the host copy of what the map holds; the runtime's own map cannot be
+read here and counts as its coarsest.
 ==================
 */
 int vk_foveation_block_at( int eye, float ndcX, float ndcY )
@@ -10080,8 +9900,7 @@ int vk_foveation_block_at( int eye, float ndcX, float ndcY )
 	if ( !vk.xr.fdmAuthored ) {
 		return 8;
 	}
-	if ( vk.xr.colorIndex >= MAX_SWAPCHAIN_IMAGES || vk.xr.fdmStagingMapped[vk.xr.colorIndex] == NULL ||
-		vk.xr.fdmTexelWidth == 0 || vk.xr.fdmTexelHeight == 0 ||
+	if ( !vk.xr.fdmUploaded || vk.xr.fdmTexelWidth == 0 || vk.xr.fdmTexelHeight == 0 ||
 		vk.xr.foveationWidth == 0 || vk.xr.foveationHeight == 0 ) {
 		return 8;
 	}
@@ -10104,7 +9923,7 @@ int vk_foveation_block_at( int eye, float ndcX, float ndcY )
 	if ( tx >= vk.xr.foveationWidth ) tx = vk.xr.foveationWidth - 1;
 	if ( ty >= vk.xr.foveationHeight ) ty = vk.xr.foveationHeight - 1;
 
-	map = (const byte*)vk.xr.fdmStagingMapped[vk.xr.colorIndex];
+	map = vk.xr.fdmCurrent;
 	density = (float)map[ ( ( (size_t)layer * vk.xr.foveationHeight + ty ) * vk.xr.foveationWidth + tx ) * 2 ] / 255.0f;
 	if ( density >= 0.999f ) {
 		return 1;
@@ -10131,9 +9950,6 @@ Print it once per framebuffer set; it is the number that says how much of the fa
 survives, and whether the bin grid is a strip grid or something square.
 ==================
 */
-// Any alignment, unlike PAD
-#define ROUND_UP( value, alignment ) ( ( ( value ) + ( alignment ) - 1 ) / ( alignment ) * ( alignment ) )
-
 static uint32_t vk_turnip_gmem_cpp( VkFormat format )
 {
 	switch ( format ) {
@@ -10155,69 +9971,20 @@ static uint32_t vk_turnip_gmem_cpp( VkFormat format )
 	}
 }
 
-// Whether the A7xx LRZ fast-clear flag RAM (1024 bytes) covers a two-layer depth image this size
-static qboolean vk_turnip_lrz_fc_covered( uint32_t width, uint32_t height, uint32_t samples )
-{
-	uint32_t pitch, rows, layerSize;
-
-	// LRZ covers the supersampled surface (fdl6_lrz_get_super_sampled_size)
-	if ( samples >= 2 ) height *= 2;
-	if ( samples >= 4 ) width *= 2;
-	if ( samples >= 8 ) height *= 2;
-	pitch = ROUND_UP( ( width + 7 ) / 8, 32 );
-	rows = ROUND_UP( ( height + 7 ) / 8, 32 );
-	layerSize = pitch * rows * 2;
-
-	return ( ROUND_UP( layerSize >> 7, 512 ) / 8 * 2 <= 1024 ) ? qtrue : qfalse;
-}
-
-/*
-==================
-vk_turnip_offset_tile_limit
-
-A depth image made for density map offsets gets its LRZ padded by the largest tile that
-keeps LRZ fast clears, and the tiles are then held to that (fdl6_lrz_get_max_fdm_extra_size).
-==================
-*/
-static void vk_turnip_offset_tile_limit( uint32_t width, uint32_t height, uint32_t samples,
-	uint32_t *limitW, uint32_t *limitH )
-{
-	uint32_t extra;
-
-	*limitW = 2016;
-	*limitH = 2032;
-	if ( !vk_turnip_lrz_fc_covered( width, height, samples ) ) {
-		return;
-	}
-	for ( extra = 2016; extra > 192; extra -= 4 ) {
-		if ( vk_turnip_lrz_fc_covered( width + extra, height + extra, samples ) ) {
-			*limitW = extra / 16 * 16;
-			*limitH = extra / 4 * 4;
-			return;
-		}
-	}
-}
-
 /*
 ==================
 vk_assume_turnip_tile_size
 
-Turnip reports no bin size. This mirrors its tiling choice (tu_util.cc) for an Adreno
-750 and the scene pass: 3 MB of GMEM less the A750's VPC attribute buffer and the eighth
-of the color CCU cache a density map pass keeps clear, shared between the color and depth
-held in GMEM by their bytes a pixel (the MSAA resolve target is not), both views to a
-bin, and the fewest bins with no side over twice the other. Stale if Turnip changes its
-tiling; the log says the size was assumed.
+Turnip reports no bin size, so the header's model of its tiling stands in for the scene
+pass: the color and depth held in GMEM by their bytes a pixel (the MSAA resolve target is
+not), both views to a bin. The log says the size was assumed.
 ==================
 */
 static qboolean vk_assume_turnip_tile_size( uint32_t width, uint32_t height, uint32_t *tileW, uint32_t *tileH )
 {
-	const uint32_t gmemSize = 3 * 1024 * 1024 - 6 * 0xc000 - ( 6 * 64 * 1024 ) / 8;
-	const uint32_t alignW = 96, alignH = 32, layers = 2;
-	const uint32_t gmemAlign = 8 * alignW * alignH;
 	const uint32_t samples = vk.msaaActive ? (uint32_t)vkSamples : 1;
 	VkPhysicalDeviceProperties props;
-	uint32_t cpp[2], cppTotal, blocks, pixels, i, w, best = ~0u, bestW = 0, bestH = 0;
+	uint32_t cpp[2];
 	uint32_t maxW = 2016, maxH = 2032;
 
 	qvkGetPhysicalDeviceProperties( vk.physical_device, &props );
@@ -10226,53 +9993,10 @@ static qboolean vk_assume_turnip_tile_size( uint32_t width, uint32_t height, uin
 	}
 	cpp[0] = vk_turnip_gmem_cpp( vk.color_format ) * samples;
 	cpp[1] = vk_turnip_gmem_cpp( vk.depth_format ) * samples;
-	if ( cpp[0] == 0 || cpp[1] == 0 ) {
-		return qfalse;
-	}
 	if ( vk.xr.fdmOffsets ) {
-		vk_turnip_offset_tile_limit( width, height, samples, &maxW, &maxH );
+		VK_FdmTurnipOffsetLimit( width, height, samples, &maxW, &maxH );
 	}
-
-	blocks = gmemSize / gmemAlign;
-	cppTotal = cpp[0] + cpp[1];
-	pixels = ~0u;
-	for ( i = 0; i < 2; i++ ) {
-		// Wide pixels take whole pairs (or more) of blocks
-		const uint32_t align = ( cpp[i] >> 3 ) ? ( cpp[i] >> 3 ) : 1;
-		uint32_t n = ( blocks * cpp[i] / cppTotal ) & ~( align - 1 );
-		if ( n < align ) n = align;
-		blocks -= n;
-		cppTotal -= cpp[i];
-		if ( n * gmemAlign / cpp[i] < pixels ) pixels = n * gmemAlign / cpp[i];
-	}
-
-	for ( w = alignW; w <= maxW && w <= ROUND_UP( width, alignW ); w += alignW ) {
-		uint32_t h = pixels / ( w * layers ), countW, countH, total;
-
-		if ( h > maxH ) h = maxH;
-		if ( h > ROUND_UP( height, alignH ) ) h = ROUND_UP( height, alignH );
-		h = h / alignH * alignH;
-		if ( h == 0 ) {
-			continue;
-		}
-		total = ( w > h * 2 || h > w * 2 ) ? 1000 : 0;
-		countW = ( width + w - 1 ) / w;
-		countH = ( height + h - 1 ) / h;
-		h = ROUND_UP( ( height + countH - 1 ) / countH, alignH );
-		total += countW * countH;
-		if ( total < best || ( total == best && abs( (int)w - (int)h ) < abs( (int)bestW - (int)bestH ) ) ) {
-			best = total;
-			bestW = w;
-			bestH = h;
-		}
-	}
-	if ( bestW == 0 ) {
-		return qfalse;
-	}
-
-	*tileW = bestW;
-	*tileH = bestH;
-	return qtrue;
+	return VK_FdmTurnipTile( width, height, cpp, 2, maxW, maxH, tileW, tileH ) ? qtrue : qfalse;
 }
 
 static void vk_log_tile_size( VkFramebuffer framebuffer, const char *pass )
@@ -10399,14 +10123,15 @@ qboolean vk_create_xr_image_views( void )
 		VK_CHECK( qvkCreateImageView( vk.device, &viewInfo, NULL, &xr->depthViews[i] ) );
 	}
 
-	// Density map views. VK_REMAINING_ARRAY_LAYERS covers both ours (a layer per eye) and the runtime's
+	// Density map views, one per color image: ours all show the one shared map. VK_REMAINING_ARRAY_LAYERS
+	// covers both ours (a layer per eye) and the runtime's
 	if ( xr->foveationActive ) {
 		for ( uint32_t i = 0; i < xr->colorInfo->imageCount && i < MAX_SWAPCHAIN_IMAGES; i++ ) {
 			VkImageViewCreateInfo viewInfo = {
 				.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
 				.pNext = NULL,
 				.flags = 0,
-				.image = xr->fdmAuthored ? xr->fdmImage[i] : xr->colorInfo->foveationImages[i],
+				.image = xr->fdmAuthored ? xr->fdmImage : xr->colorInfo->foveationImages[i],
 				.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY,
 				.format = VK_FDM_FORMAT,
 				.components = {
@@ -10966,12 +10691,17 @@ static void vk_destroy_subpass_framebuffers( void )
 			vk.framebuffers.main_with_gamma[i] = VK_NULL_HANDLE;
 		}
 	}
+	if ( vk.framebuffers.post_scene != VK_NULL_HANDLE ) {
+		qvkDestroyFramebuffer( vk.device, vk.framebuffers.post_scene, NULL );
+		vk.framebuffers.post_scene = VK_NULL_HANDLE;
+	}
 }
 
 /*
- * vk_create_subpass_framebuffers - Create the scene and post pass framebuffers
+ * vk_create_subpass_framebuffers - Create the scene, post-scene and post pass framebuffers
  *
- * fov_scene: [(msaa,) scene, depth] plus the density map; the post passes take [swapchain] and sample the scene
+ * fov_scene: [(msaa,) scene, depth] plus the density map; post_scene: [scene]; the post passes take [swapchain]
+ * and sample the scene
  */
 static qboolean vk_create_subpass_framebuffers( void )
 {
@@ -11011,6 +10741,22 @@ static qboolean vk_create_subpass_framebuffers( void )
 	ri.Printf( PRINT_ALL, "Creating subpass framebuffers (%s, %s)...\n",
 		useBloom ? "bloom" : "gamma-only",
 		vk.msaaActive ? "MSAA" : "non-MSAA" );
+
+	{
+		// The post-scene pass draws into the stored scene image, the same one whichever swapchain image the frame ends in
+		VkImageView sceneView = vk.msaaActive ? vk.transient.resolve_view : vk.transient.scene_view;
+
+		Com_Memset( &fbCI, 0, sizeof( fbCI ) );
+		fbCI.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+		fbCI.renderPass = vk.render_pass.post_scene;
+		fbCI.attachmentCount = 1;
+		fbCI.pAttachments = &sceneView;
+		fbCI.width = xr->width;
+		fbCI.height = xr->height;
+		fbCI.layers = 1;
+		VK_CHECK( qvkCreateFramebuffer( vk.device, &fbCI, NULL, &vk.framebuffers.post_scene ) );
+		SET_OBJECT_NAME( vk.framebuffers.post_scene, "post-scene framebuffer", VK_DEBUG_REPORT_OBJECT_TYPE_FRAMEBUFFER_EXT );
+	}
 
 	for ( i = 0; i < xr->colorInfo->imageCount && i < MAX_SWAPCHAIN_IMAGES; i++ ) {
 		// Get swapchain view (UNORM for gamma)
@@ -12541,7 +12287,7 @@ qboolean vk_init_xr_resources( void )
 	vk.xr.foveationWidth = 0;
 	vk.xr.foveationHeight = 0;
 	if ( vk.xr.fdmSupported ) {
-		if ( vk_create_authored_fdm( xrInfo->colorImageCount, xrInfo->colorArraySize,
+		if ( vk_create_authored_fdm( xrInfo->colorArraySize,
 				xrInfo->colorWidth, xrInfo->colorHeight, xrInfo->densityMapOffsetImages ? qtrue : qfalse ) ) {
 			vk.xr.foveationActive = qtrue;
 			ri.Printf( PRINT_ALL, "Foveated rendering: %ux%u density maps written by the renderer (%ux%u px texels), %s\n",

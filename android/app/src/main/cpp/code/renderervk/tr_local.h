@@ -672,6 +672,8 @@ typedef struct {
 	int			scissorX, scissorY, scissorWidth, scissorHeight;
 	float		fovX, fovY;
 	float		projectionMatrix[16];
+	qboolean	cullTangentsSet;	// portal views cull to where the eyes see the surface
+	float		cullTangents[4];	// right, left, up, down view-space tangents
 	cplane_t	frustum[5];
 	vec3_t		visBounds[2];
 	float		zFar;
@@ -1195,7 +1197,7 @@ typedef struct {
 	qboolean screenMapDone;
 	qboolean doneBloom;
 	qboolean doneFlares;	// main-view coronas drawn (deferred, once per frame)
-	qboolean hudDeferred;	// in-world VR HUD sprite captured, awaiting post_bloom replay over the corona
+	qboolean hudDeferred;	// in-world VR HUD sprite captured, awaiting its post-scene replay over the corona
 
 	// VR render target tracking
 	qboolean isDrawingHUD;
@@ -1989,7 +1991,7 @@ typedef struct {
 typedef struct {
 	int		commandId;
 	float	color[4];
-	qboolean postScene; // set when color queued during post-bloom 2D (skip pre-dimming)
+	qboolean postScene; // queued after the scene completed: drawn pre-gamma into the stored scene, so not pre-dimmed
 } setColorCommand_t;
 
 typedef struct {

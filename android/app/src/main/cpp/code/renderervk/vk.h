@@ -181,8 +181,8 @@ typedef enum {
 	RENDER_PASS_SCREENMAP,
 	RENDER_PASS_POST_BLOOM,
 	RENDER_PASS_HUD,            // HUD buffer (1280x960) for HUD mode 1 sprite
-	RENDER_PASS_MAIN_WITH_POST, // Combined subpass render pass (scene + bloom extract + gamma) - subpass 0
-	RENDER_PASS_POST_SCENE_2D,  // Post-bloom 2D subpass (subpass 3 for bloom, subpass 2 for gamma-only)
+	RENDER_PASS_MAIN_WITH_POST, // the FBO scene pass (fov_scene), drawn alone before the post-scene and output passes
+	RENDER_PASS_POST_SCENE,     // post-scene pass over the stored scene image: coronas, HUD and 2D before gamma
 	RENDER_PASS_COUNT
 } renderPass_t;
 
@@ -199,6 +199,7 @@ typedef struct {
 	int abs_light;
 	int allow_discard;
 	int hud_coverage; // 0: material alpha, 1: opaque coverage, 2: preserve coverage
+	int scene_alpha; // scene image alpha: 0 stays 1, 1 written for a later stage that reads it, 2 written back to 1
 	int acff; // none, rgb, rgba, alpha
 	int stencil_mark; // mark pixels with stencil bit 0x80 (for shadow exclusion)
 	struct {
@@ -301,7 +302,7 @@ void vk_begin_main_render_pass( void );
 void vk_begin_hud_render_pass( qboolean clear );
 void vk_end_hud_render_pass( void );
 void vk_finish_subpass_post( void );
-void vk_end_post_scene_subpass( void );
+void vk_end_post_scene_pass( void );
 qboolean vk_create_hud_buffer( void );
 void vk_shutdown_xr_resources( void );  // Cleanup XR-related resources
 
@@ -320,10 +321,17 @@ qboolean vk_init_xr_resources( void );  // Initialize XR swapchain resources
 
 // Foveated rendering: the density map the renderer writes itself
 void vk_destroy_authored_fdm( void );
-void vk_update_authored_fdm( uint32_t index );
+void vk_update_authored_fdm( void );
 void vk_set_foveation( int level, qboolean eyeTracked, const float centers[2][2], const float fovTan[2][4] );
 // Fragment edge in pixels (1..16) the frame's density map asks for at an ndc position in one eye; 1 when not foveating
 int vk_foveation_block_at( int eye, float ndcX, float ndcY );
+// Keep what a draw covers at full density while it lands inside a fixed map's pass: NDC bounds in one eye,
+// the current view's viewport, or the bounds of everything an overlay HUD bracket draws in 2D
+void vk_foveation_keep_sharp( int eye, const float rect[4] );
+void vk_foveation_keep_sharp_view( void );
+void vk_foveation_hud_begin( void );
+void vk_foveation_keep_sharp_hud( float x, float y, float w, float h );
+void vk_foveation_hud_end( void );
 
 qboolean vk_alloc_vbo( const byte *vbo_data, int vbo_size );
 void vk_update_mvp( const float *m );
@@ -397,6 +405,14 @@ typedef struct vk_tess_s {
 struct VR_VK_SwapchainInfo_s;
 
 
+// What a density map was drawn from, less the gaze and the HUD carve
+typedef struct {
+	int level;
+	qboolean eyeTracked, scope;
+	float fovTan[2][4];
+	uint32_t tileWidth, tileHeight;
+} vkFdmInputs_t;
+
 // XR-specific resources that don't have Quake3e equivalents
 // VR layer provides XrSwapchain handles and VkImages via VR_VK_SwapchainInfo.
 // Renderer creates and owns VkImageViews, VkFramebuffers for XR swapchains.
@@ -447,14 +463,18 @@ typedef struct {
 	uint32_t foveationWidth;
 	uint32_t foveationHeight;
 
-	// Our own density map, one per swapchain image, rewritten in the frame that renders into it
+	// Our own density map, shared by every swapchain image and rewritten in the frame that changes it
 	qboolean fdmAuthored;
-	VkImage fdmImage[MAX_SWAPCHAIN_IMAGES];
-	VkDeviceMemory fdmMemory[MAX_SWAPCHAIN_IMAGES];
-	VkBuffer fdmStaging[MAX_SWAPCHAIN_IMAGES];
-	VkDeviceMemory fdmStagingMemory[MAX_SWAPCHAIN_IMAGES];
-	void *fdmStagingMapped[MAX_SWAPCHAIN_IMAGES];
-	qboolean fdmUploaded[MAX_SWAPCHAIN_IMAGES];  // written at least once
+	qboolean fdmHostRead;           // the driver reads the map as the pass is recorded (Turnip)
+	VkImage fdmImage;
+	VkDeviceMemory fdmMemory;
+	VkBuffer fdmStaging[NUM_COMMAND_BUFFERS];  // one per frame in flight
+	VkDeviceMemory fdmStagingMemory[NUM_COMMAND_BUFFERS];
+	void *fdmStagingMapped[NUM_COMMAND_BUFFERS];
+	byte *fdmScratch;               // the map as this frame draws it
+	byte *fdmCurrent;               // the map the image holds
+	qboolean fdmUploaded;
+	vkFdmInputs_t fdmDrawn;         // what the held map was drawn from
 	uint32_t fdmLayers;
 	uint32_t fdmTexelWidth;
 	uint32_t fdmTexelHeight;
@@ -462,11 +482,9 @@ typedef struct {
 	// What the map should describe, pushed in by the VR layer each frame
 	int fdmLevel;                   // VR_FOVEATION_OFF..HIGH, or EYE_TRACKED
 	qboolean fdmEyeTracked;
+	qboolean fdmScope;              // the scope's view, masked outside its circle
 	float fdmCenter[2][2];          // per eye, normalized device coordinates
 	float fdmFovTan[2][4];          // per eye frustum: tangents of left, right, up, down
-	uint32_t fdmAppliedOffset[MAX_SWAPCHAIN_IMAGES][2][2];  // gaze per eye, quantized to map texels
-	int fdmAppliedLevel[MAX_SWAPCHAIN_IMAGES];
-	qboolean fdmAppliedEyeTracked[MAX_SWAPCHAIN_IMAGES];
 
 	// Offset mode: the map holds still around a reference point and the scene pass ends with the
 	// gaze's offset from it, so the tiler slides its bins with the eye
@@ -476,7 +494,12 @@ typedef struct {
 	int32_t fdmRef[2][2];           // per eye, framebuffer pixel the map's sharp region is drawn around
 	int32_t fdmOffset[2][2];        // per eye, the offset the current scene pass ends with
 	qboolean mapPassOpen;           // the open pass is the scene pass carrying the density map
-	byte *fdmScratch;               // the map as this frame would write it, compared before any upload
+
+	// Masks of map texels per layer, in framebuffer position, under the HUD drawn inside the map's
+	// pass: marked this frame, and held from the last for this frame's map
+	size_t fdmSharpBytes;
+	byte *fdmSharpMarked;
+	byte *fdmSharpHeld;
 
 	// Virtual screen: the finished frame's 4:3 crop with a mip chain for the reflection's blur
 	VkImage vscreenImage;
@@ -536,11 +559,13 @@ typedef struct {
 		VkRenderPass post_bloom;  // Multiview post-bloom blend
 		VkRenderPass hudBuffer;       // HUD buffer (1280x960, single layer, color+depth), color loaded
 		VkRenderPass hudBufferClear;  // same, color cleared on load: the first HUD pass of a frame
-		// Subpass optimization render passes (tile-local post-processing)
-		VkRenderPass main_with_bloom;  // 3 subpasses: scene, bloom extract, composite+gamma
-		VkRenderPass main_with_gamma;  // 2 subpasses: scene, gamma only
-		// Foveated split (vk.fovSplit): scene alone with the density map; main_with_* then load it for the post subpasses
+		// Post pass into the swapchain, one subpass: the composite (bloom) or gamma quad over the stored scene
+		VkRenderPass main_with_bloom;
+		VkRenderPass main_with_gamma;
+		// Foveated split (vk.fovSplit): scene alone with the density map; post_scene then draws coronas, HUD and 2D
+		// into the stored scene image before gamma
 		VkRenderPass fov_scene;
+		VkRenderPass post_scene;
 		// Virtual screen: clears the swapchain and draws the screen back into it, no density map
 		VkRenderPass virtualScreen;
 		// Virtual screen capture: single view, samples layer 0's crop into the screen texture's mip 0
@@ -632,6 +657,7 @@ typedef struct {
 		VkFramebuffer main_with_bloom[MAX_SWAPCHAIN_IMAGES];
 		VkFramebuffer main_with_gamma[MAX_SWAPCHAIN_IMAGES];
 		VkFramebuffer fov_scene[MAX_SWAPCHAIN_IMAGES];  // foveated split: scene pass, per density map
+		VkFramebuffer post_scene;  // the stored scene image, shared by every swapchain image
 	} framebuffers;
 
 #ifdef USE_UPLOAD_QUEUE
@@ -694,7 +720,6 @@ typedef struct {
 		VkShaderModule color_fs;
 		VkShaderModule color_vs;  // multiview
 
-		VkShaderModule bloom_fs;
 		VkShaderModule blur_fs;
 		VkShaderModule blur_extract_fs;  // first blur pass of the foveated split, bloom extract folded in
 		VkShaderModule blend_fs;
@@ -779,7 +804,7 @@ typedef struct {
 	// Post-processing pipelines (multiview)
 	VkPipeline blur_pipeline[VK_NUM_BLOOM_PASSES*2];  // Blur passes for bloom
 
-	// Post pass pipelines, in its subpass 0
+	// Output pass pipelines
 	VkPipeline final_composite_subpass_pipeline;  // composite + gamma
 	VkPipeline gamma_subpass_pipeline;            // gamma only (no bloom)
 	// Built lazily on first r_foveationDebug enable, against whichever pass carries the map
@@ -841,8 +866,8 @@ typedef struct {
 	qboolean descriptorsReady;	// qfalse between vk_release_resources() and vk_init_descriptors(): pool contents are dead
 
 	// Subpass optimization: track when HUD rendering completes the combined pass
-	// When using combined subpass render pass, if HUD rendering is requested,
-	// we first complete the subpass pass (bloom extract + gamma), then proceed with HUD.
+	// If HUD rendering is requested while the scene pass is open,
+	// the post-scene pass opens first, then the HUD proceeds.
 	qboolean subpassPostDone;			// true when vk_finish_subpass_post() already ran this frame
 
 	uint32_t screenMapWidth;
@@ -923,7 +948,6 @@ typedef struct {
 
 extern Vk_Instance	vk;				// shouldn't be cleared during ref re-init
 
-// True while the frame's render pass is open and advanced into its final 2D
-// subpass. Both fields are required: a closed pass leaves the index behind.
-#define VK_IN_POST_SCENE_2D()	( vk.inRenderPass && vk.renderPassIndex == RENDER_PASS_POST_SCENE_2D )
+// True while the frame's post-scene pass is open. Both fields are required: a closed pass leaves the index behind.
+#define VK_IN_POST_SCENE()	( vk.inRenderPass && vk.renderPassIndex == RENDER_PASS_POST_SCENE )
 extern Vk_World		vk_world;		// this data is cleared during ref re-init

@@ -134,8 +134,6 @@ add_custom_command(
     COMMAND ${BIN2HEX_EXECUTABLE} ${SPIRV_DIR}/temp.spv +${SHADER_DATA_OUTPUT} gamma_frag_spv
     COMMAND ${GLSLANG_VALIDATOR} -S frag -V --target-env vulkan1.1 -o ${SPIRV_DIR}/temp.spv ${SHADER_DIR}/blend.frag
     COMMAND ${BIN2HEX_EXECUTABLE} ${SPIRV_DIR}/temp.spv +${SHADER_DATA_OUTPUT} blend_frag_spv
-    COMMAND ${GLSLANG_VALIDATOR} -S frag -V --target-env vulkan1.1 -o ${SPIRV_DIR}/temp.spv ${SHADER_DIR}/bloom.frag
-    COMMAND ${BIN2HEX_EXECUTABLE} ${SPIRV_DIR}/temp.spv +${SHADER_DATA_OUTPUT} bloom_frag_spv
     COMMAND ${GLSLANG_VALIDATOR} -S frag -V --target-env vulkan1.1 -o ${SPIRV_DIR}/temp.spv ${SHADER_DIR}/blur.frag
     COMMAND ${BIN2HEX_EXECUTABLE} ${SPIRV_DIR}/temp.spv +${SHADER_DATA_OUTPUT} blur_frag_spv
     # First blur pass of the foveated split, with the bloom extract folded in

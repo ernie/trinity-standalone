@@ -211,8 +211,8 @@ void RE_SetColor( const float *rgba ) {
 	cmd->color[2] = rgba[2];
 	cmd->color[3] = rgba[3];
 
-	// Capture whether this color was queued during post-bloom 2D rendering.
-	// If so, the backend should use full brightness (no pre-dimming for gamma).
+	// Colors queued after the scene completes draw into the stored scene, which the
+	// output composite gamma-corrects, so the backend uses them at full brightness.
 	cmd->postScene = tr.sceneComplete;
 }
 
@@ -523,8 +523,8 @@ void RE_HUDBufferEnd( void )
 /*
  * RE_SceneComplete - the 3D scene is finished
  *
- * Called after trap_R_RenderScene(). Bloom extract and composite, or gamma
- * alone, runs here; the pass then sits in its final 2D subpass.
+ * Called after trap_R_RenderScene(). The scene pass ends and the blur chain runs
+ * here; the post-scene pass then stays open for coronas, the HUD and 2D.
  */
 void RE_SceneComplete( void )
 {

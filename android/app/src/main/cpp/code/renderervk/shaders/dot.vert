@@ -8,7 +8,7 @@ layout(push_constant) uniform Probe {
 	vec4 du[2];       // per-eye clip-space delta for one unit along u
 	vec4 dv[2];       // per-eye clip-space delta for one unit along v
 	vec4 extent;      // half extents: xy for eye 0 (along u, v), zw for eye 1
-	vec4 params;      // x: which counter the fragment adds to (0 passed, 1 total)
+	vec4 params;      // x: which of the eye's counters the fragment adds to (0 passed, 1 total)
 };
 
 layout(location = 0) in vec3 in_position; // unused; satisfies the pipeline's vertex input
@@ -26,5 +26,5 @@ void main() {
 	vec2 halfExtent = ( gl_ViewIndex == 0 ) ? extent.xy : extent.zw;
 	vec2 k = corner[gl_VertexIndex] * halfExtent;
 	gl_Position = center[gl_ViewIndex] + k.x * du[gl_ViewIndex] + k.y * dv[gl_ViewIndex];
-	counter = int( params.x );
+	counter = int( params.x ) + 2 * gl_ViewIndex;
 }

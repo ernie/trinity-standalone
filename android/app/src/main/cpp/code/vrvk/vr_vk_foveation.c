@@ -451,17 +451,7 @@ void VR_VK_Foveation_Frame(VR_Engine* engine)
 			!vr.virtual_screen;
 		const int strength = foveate ? engine->appState.Renderer.FoveationStrength : 0;
 
-		if (vr.weapon_zoomed)
-		{
-			// The scope aims at the middle of a symmetric render, where neither the optical axis nor a gaze lands
-			if (eyeTracked && swapchains)
-			{
-				VR_VK_Foveation_RequestPatternUpdate(engine, swapchains->color.swapchain);
-			}
-			s_gazeCenter[0][0] = s_gazeCenter[0][1] = 0.0f;
-			s_gazeCenter[1][0] = s_gazeCenter[1][1] = 0.0f;
-		}
-		else if (eyeTracked && swapchains)
+		if (eyeTracked && swapchains)
 		{
 			// Meta's extension asks for this right before the gaze is read
 			VR_VK_Foveation_RequestPatternUpdate(engine, swapchains->color.swapchain);

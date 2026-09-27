@@ -503,6 +503,25 @@ static void VR_Vulkan_QueryFragmentDensityMap(void)
         fdmProps.minFragmentDensityTexelSize.width, fdmProps.minFragmentDensityTexelSize.height,
         fdmProps.maxFragmentDensityTexelSize.width, fdmProps.maxFragmentDensityTexelSize.height));
 
+    // The tiler applies a density map one bin at a time, so the bin is the map's real resolution
+    if (vr_vk.fragmentDensityMapSupported && VR_Vulkan_HasDeviceExtension(VK_QCOM_TILE_PROPERTIES_EXTENSION_NAME)) {
+        VkPhysicalDeviceTilePropertiesFeaturesQCOM tileFeatures = {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TILE_PROPERTIES_FEATURES_QCOM,
+            .pNext = NULL,
+        };
+        VkPhysicalDeviceFeatures2 tileFeatures2 = {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+            .pNext = &tileFeatures,
+        };
+
+        pfn_vkGetPhysicalDeviceFeatures2(vr_vk.physicalDevice, &tileFeatures2);
+        vr_vk.tilePropertiesSupported = tileFeatures.tileProperties ? VR_TRUE : VR_FALSE;
+        VR_VK_LogLine(va("Tile properties: %s",
+            vr_vk.tilePropertiesSupported ? "supported, bin size will be reported" : "feature off"));
+    } else if (vr_vk.fragmentDensityMapSupported) {
+        VR_VK_LogLine("Tile properties: absent");
+    }
+
     VR_Vulkan_QueryFragmentDensityMapOffset();
 }
 
@@ -575,13 +594,9 @@ XrResult VR_Vulkan_CreateDevice(XrInstance xrInstance, XrSystemId systemId)
         if (vr_vk.fragmentDensityMap2Supported) {
             extensions[extensionCount++] = VK_EXT_FRAGMENT_DENSITY_MAP_2_EXTENSION_NAME;
         }
-        // The tiler applies a density map one bin at a time, so the bin is the map's real resolution
-        vr_vk.tilePropertiesSupported = VR_Vulkan_HasDeviceExtension(VK_QCOM_TILE_PROPERTIES_EXTENSION_NAME);
         if (vr_vk.tilePropertiesSupported) {
             extensions[extensionCount++] = VK_QCOM_TILE_PROPERTIES_EXTENSION_NAME;
         }
-        VR_VK_LogLine(va("Tile properties: %s",
-            vr_vk.tilePropertiesSupported ? "supported, bin size will be reported" : "absent"));
         if (vr_vk.fragmentDensityMapOffsetSupported) {
             extensions[extensionCount++] = vr_vk.fragmentDensityMapOffsetExtension;
             extensions[extensionCount++] = VK_KHR_CREATE_RENDERPASS_2_EXTENSION_NAME;
@@ -663,6 +678,14 @@ XrResult VR_Vulkan_CreateDevice(XrInstance xrInstance, XrSystemId systemId)
         offsetFeatures.pNext = multiviewFeatures.pNext;
         multiviewFeatures.pNext = &offsetFeatures;
     }
+    VkPhysicalDeviceTilePropertiesFeaturesQCOM tileFeatures = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TILE_PROPERTIES_FEATURES_QCOM,
+        .pNext = NULL,
+    };
+    if (vr_vk.fragmentDensityMapSupported && vr_vk.tilePropertiesSupported) {
+        tileFeatures.pNext = multiviewFeatures.pNext;
+        multiviewFeatures.pNext = &tileFeatures;
+    }
 
     VkPhysicalDeviceFeatures2 features2 = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
@@ -683,6 +706,9 @@ XrResult VR_Vulkan_CreateDevice(XrInstance xrInstance, XrSystemId systemId)
     }
     if (vr_vk.fragmentDensityMapOffsetSupported) {
         offsetFeatures.fragmentDensityMapOffset = VK_TRUE;
+    }
+    if (vr_vk.fragmentDensityMapSupported && vr_vk.tilePropertiesSupported) {
+        tileFeatures.tileProperties = VK_TRUE;
     }
 
     // Queue create info

@@ -21,6 +21,7 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 */
 #include "tr_local.h"
 #include "vk_hud_coverage.h"
+#include "vk_transmittance.h"
 
 // tr_shader.c -- this file deals with the parsing and definition of shaders
 
@@ -3326,6 +3327,7 @@ static shader_t *FinishShader( void ) {
 
 	{
 		Vk_Pipeline_Def def;
+		int readsDestinationAlpha[MAX_SHADER_STAGES];
 
 		Com_Memset( &def, 0, sizeof( def ) );
 		def.face_culling = shader.cullType;
@@ -3335,12 +3337,22 @@ static shader_t *FinishShader( void ) {
 			def.allow_discard = 1;
 		}
 
+		// the scene image's alpha carries transmittance for bloom, so only stages feeding a later
+		// destination-alpha blend write it, and the shader's last stage puts it back to 1
+		for ( i = 0; i < stage; i++ ) {
+			const uint32_t src = stages[i].stateBits & GLS_SRCBLEND_BITS;
+			const uint32_t dst = stages[i].stateBits & GLS_DSTBLEND_BITS;
+			readsDestinationAlpha[i] = src == GLS_SRCBLEND_DST_ALPHA || src == GLS_SRCBLEND_ONE_MINUS_DST_ALPHA ||
+				src == GLS_SRCBLEND_ALPHA_SATURATE || dst == GLS_DSTBLEND_DST_ALPHA || dst == GLS_DSTBLEND_ONE_MINUS_DST_ALPHA;
+		}
+
 		for ( i = 0; i < stage; i++ ) {
 			int env_mask;
 			shaderStage_t *pStage = &stages[i];
 			def.state_bits = pStage->stateBits;
 			def.hud_coverage = VK_HudCoverage(shader.lightmapIndex == LIGHTMAP_2D,
 				stages[0].stateBits, pStage->stateBits);
+			def.scene_alpha = VK_SceneAlphaMode( readsDestinationAlpha, stage, i );
 
 			if ( pStage->mtEnv3 ) {
 				switch ( pStage->mtEnv3 ) {

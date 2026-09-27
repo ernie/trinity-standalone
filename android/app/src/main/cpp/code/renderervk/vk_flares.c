@@ -70,11 +70,11 @@ typedef struct flare_s {
 
 	int			testTime;			// refdef time of the last test, for the intensity slew
 	qboolean	probeBinary;		// the last probe was the one-pixel test, answered yes or no
-	float		target;				// what the last test asked for: 0, 1, or the covered fraction
-	float		intensity;			// slews toward target; drawIntensity is set from it each test
+	float		target[2];			// per eye, what the last test asked for: 0, 1, or the covered fraction
+	float		intensity[2];		// per eye, slews toward target; the corona's color in that eye
 
-	float		drawIntensity;		// this view's draw value, may be non 0 while fading
-	float		deferredIntensity;	// drawIntensity captured at own-view test; later PV_NONE views (HUD icons) zero drawIntensity before the deferred draw
+	float		drawIntensity;		// this view's draw gate, the brighter eye's intensity; non 0 while fading
+	float		deferredIntensity;	// drawIntensity captured at own-view test; a later world view zeroes drawIntensity before the deferred draw
 
 	int			windowX, windowY;
 	float		eyeZ;
@@ -104,7 +104,7 @@ static float	deferredEyeProj[2][16];
 static float	deferredModelMatrix[16];
 
 // In-world VR HUD sprite deferral: the HUD RT_SPRITE is intercepted in
-// RB_SurfaceSprite during the main view and replayed in post_bloom AFTER the corona
+// RB_SurfaceSprite during the main view and replayed in the post-scene pass AFTER the corona
 // (RB_DrawDeferredHud) so opaque HUD pixels composite over the additive corona. All
 // state is captured in the back end at sprite-draw time so the replay uses the exact
 // main-view camera the sprite would have drawn with, independent of r_flares.
@@ -212,8 +212,8 @@ void RB_AddFlare( void *surface, int fogNum, vec3_t point, vec3_t color, vec3_t 
 		f->surface = surface;
 		f->frameSceneNum = backEnd.viewParms.frameSceneNum;
 		f->portalView = backEnd.viewParms.portalView;
-		f->target = 0.0f;
-		f->intensity = 0.0f;
+		f->target[0] = f->target[1] = 0.0f;
+		f->intensity[0] = f->intensity[1] = 0.0f;
 		f->probeBinary = qtrue;
 		f->testTime = backEnd.refdef.time;
 		f->testCount = 0;
@@ -408,25 +408,31 @@ static void RB_TestFlare( flare_t *f ) {
 
 	backEnd.pc.c_flareTests++;
 
-	// two counters a flare; the stride keeps the dynamic offset aligned
+	// passed and total per eye; the stride keeps the dynamic offset aligned
 	offset = (f - r_flareStructs) * vk.storage_alignment;
 	slot = (uint32_t*)( vk.storage.buffer_ptr + offset );
 
 	// last frame's counts, reset here: multiview gives no ordering between the two views' invocations
-	passed = slot[0];
-	total = slot[1];
-	slot[0] = 0;
-	slot[1] = 0;
+	for ( i = 0; i < 2; i++ ) {
+		passed = slot[i * 2 + 0];
+		total = slot[i * 2 + 1];
+		slot[i * 2 + 0] = 0;
+		slot[i * 2 + 1] = 0;
 
-	if ( f->testCount ) {
+		if ( !f->testCount ) {
+			continue;
+		}
 		if ( f->probeBinary ) {
-			f->target = passed ? 1.0f : 0.0f;
+			f->target[i] = passed ? 1.0f : 0.0f;
 		} else if ( total ) {
-			f->target = (float)passed / ( (float)total * FLARE_PATCH_FULL_AT );
-			if ( f->target > 1.0f ) {
-				f->target = 1.0f;
+			f->target[i] = (float)passed / ( (float)total * FLARE_PATCH_FULL_AT );
+			if ( f->target[i] > 1.0f ) {
+				f->target[i] = 1.0f;
 			}
 		}
+	}
+
+	if ( f->testCount ) {
 		f->testCount = 1;
 	}
 
@@ -526,41 +532,49 @@ static void RB_TestFlare( flare_t *f ) {
 		dt = 0.25f;
 	}
 	step = r_flareFade->value * dt;
-	if ( f->intensity < f->target ) {
-		f->intensity += step;
-		if ( f->intensity > f->target ) {
-			f->intensity = f->target;
-		}
-	} else {
-		f->intensity -= step;
-		if ( f->intensity < f->target ) {
-			f->intensity = f->target;
+	for ( i = 0; i < 2; i++ ) {
+		if ( f->intensity[i] < f->target[i] ) {
+			f->intensity[i] += step;
+			if ( f->intensity[i] > f->target[i] ) {
+				f->intensity[i] = f->target[i];
+			}
+		} else {
+			f->intensity[i] -= step;
+			if ( f->intensity[i] < f->target[i] ) {
+				f->intensity[i] = f->target[i];
+			}
 		}
 	}
 
-	f->drawIntensity = f->intensity;
+	f->drawIntensity = MAX( f->intensity[0], f->intensity[1] );
 }
+
+
+// One corona of a batch: the billboard and each eye's color, worked out before the batch opens
+typedef struct {
+	const flare_t	*flare;
+	vec3_t			left, up;
+	color4ub_t		color[2];
+} flareDraw_t;
+
+static flareDraw_t	flareBatch[ MAX_FLARES ];
 
 
 /*
 ==================
-RB_RenderFlare
+RB_SetupFlare
+
+Fills d from f; qfalse when falloff or fog leave both eyes black. The fog math
+uses tess, so this never runs while a batch is open.
 ==================
 */
-static void RB_RenderFlare( flare_t *f ) {
+static qboolean RB_SetupFlare( const flare_t *f, flareDraw_t *d ) {
 	float			size;
-	vec3_t			color;
 	float distance, intensity, factor;
 	float radius;
-	vec3_t			dir, left, up;
+	vec3_t			dir;
 	byte fogFactors[3] = {255, 255, 255};
-	color4ub_t		c;
-
-	// RB_RenderFlares culls drawIntensity == 0 before calling here
-	//if ( f->drawIntensity == 0.0 )
-	//	return;
-
-	backEnd.pc.c_flareRenders++;
+	int				e, k;
 
 	// We don't want too big values anyways when dividing by distance.
 	if ( f->eyeZ > -1.0f )
@@ -597,8 +611,6 @@ static void RB_RenderFlare( flare_t *f ) {
 
 	intensity = r_flareCoeff->value * size * size / ( factor * factor );
 
-	VectorScale( f->color, f->drawIntensity * intensity, color );
-
 	// Calculations for fogging
 	if ( tr.world && f->fogNum > 0 && f->fogNum < tr.world->numfogs )
 	{
@@ -610,23 +622,21 @@ static void RB_RenderFlare( flare_t *f ) {
 
 		// We don't need to render the flare if colors are 0 anyways.
 		if ( !(fogFactors[0] || fogFactors[1] || fogFactors[2]) )
-			return;
+			return qfalse;
 	}
 
-	c.rgba[0] = color[0] * fogFactors[0];
-	c.rgba[1] = color[1] * fogFactors[1];
-	c.rgba[2] = color[2] * fogFactors[2];
-	c.rgba[3] = 255;
+	for ( e = 0; e < 2; e++ ) {
+		for ( k = 0; k < 3; k++ ) {
+			d->color[e].rgba[k] = f->color[k] * f->intensity[e] * intensity * fogFactors[k];
+		}
+		d->color[e].rgba[3] = 255;
+	}
 
 	// falloff/fog can quantize the color to black; an additive black quad
 	// contributes nothing but still pays full depth-test-disabled fill
-	if ( !( c.rgba[0] | c.rgba[1] | c.rgba[2] ) )
-		return;
-
-	// Depth handling: the flare stage pipelines have the depth test disabled
-	// (rebaked in CreateExternalShaders), so the billboard is not swallowed
-	// by the light-fixture surface it sits on. Occlusion is the probe's job.
-	RB_BeginSurface( tr.flareShader, f->fogNum );
+	if ( !( d->color[0].rgba[0] | d->color[0].rgba[1] | d->color[0].rgba[2] |
+			d->color[1].rgba[0] | d->color[1].rgba[1] | d->color[1].rgba[2] ) )
+		return qfalse;
 
 	// World-space billboard at the flare origin, sized to subtend the same
 	// screen fraction as the classic window-space quad (`size` pixels of
@@ -642,25 +652,86 @@ static void RB_RenderFlare( flare_t *f ) {
 	// peripheral gaze angles); in-plane spin follows the view's up vector.
 	VectorSubtract( f->origin, f->viewOrigin, dir );
 	VectorNormalizeFast( dir );
-	CrossProduct( f->viewUp, dir, left );
-	if ( DotProduct( left, left ) < 0.0001f ) {
+	CrossProduct( f->viewUp, dir, d->left );
+	if ( DotProduct( d->left, d->left ) < 0.0001f ) {
 		// sight line parallel to view up: fall back to view left
-		VectorCopy( f->viewLeft, left );
+		VectorCopy( f->viewLeft, d->left );
 	} else {
-		VectorNormalizeFast( left );
+		VectorNormalizeFast( d->left );
 	}
-	CrossProduct( dir, left, up );
+	CrossProduct( dir, d->left, d->up );
 
-	VectorScale( left, radius, left );
-	VectorScale( up, radius, up );
+	VectorScale( d->left, radius, d->left );
+	VectorScale( d->up, radius, d->up );
 
 	if ( f->portalView == PV_MIRROR ) {
-		VectorSubtract( vec3_origin, left, left );
+		VectorSubtract( vec3_origin, d->left, d->left );
 	}
 
-	RB_AddQuadStamp( f->origin, left, up, c );
+	d->flare = f;
+	return qtrue;
+}
 
-	RB_EndSurface();
+
+/*
+==================
+RB_DrawFlareBatch
+
+Draws the batch in one draw, or one per eye with the other eye's projection
+collapsed when the eyes' fades differ. vk_view_eyeproj must hold the batch's view.
+
+Depth handling: the flare stage pipelines have the depth test disabled
+(rebaked in CreateExternalShaders), so the billboard is not swallowed
+by the light-fixture surface it sits on. Occlusion is the probe's job.
+==================
+*/
+static void RB_DrawFlareBatch( const flareDraw_t *batch, int count ) {
+	float	eyeProj[2][16];
+	int		e, i, eyes, fogNum;
+
+	eyes = 1;
+	for ( i = 0; i < count; i++ ) {
+		if ( memcmp( &batch[i].color[0], &batch[i].color[1], sizeof( batch[i].color[0] ) ) ) {
+			eyes = 2;
+			break;
+		}
+	}
+
+	Com_Memcpy( eyeProj, vk_view_eyeproj, sizeof( eyeProj ) );
+
+	for ( e = 0; e < eyes; e++ ) {
+		if ( eyes == 2 ) {
+			// z = 2w lies past the far plane, so the other eye's layer clips every vertex
+			Com_Memset( vk_view_eyeproj[1 - e], 0, sizeof( vk_view_eyeproj[0] ) );
+			vk_view_eyeproj[1 - e][14] = 2.0f;
+			vk_view_eyeproj[1 - e][15] = 1.0f;
+			VK_PushEyeProj();
+		}
+
+		fogNum = -1;
+		for ( i = 0; i < count; i++ ) {
+			const color4ub_t *c = &batch[i].color[e];
+			if ( !( c->rgba[0] | c->rgba[1] | c->rgba[2] ) )
+				continue;
+			if ( batch[i].flare->fogNum != fogNum ) {
+				if ( fogNum >= 0 )
+					RB_EndSurface();
+				fogNum = batch[i].flare->fogNum;
+				RB_BeginSurface( tr.flareShader, fogNum );
+			}
+			RB_AddQuadStamp( batch[i].flare->origin, batch[i].left, batch[i].up, *c );
+		}
+		if ( fogNum >= 0 )
+			RB_EndSurface();
+
+		if ( eyes == 2 ) {
+			Com_Memcpy( vk_view_eyeproj, eyeProj, sizeof( eyeProj ) );
+		}
+	}
+
+	if ( eyes == 2 ) {
+		VK_PushEyeProj();
+	}
 }
 
 
@@ -684,6 +755,7 @@ void RB_RenderFlares( void ) {
 	flare_t		*f;
 	flare_t		**prev;
 	qboolean	draw;
+	int			count;
 
 	if ( !r_flares->integer ) {
 		return;
@@ -694,6 +766,11 @@ void RB_RenderFlares( void ) {
 	}
 
 	if ( backEnd.isHyperspace ) {
+		return;
+	}
+
+	// no world depth to probe against (HUD icons, UI models)
+	if ( backEnd.refdef.rdflags & RDF_NOWORLDMODEL ) {
 		return;
 	}
 
@@ -720,7 +797,7 @@ void RB_RenderFlares( void ) {
 		f->drawIntensity = 0;
 		if ( f->frameSceneNum == backEnd.viewParms.frameSceneNum && f->portalView == backEnd.viewParms.portalView ) {
 			RB_TestFlare( f );
-			// deferred draw runs after later PV_NONE views (3D HUD icons) zero
+			// deferred draw runs after any later world view zeroes
 			// drawIntensity for this flare; preserve the real intensity here
 			f->deferredIntensity = f->drawIntensity;
 			if ( f->testCount == 0 ) {
@@ -763,11 +840,15 @@ void RB_RenderFlares( void ) {
 	// pipelines multiply by eyeProj, which garbles pre-projected vertices.
 	vk_update_mvp( backEnd.viewParms.world.modelMatrix );
 
+	count = 0;
 	for ( f = r_activeFlares ; f ; f = f->next ) {
 		if ( f->frameSceneNum == backEnd.viewParms.frameSceneNum && f->portalView == backEnd.viewParms.portalView && f->drawIntensity ) {
-			RB_RenderFlare( f );
+			backEnd.pc.c_flareRenders++;
+			if ( RB_SetupFlare( f, &flareBatch[count] ) )
+				count++;
 		}
 	}
+	RB_DrawFlareBatch( flareBatch, count );
 
 	//Com_Memcpy( vk_world.modelview_transform, modelMatrix_original, sizeof( modelMatrix_original ) );
 	//vk_update_mvp( NULL );
@@ -779,7 +860,7 @@ void RB_RenderFlares( void ) {
 RB_RenderDeferredFlares
 
 Draws main-view (PV_NONE) coronas once per frame at the 3D->2D boundary: in FBO
-mode after the bloom-extract subpass has sampled the scene (so coronas aren't
+mode after the blur chain has sampled the scene (so coronas aren't
 re-bloomed), in direct mode (r_fbo 0) into the still-open main pass. doneFlares
 guards the once-per-frame; the draw is idempotent across the hook sites.
 
@@ -794,6 +875,7 @@ orientation comes from state captured in RB_AddFlare.
 void RB_RenderDeferredFlares( void ) {
 	flare_t				*f;
 	const trRefEntity_t	*savedEntity;
+	int					count;
 
 	if ( !r_flares->integer || backEnd.doneFlares )
 		return;
@@ -830,14 +912,19 @@ void RB_RenderDeferredFlares( void ) {
 	// restored per-eye eyeProj UBO supplies the stereo projection.
 	vk_update_mvp( deferredModelMatrix );
 
+	count = 0;
 	for ( f = r_activeFlares ; f ; f = f->next ) {
 		if ( f->portalView == PV_NONE && f->addedFrame == backEnd.viewParms.frameCount ) {
-			// restore intensity zeroed by later PV_NONE (3D HUD icon) views since this flare's own test
+			// restore intensity zeroed by a later world view since this flare's own test
 			f->drawIntensity = f->deferredIntensity;
-			if ( f->drawIntensity )
-				RB_RenderFlare( f );
+			if ( f->drawIntensity ) {
+				backEnd.pc.c_flareRenders++;
+				if ( RB_SetupFlare( f, &flareBatch[count] ) )
+					count++;
+			}
 		}
 	}
+	RB_DrawFlareBatch( flareBatch, count );
 
 	// Restore MVP state so the flare camera can't leak into subsequent 2D: when
 	// projection2D is already set (end-of-frame hook site) this re-pushes the 2D
@@ -873,12 +960,47 @@ void RB_CaptureDeferredHud( const vec3_t origin, const vec3_t left, const vec3_t
 
 /*
 ==================
+RB_ReportHudRect
+
+Each eye's NDC bounds of the HUD quad, so a density map carrying its pass can keep it
+sharp; an eye with a corner behind it reports none.
+==================
+*/
+static void RB_ReportHudRect( void ) {
+	float rect[4];
+	vec4_t eye, clip;
+	vec3_t corner;
+	int e, i, k;
+
+	for ( e = 0; e < 2; e++ ) {
+		rect[0] = rect[1] = 1e9f;
+		rect[2] = rect[3] = -1e9f;
+		for ( i = 0; i < 4; i++ ) {
+			for ( k = 0; k < 3; k++ )
+				corner[k] = deferredHudOrigin[k] + ( ( i & 1 ) ? 1 : -1 ) * deferredHudLeft[k] +
+					( ( i & 2 ) ? 1 : -1 ) * deferredHudUp[k];
+			R_TransformModelToClip( corner, deferredHudModelMatrix, deferredHudEyeProj[e], eye, clip );
+			if ( clip[3] <= 0.001f )
+				break;
+			rect[0] = MIN( rect[0], clip[0] / clip[3] );
+			rect[1] = MIN( rect[1], clip[1] / clip[3] );
+			rect[2] = MAX( rect[2], clip[0] / clip[3] );
+			rect[3] = MAX( rect[3], clip[1] / clip[3] );
+		}
+		if ( i == 4 )
+			vk_foveation_keep_sharp( e, rect );
+	}
+}
+
+
+/*
+==================
 RB_DrawDeferredHud
 
 Replays the captured in-world HUD sprite at the 3D->2D boundary, AFTER
 RB_RenderDeferredFlares has drawn the corona; draws once per frame across the
 hook sites and runs independent of r_flares. In FBO mode it lands in the
-post-bloom 2D subpass (no depth attachment, so unoccluded); in direct mode
+post-scene pass (no depth attachment, so unoccluded); in direct mode
 (r_fbo 0) in the still-open main pass, where DEPTH_RANGE_WEAPON reproduces the
 original inline RF_DEPTHHACK draw. Either way it composites over the corona by
 drawing after it.
@@ -899,8 +1021,9 @@ void RB_DrawDeferredHud( void ) {
 	if ( backEnd.projection2D )
 		return;
 
-	// consume: draw exactly once even though both post_bloom hook sites call us
+	// consume: draw exactly once even though both post-scene hook sites call us
 	backEnd.hudDeferred = qfalse;
+	RB_ReportHudRect();
 
 	savedEntity = backEnd.currentEntity;
 	backEnd.currentEntity = &tr.worldEntity;
@@ -913,7 +1036,7 @@ void RB_DrawDeferredHud( void ) {
 	vk_update_mvp( deferredHudModelMatrix );
 
 	RB_BeginSurface( tr.hudShader, deferredHudFogNum );
-	// weapon depth range: no-op in the FBO subpass (no depth attachment),
+	// weapon depth range: no-op in the post-scene pass (no depth attachment),
 	// load-bearing in direct mode so world geometry can't occlude the HUD quad
 	tess.depthRange = DEPTH_RANGE_WEAPON;
 	RB_AddQuadStamp( deferredHudOrigin, deferredHudLeft, deferredHudUp, deferredHudColor );

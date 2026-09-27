@@ -1174,13 +1174,13 @@ static const void *RB_SetColor( const void *data ) {
 	cmd = (const setColorCommand_t *)data;
 
 	// Gamma compensation for 2D colors:
-	// - Before the gamma pass: pre-darken so the pass produces correct output.
+	// - Before the scene completes: pre-darken so the output composite produces correct output.
 	//   HUD buffer content belongs here too: it is gamma-passed later, when the
 	//   hud sprite that samples it is drawn.
-	// - Post-bloom 2D (including HUD mode 2): the fragment shader applies gamma
-	//   itself, so pre-compensating here would apply it twice.
+	// - After the scene completes (including HUD mode 2): the draws land in the stored scene
+	//   and the output composite applies gamma once, so pre-compensating would apply it twice.
 	if ( cmd->postScene ) {
-		// gamma is applied downstream in the fragment shader: use colors as-is
+		// the output composite applies gamma: use colors as-is
 		backEnd.color2D.rgba[0] = cmd->color[0] * 255;
 		backEnd.color2D.rgba[1] = cmd->color[1] * 255;
 		backEnd.color2D.rgba[2] = cmd->color[2] * 255;
@@ -1237,6 +1237,9 @@ static const void *RB_StretchPic( const void *data ) {
 	}
 
 	RB_AddQuadStamp2( cmd->x, cmd->y, cmd->w, cmd->h, cmd->s1, cmd->t1, cmd->s2, cmd->t2, backEnd.color2D );
+	if ( backEnd.isDrawingHUD ) {
+		vk_foveation_keep_sharp_hud( cmd->x, cmd->y, cmd->w, cmd->h );
+	}
 
 	return (const void *)(cmd + 1);
 }
@@ -1422,6 +1425,10 @@ static const void *RB_DrawSurfs( const void *data ) {
 
 	// clear the z buffer, set the modelview, etc
 	RB_BeginDrawingView();
+
+	if ( backEnd.refdef.isHUD ) {
+		vk_foveation_keep_sharp_view();
+	}
 
 	RB_RenderDrawSurfList( cmd->drawSurfs, cmd->numDrawSurfs );
 
@@ -1810,9 +1817,11 @@ static const void* RB_HUDBuffer( const void* data ) {
 		if ( cmd->start && !backEnd.isDrawingHUD ) {
 			backEnd.isDrawingHUD = qtrue;
 			backEnd.projection2D = qfalse;
+			vk_foveation_hud_begin();
 		}
 		else if ( !cmd->start && backEnd.isDrawingHUD ) {
 			backEnd.isDrawingHUD = qfalse;
+			vk_foveation_hud_end();
 		}
 		return (const void*)(cmd + 1);
 	}
@@ -1859,14 +1868,13 @@ static const void* RB_SceneComplete( const void* data ) {
 	// the bloom and gamma-only paths
 	// Also requires that we're actually in a render pass with a valid command buffer
 	if ( vk.renderPassIndex == RENDER_PASS_MAIN_WITH_POST && vk.inRenderPass ) {
-		// Transition through bloom extract/composite (or gamma) to post-bloom 2D subpass
+		// Open the post-scene pass over the stored scene
 		vk_finish_subpass_post();
-		// Now in the final 2D subpass
 
 		// 3D->2D boundary: draw the deferred main-view coronas now, after the
 		// bloom bright-pass has already sampled the scene, so they aren't
 		// captured by bloom / don't inflate the fixture's bloom blob. The
-		// post-bloom 2D subpass stays open for this draw and subsequent 2D commands.
+		// post-scene pass stays open for this draw and the 2D that follows.
 		RB_RenderDeferredFlares();
 		// Replay the in-world VR HUD sprite over the corona (Option B): opaque HUD pixels
 		// composite over the additive corona; the corona shows through transparent regions.
