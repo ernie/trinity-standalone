@@ -1993,7 +1993,8 @@ static void RE_Shutdown( refShutdownCode_t code ) {
 	R_DoneFreeType();
 
 #ifdef USE_VULKAN
-	if ( r_device->modified ) {
+	// a Com_Error between CL_InitRef and R_Register shuts down before r_device exists
+	if ( r_device && r_device->modified ) {
 		code = REF_UNLOAD_DLL;
 	}
 #endif

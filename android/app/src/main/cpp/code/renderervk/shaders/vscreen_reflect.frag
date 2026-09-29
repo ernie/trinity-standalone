@@ -14,5 +14,5 @@ const float BLUR_LOD = 3.0;
 void main() {
 	float depth = (1.0 - frag_tex_coord.y) / SPAN;
 	vec3 color = textureLod(screenTexture, frag_tex_coord, BLUR_LOD).rgb;
-	out_color = vec4(color, STRENGTH * clamp(1.0 - depth, 0.0, 1.0));
+	out_color = vec4(color, STRENGTH * (1.0 - smoothstep(0.0, 0.9, depth)));
 }

@@ -340,17 +340,20 @@ qboolean FS_Initialized( void ) {
 
 /*
 =================
-FS_TrinityPakIndex
+FS_TrinityPakBase
+
+The Trinity pak (pak8t, pak3t, zzz-trinity-announcer) this pack is, by
+exact base name (e.g. "pak8t") or checksummed download variant
+(e.g. "pak8t.0abcdef0", which sets *download); NULL for any other pak.
 =================
 */
-static int FS_TrinityPakIndex( pack_t *pack ) {
+static const char *FS_TrinityPakBase( const pack_t *pack, qboolean *download ) {
 	static const char *trinityPaks[] = {
 		"pak8t", "pak3t", "zzz-trinity-announcer"
 	};
-	int t, i;
+	int t;
 	const char *base;
 	int baseLen;
-	char qualifiedName[MAX_OSPATH];
 
 	for ( t = 0; t < ARRAY_LEN( trinityPaks ); t++ ) {
 		base = trinityPaks[t];
@@ -361,16 +364,33 @@ static int FS_TrinityPakIndex( pack_t *pack ) {
 		if ( pack->pakBasename[baseLen] != '\0' &&
 		     pack->pakBasename[baseLen] != '.' )
 			continue;
+		*download = pack->pakBasename[baseLen] == '.';
+		return base;
+	}
+	return NULL;
+}
 
-		Com_sprintf( qualifiedName, sizeof( qualifiedName ),
-		             "%s/%s", pack->pakGamename, base );
+/*
+=================
+FS_TrinityPakIndex
+=================
+*/
+static int FS_TrinityPakIndex( pack_t *pack ) {
+	qboolean download;
+	const char *base = FS_TrinityPakBase( pack, &download );
+	int i;
+	char qualifiedName[MAX_OSPATH];
 
-		for ( i = 0; i < fs_numServerReferencedPaks; i++ ) {
-			if ( !fs_serverReferencedPakNames[i] )
-				continue;
-			if ( !Q_stricmp( fs_serverReferencedPakNames[i], qualifiedName ) )
-				return i;
-		}
+	if ( !base )
+		return -1;
+	Com_sprintf( qualifiedName, sizeof( qualifiedName ),
+	             "%s/%s", pack->pakGamename, base );
+
+	for ( i = 0; i < fs_numServerReferencedPaks; i++ ) {
+		if ( !fs_serverReferencedPakNames[i] )
+			continue;
+		if ( !Q_stricmp( fs_serverReferencedPakNames[i], qualifiedName ) )
+			return i;
 	}
 	return -1;
 }
@@ -395,6 +415,12 @@ qboolean FS_PakIsPure( pack_t *pack ) {
 	if ( fs_numServerReferencedPaks ) {
 		i = FS_TrinityPakIndex( pack );
 		if ( i >= 0 && pack->checksum != fs_serverReferencedPaks[i] )
+			return qfalse;
+	} else {
+		// A downloaded Trinity pak is bound to the server it came from: local games use the installed copy,
+		// which sits behind the home directory's downloads in the search order.
+		qboolean download = qfalse;
+		if ( FS_TrinityPakBase( pack, &download ) && download )
 			return qfalse;
 	}
 

@@ -2434,6 +2434,12 @@ void Com_GameRestart(int checksumFeed, qboolean disconnect)
 			CL_Shutdown("Game directory changed", disconnect, qfalse);
 		}
 
+		// FS_Restart closes the log; drop the handle so logging reopens in the new game dir
+		if ( logfile ) {
+			FS_FCloseFile( logfile );
+			logfile = 0;
+		}
+
 		FS_Restart(checksumFeed);
 	
 		// Clean out any user and VM created cvars
