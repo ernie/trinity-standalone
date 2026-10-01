@@ -26,8 +26,9 @@ typedef struct {
 	vrVector3f_t position;
 } vrPosef_t;
 
-#define THUMB_LEFT  0
-#define THUMB_RIGHT 1
+// thumbstick_location[] holds the sticks by role, deadzone-processed
+#define VR_STICK_MOVE 0
+#define VR_STICK_TURN 1
 
 typedef struct {
 	float fov_x;

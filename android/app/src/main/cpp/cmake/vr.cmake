@@ -8,6 +8,7 @@ message(STATUS "Configuring VR sources")
 # Graphics-agnostic VR sources (vrcommon/)
 set(VR_COMMON_SOURCES
     ${SOURCE_DIR}/vrcommon/vr_base.c
+    ${SOURCE_DIR}/vrcommon/vr_bind.c
     ${SOURCE_DIR}/vrcommon/vr_cvars.c
     ${SOURCE_DIR}/vrcommon/vr_debug.c
     ${SOURCE_DIR}/vrcommon/vr_events.c
@@ -17,6 +18,7 @@ set(VR_COMMON_SOURCES
     ${SOURCE_DIR}/vrcommon/vr_instance.c
     ${SOURCE_DIR}/vrcommon/vr_math.c
     ${SOURCE_DIR}/vrcommon/vr_render_loop.c
+    ${SOURCE_DIR}/vrcommon/vr_router.c
     ${SOURCE_DIR}/vrcommon/vr_session.c
     ${SOURCE_DIR}/vrcommon/vr_shared_sync.c
     ${SOURCE_DIR}/vrcommon/vr_spaces.c

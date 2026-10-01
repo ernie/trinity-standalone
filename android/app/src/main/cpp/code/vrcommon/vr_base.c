@@ -270,8 +270,6 @@ VR_Engine* VR_Init( void )
 	memset(&vr_engine, 0, sizeof(vr_engine));
 	memset(&vr, 0, sizeof(vr));
 
-	vr.follow_mode = VRFM_THIRDPERSON_1;
-
 #if __ANDROID__
 	// The Android OpenXR loader must be initialized before enumerating instance
 	// extensions, or the enumeration comes back empty. Idempotent: VR_CreateInstance

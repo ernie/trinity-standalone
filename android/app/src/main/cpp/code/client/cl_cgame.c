@@ -29,6 +29,7 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 #include "../vrcommon/vr_base.h"
 #include "../vrcommon/vr_clientinfo.h"
 #include "../vrcommon/vr_input.h"
+#include "cl_vr_bind.h"
 #include "../vrcommon/vr_renderer.h"
 
 #ifdef USE_MUMBLE
@@ -264,8 +265,7 @@ void CL_ConfigstringModified( void ) {
 	if ( index == CS_VOTE_TIME
 		|| index == CS_TEAMVOTE_TIME
 		|| index == CS_TEAMVOTE_TIME + 1 ) {
-		Cvar_Set( "cl_voteYesKey", "A" );
-		Cvar_Set( "cl_voteNoKey", "B" );
+		CL_ResolveVoteKeys();
 	}
 }
 
@@ -505,6 +505,8 @@ and writes the value into the provided buffer.
 ====================
 */
 qboolean CL_GetValue( char *value, int valueSize, const char *key ) {
+	if ( CL_VRBind_GetValue( key, value, valueSize ) )
+		return qtrue;
 
 	// enhanced blood decals: advertise the radial decal trap only when the
 	// active renderer implements it, so the mod can fall back gracefully

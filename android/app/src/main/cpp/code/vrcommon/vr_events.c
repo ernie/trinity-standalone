@@ -81,8 +81,6 @@ XrBool32 VR_ProcessXrEvents(VR_App* app)
 
 void _VR_HandleSessionStateChange(VR_App* app, XrSessionState newState)
 {
-	if (newState != XR_SESSION_STATE_FOCUSED)
-		VR_CancelTVDInput();
 	switch (newState)
 	{
 		case XR_SESSION_STATE_FOCUSED:

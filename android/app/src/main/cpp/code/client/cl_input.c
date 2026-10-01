@@ -26,6 +26,7 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 #include "../vrcommon/vr_base.h"
 #include "../vrcommon/vr_input.h"
 #include "../vrcommon/vr_clientinfo.h"
+#include "../vrcommon/vr_router.h"
 
 unsigned	frame_msec;
 int			old_com_frameTime;
@@ -226,8 +227,17 @@ void IN_StrafeDown(void) {IN_KeyDown(&in_strafe);}
 void IN_StrafeUp(void) {IN_KeyUp(&in_strafe);}
 
 #ifdef USE_VOIP
-static void IN_VoipRecordDown(void) { Cvar_Set( "cl_voipCapture", "1" ); }
-static void IN_VoipRecordUp(void)   { Cvar_Set( "cl_voipCapture", "0" ); }
+/* Push-to-talk, or with voice activation on, the mute toggle: one binding serves both modes. */
+static void IN_VoipRecordDown(void) {
+	if ( cl_voipUseVAD->integer )
+		Cvar_Set( "cl_voipVADMuted", Cvar_VariableIntegerValue( "cl_voipVADMuted" ) ? "0" : "1" );
+	else
+		Cvar_Set( "cl_voipCapture", "1" );
+}
+static void IN_VoipRecordUp(void) {
+	if ( !cl_voipUseVAD->integer )
+		Cvar_Set( "cl_voipCapture", "0" );
+}
 #endif
 
 void IN_Button0Down(void) {IN_KeyDown(&in_buttons[0]);}
@@ -340,7 +350,8 @@ void CL_KeyMove( usercmd_t *cmd ) {
 	// the walking flag is to keep animations consistent
 	// even during acceleration and develeration
 	//
-	if ( in_speed.active ^ cl_run->integer ) {
+	// Always Run is a keyboard setting; VR runs unless +speed is held (the analog walk sets its own bit)
+	if ( !in_speed.active ) {
 		movespeed = 127;
 		cmd->buttons &= ~BUTTON_WALKING;
 	} else {
@@ -421,141 +432,6 @@ void CL_JoystickEvent( int axis, int value, int time ) {
 }
 
 /*
-=================
-CL_JoystickMove
-=================
-*/
-void CL_JoystickMove( usercmd_t *cmd ) {
-	float	anglespeed;
-
-	float yaw     = j_yaw->value     * cl.joystickAxis[j_yaw_axis->integer];
-	float right   = j_side->value    * cl.joystickAxis[j_side_axis->integer];
-	float forward = j_forward->value * cl.joystickAxis[j_forward_axis->integer];
-	float pitch   = j_pitch->value   * cl.joystickAxis[j_pitch_axis->integer];
-	float up      = j_up->value      * cl.joystickAxis[j_up_axis->integer];
-
-	// Walk/run is driven by analog stick magnitude in VR (see IN_VRJoystick).
-	// vr.walking already accounts for vr_analogWalk being disabled (then it stays false).
-	if ( vr.walking ) {
-		cmd->buttons |= BUTTON_WALKING;
-	}
-
-	if ( in_speed.active ) {
-		anglespeed = 0.001 * cls.frametime * cl_anglespeedkey->value;
-	} else {
-		anglespeed = 0.001 * cls.frametime;
-	}
-
-	if ( !in_strafe.active ) {
-		cl.viewangles[YAW] += anglespeed * yaw;
-		cmd->rightmove = ClampCharMove( cmd->rightmove + (int)right );
-	} else {
-		cl.viewangles[YAW] += anglespeed * right;
-		cmd->rightmove = ClampCharMove( cmd->rightmove + (int)yaw );
-	}
-
-	if ( in_mlooking ) {
-		cl.viewangles[PITCH] += anglespeed * forward;
-		cmd->forwardmove = ClampCharMove( cmd->forwardmove + (int)pitch );
-	} else {
-		cl.viewangles[PITCH] += anglespeed * pitch;
-		cmd->forwardmove = ClampCharMove( cmd->forwardmove + (int)forward );
-	}
-
-	cmd->upmove = ClampCharMove( cmd->upmove + (int)up );
-}
-
-/*
-=================
-CL_MouseMove
-=================
-*/
-
-void CL_MouseMove(usercmd_t *cmd)
-{
-	float mx, my;
-
-	// allow mouse smoothing
-	if (m_filter->integer)
-	{
-		mx = (cl.mouseDx[0] + cl.mouseDx[1]) * 0.5f;
-		my = (cl.mouseDy[0] + cl.mouseDy[1]) * 0.5f;
-	}
-	else
-	{
-		mx = cl.mouseDx[cl.mouseIndex];
-		my = cl.mouseDy[cl.mouseIndex];
-	}
-	
-	cl.mouseIndex ^= 1;
-	cl.mouseDx[cl.mouseIndex] = 0;
-	cl.mouseDy[cl.mouseIndex] = 0;
-
-	if (mx == 0.0f && my == 0.0f)
-		return;
-	
-	if (cl_mouseAccel->value != 0.0f)
-	{
-		if(cl_mouseAccelStyle->integer == 0)
-		{
-			float accelSensitivity;
-			float rate;
-			
-			rate = sqrt(mx * mx + my * my) / (float) frame_msec;
-
-			accelSensitivity = cl_sensitivity->value + rate * cl_mouseAccel->value;
-			mx *= accelSensitivity;
-			my *= accelSensitivity;
-			
-			if(cl_showMouseRate->integer)
-				Com_Printf("rate: %f, accelSensitivity: %f\n", rate, accelSensitivity);
-		}
-		else
-		{
-			float rate[2];
-			float power[2];
-
-			// sensitivity remains pretty much unchanged at low speeds
-			// cl_mouseAccel is a power value to how the acceleration is shaped
-			// cl_mouseAccelOffset is the rate for which the acceleration will have doubled the non accelerated amplification
-			// NOTE: decouple the config cvars for independent acceleration setup along X and Y?
-
-			rate[0] = fabs(mx) / (float) frame_msec;
-			rate[1] = fabs(my) / (float) frame_msec;
-			power[0] = powf(rate[0] / cl_mouseAccelOffset->value, cl_mouseAccel->value);
-			power[1] = powf(rate[1] / cl_mouseAccelOffset->value, cl_mouseAccel->value);
-
-			mx = cl_sensitivity->value * (mx + ((mx < 0) ? -power[0] : power[0]) * cl_mouseAccelOffset->value);
-			my = cl_sensitivity->value * (my + ((my < 0) ? -power[1] : power[1]) * cl_mouseAccelOffset->value);
-
-			if(cl_showMouseRate->integer)
-				Com_Printf("ratex: %f, ratey: %f, powx: %f, powy: %f\n", rate[0], rate[1], power[0], power[1]);
-		}
-	}
-	else
-	{
-		mx *= cl_sensitivity->value;
-		my *= cl_sensitivity->value;
-	}
-
-	// ingame FOV
-	mx *= cl.cgameSensitivity;
-	my *= cl.cgameSensitivity;
-
-	// add mouse X/Y movement to cmd
-	if(in_strafe.active)
-		cmd->rightmove = ClampCharMove(cmd->rightmove + m_side->value * mx);
-	else
-		cl.viewangles[YAW] -= m_yaw->value * mx;
-
-	if ((in_mlooking || cl_freelook->integer) && !in_strafe.active)
-		cl.viewangles[PITCH] += m_pitch->value * my;
-	else
-		cmd->forwardmove = ClampCharMove(cmd->forwardmove - m_forward->value * my);
-}
-
-
-/*
 ==============
 CL_CmdButtons
 ==============
@@ -587,89 +463,11 @@ void CL_CmdButtons( usercmd_t *cmd ) {
 }
 
 
-/*
-==============
-CL_FinishMove
-==============
-*/
-void rotateAboutOrigin(float x, float y, float rotation, vec2_t out);
-void CL_FinishMove( usercmd_t *cmd ) {
-	int		i;
-
-	// copy the state that the cgame is currently sending
-	cmd->weapon = cl.cgameUserCmdValue;
-
-	// send the current server time so the amount of movement
-	// can be determined without allowing cheating
-	cmd->serverTime = cl.serverTime;
-
-	vr.clientNum = cl.snap.ps.clientNum;
-
-	//If we are running multiplayer, pass the angles from the weapon and adjust the move values accordingly,
-	// to "fake" a 3DoF weapon but keeping the movement correct (necessary with a remote non-vr server)
-	if ( !vr.use_6dof )
-	{
-        //Realign in playspace
-        if (--vr.realign == 0)
-        {
-            VectorCopy(vr.hmdposition, vr.hmdorigin);
-        }
-
-        vec3_t angles;
-		VectorCopy(vr.calculated_weaponangles, angles);
-
-		//Adjust for difference in server angles
-        float deltaPitch = SHORT2ANGLE(cl.snap.ps.delta_angles[PITCH]);
-		angles[PITCH] -= deltaPitch;
-		angles[YAW] += (cl.viewangles[YAW] - vr.hmdorientation[YAW]);
-		if (!vr_sendRollToServer->integer && !clc.serverSupportsVR) {
-			angles[ROLL] = 0;
-		} else {
-			angles[ROLL] = Com_Clamp(-60.0f, 60.0f, vr.hmdorientation[ROLL]);
-		}
-
-		for (i = 0; i < 3; i++) {
-			cmd->angles[i] = ANGLE2SHORT(angles[i]);
-		}
-
-		vec3_t out;
-		rotateAboutOrigin(cmd->rightmove, cmd->forwardmove, -vr.calculated_weaponangles[YAW], out);
-		cmd->rightmove = ClampCharMove( (int)out[0] );
-		cmd->forwardmove = ClampCharMove( (int)out[1] );
-	}
-	else {
-		for (i = 0; i < 3; i++) {
-			cmd->angles[i] = ANGLE2SHORT(cl.viewangles[i]);
-		}
-
-		// In single-player spectator mode, apply offhand pitch to convert forward movement
-		// into vertical movement for fly controls
-		if (cl.snap.ps.pm_type == PM_SPECTATOR && !(cl.snap.ps.pm_flags & PMF_FOLLOW)) {
-			float pitchRad = vr.offhandangles[PITCH] * (M_PI / 180.0f);
-			float originalForward = cmd->forwardmove;
-			float originalUp = cmd->upmove;
-
-			// Decompose forward movement into horizontal and vertical components based on pitch
-			cmd->forwardmove = ClampCharMove((int)(originalForward * cos(pitchRad)));
-			// Integrate original upmove input with pitch-based vertical movement
-			cmd->upmove = ClampCharMove((int)(originalUp + originalForward * -sin(pitchRad)));
-		}
-	}
-
-	// Pack VR head orientation into buttons bits 12-25 for VR-aware servers
-	// (roll is sent via cmd->angles[ROLL] separately)
-	if (clc.serverSupportsVR) {
-		float headPitch = Com_Clamp(-80.0f, 80.0f, vr.hmdorientation[PITCH]);
-		int pitchPacked = ((int)((headPitch + 90.0f) * 127.0f / 180.0f)) & 0x7F;
-
-		float headYawOffset = Com_Clamp(-80.0f, 80.0f,
-			AngleSubtract(vr.hmdorientation[YAW], vr.weaponangles[YAW]));
-		int yawPacked = ((int)((headYawOffset + 90.0f) * 127.0f / 180.0f)) & 0x7F;
-
-		cmd->buttons |= (pitchPacked << 12) | (yawPacked << 19);
-	}
+/* VR builds its own command; bound keys still feed buttons and digital movement. */
+void CL_VRInput_KeyState( usercmd_t *cmd ) {
+	CL_CmdButtons( cmd );
+	CL_KeyMove( cmd );
 }
-
 
 /*
 =================
@@ -678,46 +476,12 @@ CL_CreateCmd
 */
 usercmd_t CL_CreateCmd( void ) {
 	usercmd_t	cmd;
-	vec3_t		oldAngles;
 
-	VectorCopy( cl.viewangles, oldAngles );
-
-	// keyboard angle adjustment
+	// head yaw, snap requests, pitch and roll
 	CL_AdjustAngles ();
-	
-	Com_Memset( &cmd, 0, sizeof( cmd ) );
 
-	CL_CmdButtons( &cmd );
-
-	// get basic movement from keyboard
-	CL_KeyMove( &cmd );
-
-	// get basic movement from mouse
-	CL_MouseMove( &cmd );
-
-	// get basic movement from joystick
-	CL_JoystickMove( &cmd );
-
-	// check to make sure the angles haven't wrapped
-	if ( cl.viewangles[PITCH] - oldAngles[PITCH] > 90 ) {
-		cl.viewangles[PITCH] = oldAngles[PITCH] + 90;
-	} else if ( oldAngles[PITCH] - cl.viewangles[PITCH] > 90 ) {
-		cl.viewangles[PITCH] = oldAngles[PITCH] - 90;
-	}
-
-    // store out the final values
-	CL_FinishMove( &cmd );
-
-	// draw debug graphs of turning for mouse testing
-	if ( cl_debugMove->integer ) {
-		if ( cl_debugMove->integer == 1 ) {
-			SCR_DebugGraph( fabs(cl.viewangles[YAW] - oldAngles[YAW]) );
-		}
-		if ( cl_debugMove->integer == 2 ) {
-			SCR_DebugGraph( fabs(cl.viewangles[PITCH] - oldAngles[PITCH]) );
-		}
-	}
-
+	// the engine's VR command builder: role-stick movement, bound keys, weapon angles and head pose
+	VR_Router_ApplyMove( &cmd );
 	return cmd;
 }
 

@@ -136,6 +136,7 @@ typedef enum {
 	// number; append new ones here to keep the ABI stable)
 	// NOTE: sequential entries must stay below UI_MEMSET = 100
 	UI_VR_REGISTERSTATE,
+	UI_VR_BINDCAPTURE,
 	UI_TRAP_GETVALUE = COM_TRAP_GETVALUE,
 
 	UI_MEMSET = 100,

@@ -588,6 +588,8 @@ extern	cvar_t	*cl_tvDownload;
 extern	cvar_t	*cl_tvdOffer;
 extern	cvar_t	*cl_voteYesKey;
 extern	cvar_t	*cl_voteNoKey;
+void CL_ResolveVoteKeys( void );
+void CL_VRInput_KeyState( usercmd_t *cmd );
 
 void CL_TV_Init( void );
 qboolean CL_TV_Open( const char *filename );

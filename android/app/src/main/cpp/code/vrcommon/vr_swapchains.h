@@ -48,4 +48,13 @@ void VR_GetSupersampledResolution(
 	int* width,
 	int* height);
 
+// The size supersampling scales: the runtime's recommendation, or the ADB override when one is set.
+void VR_GetBaseResolution(
+	XrInstance instance,
+	XrSystemId systemId,
+	int* width,
+	int* height,
+	int* maxWidth,
+	int* maxHeight);
+
 #endif // __VR_SWAPCHAINS_COMMON

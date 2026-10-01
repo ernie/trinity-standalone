@@ -20,6 +20,7 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 ===========================================================================
 */
 #include "client.h"
+#include "../vrcommon/vr_router.h"
 
 /*
 
@@ -315,6 +316,43 @@ keyname_t keynames[] =
 	{"PAD0_RIGHTSTICK_DOWN", K_PAD0_RIGHTSTICK_DOWN },
 	{"PAD0_LEFTTRIGGER", K_PAD0_LEFTTRIGGER },
 	{"PAD0_RIGHTTRIGGER", K_PAD0_RIGHTTRIGGER },
+
+	{"VR_WPN_TRIGGER", K_VR_WPN_TRIGGER },
+	{"VR_OFF_TRIGGER", K_VR_OFF_TRIGGER },
+	{"VR_WPN_GRIP", K_VR_WPN_GRIP },
+	{"VR_OFF_GRIP", K_VR_OFF_GRIP },
+	{"VR_WPN_GRIPCLICK", K_VR_WPN_GRIPCLICK },
+	{"VR_OFF_GRIPCLICK", K_VR_OFF_GRIPCLICK },
+	{"VR_WPN_THUMBREST", K_VR_WPN_THUMBREST },
+	{"VR_OFF_THUMBREST", K_VR_OFF_THUMBREST },
+	{"VR_WPN_BUMPER", K_VR_WPN_BUMPER },
+	{"VR_OFF_BUMPER", K_VR_OFF_BUMPER },
+	{"VR_WPN_TRACKPAD", K_VR_WPN_TRACKPAD },
+	{"VR_OFF_TRACKPAD", K_VR_OFF_TRACKPAD },
+	{"VR_WPN_A", K_VR_WPN_A },
+	{"VR_WPN_B", K_VR_WPN_B },
+	{"VR_OFF_A", K_VR_OFF_A },
+	{"VR_OFF_B", K_VR_OFF_B },
+	{"VR_MOVESTICK", K_VR_MOVESTICK },
+	{"VR_TURNSTICK", K_VR_TURNSTICK },
+	{"VR_MOVESTICK_UP", K_VR_MOVESTICK_UP },
+	{"VR_MOVESTICK_DOWN", K_VR_MOVESTICK_DOWN },
+	{"VR_MOVESTICK_LEFT", K_VR_MOVESTICK_LEFT },
+	{"VR_MOVESTICK_RIGHT", K_VR_MOVESTICK_RIGHT },
+	{"VR_TURNSTICK_UP", K_VR_TURNSTICK_UP },
+	{"VR_TURNSTICK_DOWN", K_VR_TURNSTICK_DOWN },
+	{"VR_TURNSTICK_LEFT", K_VR_TURNSTICK_LEFT },
+	{"VR_TURNSTICK_RIGHT", K_VR_TURNSTICK_RIGHT },
+	{"VR_A", K_VR_A },
+	{"VR_B", K_VR_B },
+	{"VR_X", K_VR_X },
+	{"VR_Y", K_VR_Y },
+	{"VR_MENU", K_VR_MENU },
+	{"VR_VIEW", K_VR_VIEW },
+	{"VR_DPAD_UP", K_VR_DPAD_UP },
+	{"VR_DPAD_DOWN", K_VR_DPAD_DOWN },
+	{"VR_DPAD_LEFT", K_VR_DPAD_LEFT },
+	{"VR_DPAD_RIGHT", K_VR_DPAD_RIGHT },
 
 	{NULL,0}
 };
@@ -1223,6 +1261,8 @@ void CL_InitKeyCommands( void ) {
 	Cmd_SetCommandCompletionFunc( "unbind", Key_CompleteUnbind );
 	Cmd_AddCommand ("unbindall",Key_Unbindall_f);
 	Cmd_AddCommand ("bindlist",Key_Bindlist_f);
+	// the config runs before CL_Init, so vrbind lines need the commands now
+	CL_VRBind_InitCommands();
 }
 
 /*
@@ -1453,9 +1493,11 @@ Called by the system for both key up and key down events
 ===================
 */
 void CL_KeyEvent (int key, qboolean down, unsigned time) {
-	if( down )
+	if( down ) {
+		/* A keyboard or mouse press means the player stopped waiting to bind a VR button. */
+		VR_Router_CancelCapture();
 		CL_KeyDownEvent( key, time );
-	else
+	} else
 		CL_KeyUpEvent( key, time );
 }
 
@@ -1531,11 +1573,23 @@ Key_SetCatcher
 ====================
 */
 void Key_SetCatcher( int catcher ) {
+	int previous = keyCatchers;
+	int textCatchers = KEYCATCH_CONSOLE | KEYCATCH_MESSAGE;
 	// If the catcher state is changing, clear all key states
 	if( catcher != keyCatchers )
 		Key_ClearStates( );
 
 	keyCatchers = catcher;
+	// The keyboard follows the catchers that take text, however they open or close
+	if ( (previous ^ catcher) & textCatchers ) {
+		if ( catcher & textCatchers )
+			VKeyboard_Show();
+		else
+			VKeyboard_Hide();
+	} else if ( (previous & KEYCATCH_UI) && !(catcher & (KEYCATCH_UI | textCatchers)) ) {
+		// The UI's fields own the keyboard; with no text catcher left, nothing does.
+		VKeyboard_Hide();
+	}
 }
 
 // This must not exceed MAX_CMD_LINE

@@ -1095,6 +1095,8 @@ void Key_KeynameCompletion( void(*callback)(const char *s) );
 // for keyname autocompletion
 
 void Key_WriteBindings( fileHandle_t f );
+void CL_VRBind_InitCommands( void );
+void CL_VRBind_Write( fileHandle_t f );
 // for writing the config files
 
 void S_ClearSoundBuffer( void );

@@ -166,17 +166,15 @@ void VR_GetRecommendedResolution(
 	free(views);
 }
 
-void VR_GetSupersampledResolution(
+void VR_GetBaseResolution(
 	XrInstance instance,
 	XrSystemId systemId,
 	int* width,
-	int* height)
+	int* height,
+	int* maxWidth,
+	int* maxHeight)
 {
-	int maxWidth = 0, maxHeight = 0;
-	VR_GetRecommendedResolution(instance, systemId, width, height, &maxWidth, &maxHeight);
-
-	int baseWidth = *width;
-	int baseHeight = *height;
+	VR_GetRecommendedResolution(instance, systemId, width, height, maxWidth, maxHeight);
 
 #ifdef __ANDROID__
 	// Check for ADB resolution overrides (set by QGO, SideQuest, or manual adb setprop)
@@ -186,11 +184,21 @@ void VR_GetSupersampledResolution(
 	if (adbWidth > 0 && adbHeight > 0)
 	{
 		Com_Printf("Using ADB override resolution: %dx%d (OpenXR recommended: %dx%d)\n",
-			adbWidth, adbHeight, baseWidth, baseHeight);
-		baseWidth = adbWidth;
-		baseHeight = adbHeight;
+			adbWidth, adbHeight, *width, *height);
+		*width = adbWidth;
+		*height = adbHeight;
 	}
 #endif
+}
+
+void VR_GetSupersampledResolution(
+	XrInstance instance,
+	XrSystemId systemId,
+	int* width,
+	int* height)
+{
+	int maxWidth = 0, maxHeight = 0, baseWidth, baseHeight;
+	VR_GetBaseResolution(instance, systemId, &baseWidth, &baseHeight, &maxWidth, &maxHeight);
 
 	const float supersamplingFactor = VR_GetSupersamplingFactor();
 	int supersampledWidth = (int)(baseWidth * supersamplingFactor);

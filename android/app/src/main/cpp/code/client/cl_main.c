@@ -22,6 +22,7 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 // cl_main.c  -- client main loop
 
 #include "client.h"
+#include "cl_vr_bind.h"
 #include "cl_trinity.h"
 #include "cl_trinity_rconset.h"
 #include <limits.h>
@@ -134,6 +135,23 @@ cvar_t	*cl_tvDownload;
 cvar_t	*cl_tvdOffer;
 cvar_t	*cl_voteYesKey;
 cvar_t	*cl_voteNoKey;
+
+/* The vote prompts name the button that votes: the VR vote binding, else the keyboard's "vote" binds. */
+void CL_ResolveVoteKeys( void ) {
+	static const char *commands[2][2] = {{"vote yes", "+vote_yes"}, {"vote no", "+vote_no"}};
+	static const char *cvars[2] = {"cl_voteYesKey", "cl_voteNoKey"};
+	char name[64];
+	int i, keynum;
+	for ( i = 0; i < 2; i++ ) {
+		if ( CL_VRBind_NameFor( "vote", commands[i][1], name, sizeof( name ) ) ) {
+			Cvar_Set( cvars[i], name );
+			continue;
+		}
+		keynum = Key_GetKey( commands[i][0] );
+		Cvar_Set( cvars[i], keynum >= 0 ? Key_KeynumToString( keynum ) : "" );
+	}
+}
+
 cvar_t	*cl_conXOffset;
 cvar_t	*cl_inGameVideo;
 
@@ -2765,9 +2783,8 @@ void CL_TV_DownloadFrame( void ) {
 			// signal cgame via ROM cvar
 			Cvar_Set( "cl_tvdOffer", clc.tvDemoPendingLocal );
 
-			// resolve vote key labels for cgame display (VR: always A/B)
-			Cvar_Set( "cl_voteYesKey", "A" );
-			Cvar_Set( "cl_voteNoKey", "B" );
+			// resolve vote key labels for cgame display
+			CL_ResolveVoteKeys();
 		} else {
 			Com_DPrintf( "TV: sv_dlURL not set, skipping demo download\n" );
 		}

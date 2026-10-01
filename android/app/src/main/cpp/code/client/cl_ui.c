@@ -25,6 +25,8 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 
 #include "../botlib/botlib.h"
 #include "../vrcommon/vr_input.h"
+#include "../vrcommon/vr_router.h"
+#include "cl_vr_bind.h"
 
 extern	botlib_export_t	*botlib_export;
 
@@ -728,6 +730,10 @@ static qboolean CL_UIGetValue( char *value, int valueSize, const char *key ) {
 		Com_sprintf( value, valueSize, "%i", UI_VR_REGISTERSTATE );
 		return qtrue;
 	}
+	if ( !Q_stricmp( key, "trap_VR_BindCapture" ) ) {
+		Com_sprintf( value, valueSize, "%i", UI_VR_BINDCAPTURE );
+		return qtrue;
+	}
 	if ( !Q_stricmp( key, "trap_HapticEvent" ) ) {
 		Com_sprintf( value, valueSize, "%i", UI_HAPTICEVENT );
 		return qtrue;
@@ -749,16 +755,9 @@ static qboolean CL_UIGetValue( char *value, int valueSize, const char *key ) {
 		return qtrue;
 	}
 
-	// Value keys (no syscall): names of the inputs that synthesize K_SPACE
-	// and K_ESCAPE in menus, so ui prompts can name the real controls.
-	if ( !Q_stricmp( key, "vr_menu_skip_button" ) ) {
-		Com_sprintf( value, valueSize, "%s", VR_GetMenuSkipButtonName() );
+	// Value keys (no syscall): names of the bound buttons, so ui prompts can name the real controls
+	if ( CL_VRBind_GetValue( key, value, valueSize ) )
 		return qtrue;
-	}
-	if ( !Q_stricmp( key, "vr_menu_cancel_button" ) ) {
-		Com_sprintf( value, valueSize, "%s", VR_GetMenuCancelButtonName() );
-		return qtrue;
-	}
 	return qfalse;
 }
 
@@ -1143,6 +1142,9 @@ intptr_t CL_UISystemCalls( intptr_t *args ) {
 
 	case UI_VR_REGISTERSTATE:
 		VM_RegisterVRShared( uivm, VR_WRITER_UI, args[1], args[2], args[3], args[4] );
+		return 0;
+	case UI_VR_BINDCAPTURE:
+		VR_Router_BindCapture();
 		return 0;
 
 	default:

@@ -25,6 +25,7 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 #include "../vrcommon/vr_clientinfo.h"
 #include "../vrcommon/vr_renderer.h"
 #include "../vrcommon/vr_base.h"
+#include "cl_vr_bind.h"
 
 extern vr_clientinfo_t vr;
 extern cvar_t *vr_currentHudDrawStatus;
@@ -676,17 +677,24 @@ static void SCR_DrawVRFallbackNotice( void ) {
 	int i, j, longest, hudMode;
 	qboolean useHudBuffer;
 
-	if ( !scr_vrFallbackPak[0] || clc.state != CA_ACTIVE )
+	lines[0] = lines[1] = NULL;
+	if ( scr_vrFallbackPak[0] && clc.state == CA_ACTIVE ) {
+		// the window starts with play, after any slow map load
+		if ( !scr_vrFallbackExpireTime )
+			scr_vrFallbackExpireTime = Sys_Milliseconds() + VR_FALLBACK_NOTICE_MSEC;
+		if ( Sys_Milliseconds() <= scr_vrFallbackExpireTime ) {
+			Com_sprintf( line2, sizeof( line2 ), "%s QVMs are VR-incompatible", scr_vrFallbackPak );
+			lines[0] = "Fallback VR modules active";
+			lines[1] = line2;
+		}
+	}
+	// the Simple profile binds only menus, so the player has to know why nothing else works
+	if ( !lines[0] && CL_VRBind_Profile() >= 0 && VR_ProfileFamily( CL_VRBind_Profile() ) == VRF_SIMPLE ) {
+		lines[0] = "This controller isn't supported for play.";
+		lines[1] = "Use a supported controller.";
+	}
+	if ( !lines[0] )
 		return;
-	// the window starts with play, after any slow map load
-	if ( !scr_vrFallbackExpireTime )
-		scr_vrFallbackExpireTime = Sys_Milliseconds() + VR_FALLBACK_NOTICE_MSEC;
-	if ( Sys_Milliseconds() > scr_vrFallbackExpireTime )
-		return;
-
-	Com_sprintf( line2, sizeof( line2 ), "%s QVMs are VR-incompatible", scr_vrFallbackPak );
-	lines[0] = "Fallback VR modules active";
-	lines[1] = line2;
 	lengths[0] = (int)strlen( lines[0] );
 	lengths[1] = (int)strlen( lines[1] );
 	longest = lengths[0] > lengths[1] ? lengths[0] : lengths[1];

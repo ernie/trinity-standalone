@@ -13,6 +13,8 @@
 #include "vr_macros.h"
 #include "vr_virtual_screen.h"
 #include "vr_math.h"
+#include "vr_bind.h"
+#include "vr_router.h"
 
 #if __ANDROID__
 #include <android/log.h>
@@ -74,74 +76,21 @@ XrSpace rightControllerAimSpace = XR_NULL_HANDLE;
 qboolean inputInitialized = qfalse;
 qboolean useSimpleProfile = qfalse;
 
-enum {
-	VR_TOUCH_AXIS_UP = 1 << 0,
-	VR_TOUCH_AXIS_UPRIGHT = 1 << 1,
-	VR_TOUCH_AXIS_RIGHT = 1 << 2,
-	VR_TOUCH_AXIS_DOWNRIGHT = 1 << 3,
-	VR_TOUCH_AXIS_DOWN = 1 << 4,
-	VR_TOUCH_AXIS_DOWNLEFT = 1 << 5,
-	VR_TOUCH_AXIS_LEFT = 1 << 6,
-	VR_TOUCH_AXIS_UPLEFT = 1 << 7,
-	VR_TOUCH_AXIS_TRIGGER_INDEX = 1 << 8,
-};
-
-typedef struct {
-	uint32_t buttons;
-	uint32_t axisButtons;
-} vrController_t;
-
 extern vr_clientinfo_t vr;
 
-static vrController_t leftController;
-static vrController_t rightController;
-static int in_vrEventTime = 0;
-static double lastframetime = 0;
-static qboolean wasInMenuMode = qfalse;
 
 // Aim poses in the world space, without vr_heightAdjust, for rays against the virtual screen
 static XrPosef aimPose[2];
 static qboolean aimPoseValid[2];
+static qboolean aimOrientationValid[2];
 
-extern cvar_t *vr_triggerSensitivity;
-static float IN_TriggerPressedThreshold(void) { return 1.0f - vr_triggerSensitivity->value; }
-static float IN_TriggerReleasedThreshold(void) {
-	float r = IN_TriggerPressedThreshold() - 0.25f;
-	return r < 0.1f ? 0.1f : r;
-}
-
-// Weapon adjustment mode: dual-grip hold detection
-static int dualGripHoldStartTime = 0;
-static qboolean dualGripWasActive = qfalse;
-static int weaponAdjustBHoldStart = 0; // B button hold tracking for reset-all
-
-// Apply analog curve to thumbstick input
-// Smoothly ramps from dead zone to maximum value (same approach as SDL gamepad)
-static float IN_ApplyThumbstickCurve(float value, float threshold)
-{
-	float absValue = fabs(value);
-
-	// Below threshold, return 0
-	if (absValue < threshold)
-		return 0.0f;
-
-	// Smoothly ramp from dead zone to maximum value
-	float f = (absValue - threshold) / (1.0f - threshold);
-
-	// Preserve sign
-	return (value < 0) ? -f : f;
-}
 
 extern cvar_t *vr_sensitivity;
-extern cvar_t *m_pitch;
-extern cvar_t *m_yaw;
 
 #ifndef EPSILON
 #define EPSILON 0.001f
 #endif
 
-// Grip click has no VR_Button bit in the shared header, so it takes a free one locally
-#define VR_BUTTON_GRIP_CLICK 0x02000000
 
 extern cvar_t *vr_righthanded;
 extern cvar_t *vr_switchThumbsticks;
@@ -215,18 +164,13 @@ void VR_PrintInputInfo( void )
 
 extern cvar_t *vr_heightAdjust;
 extern cvar_t *vr_twoHandedWeapons;
-extern cvar_t *vr_refreshrate;
 extern cvar_t *vr_weaponScope;
-extern cvar_t *vr_hapticIntensity;
 extern cvar_t *vr_thumbstickDeadzone;
 extern cvar_t *vr_thumbstickFullDeflection;
 extern cvar_t *vr_analogWalk;
-extern cvar_t *vr_weaponAdjust;
 extern cvar_t *vr_weaponSelectorMode;
 extern cvar_t *vr_6dof;
 
-qboolean alt_key_mode_active = qfalse;
-static int altHeldCount = 0;
 
 void rotateAboutOrigin(float x, float y, float rotation, vec2_t out)
 {
@@ -329,386 +273,6 @@ void QuatToYawPitchRoll(XrQuaternionf q, vec3_t rotation, vec3_t out)
 	XrVector3f_Normalize(&up);
 
 	GetAnglesFromVectors(forward, right, up, out);
-}
-
-static qboolean IN_GetInputAction(const char* inputName, char* action)
-{
-	char cvarname[256];
-	Com_sprintf(cvarname, 256, "vr_button_map_%s%s", inputName, alt_key_mode_active ? "_ALT" : "");
-	char * val = Cvar_VariableString(cvarname);
-	if (val && strlen(val) > 0)
-	{
-		Com_sprintf(action, 256, "%s", val);
-		return qtrue;
-	}
-
-	//If we didn't find something for this input and the alt key is active, then see if the un-alt key has a function
-	if (alt_key_mode_active)
-	{
-		Com_sprintf(cvarname, 256, "vr_button_map_%s", inputName);
-		char * val = Cvar_VariableString(cvarname);
-		if (val && strlen(val) > 0)
-		{
-			Com_sprintf(action, 256, "%s", val);
-			return qtrue;
-		}
-	}
-
-	return qfalse;
-}
-
-// Returns true in case active input should be auto-repeated (now only applicable for smooth-turn)
-static qboolean IN_SendInputAction(const char* action, qboolean inputActive, float axisValue, qboolean thumbstickAxis)
-{
-	if (action)
-	{
-		//handle our special actions first
-		if (strcmp(action, "blank") == 0)
-		{
-			// Empty function used to block alt fallback on unmapped alt buttons or
-			// force 8-way mapping mode of thumbstick without assigning actual action
-		}
-		else if (strcmp(action, "+alt") == 0)
-		{
-			// Either bumper (or thumbrest) holds alt; releasing one must not drop the other's hold
-			altHeldCount += inputActive ? 1 : -1;
-			if (altHeldCount < 0)
-				altHeldCount = 0;
-			alt_key_mode_active = altHeldCount > 0;
-		}
-		else if (strcmp(action, "+weapon_stabilise") == 0)
-		{
-			//stabilised weapon only triggered when controllers close enough (40cm) to each other
-			if (inputActive)
-			{
-				vec3_t l;
-				VectorSubtract(vr.weaponposition, vr.offhandposition, l);
-				vr.weapon_stabilised = VectorLength(l) < 0.4f;
-			}
-			else
-			{
-				vr.weapon_stabilised = qfalse;
-			}
-		}
-		else if (strcmp(action, "+weapon_select") == 0)
-		{
-			// Don't allow weapon select in demo playback or follow mode
-			if (clc.demoplaying || (cl.snap.ps.pm_flags & PMF_FOLLOW))
-			{
-				vr.weapon_select = qfalse;
-			}
-			else
-			{
-				vr.weapon_select = inputActive;
-				if (inputActive)
-				{
-					int selectorType = (int) Cvar_VariableValue("vr_weaponSelectorMode");
-					vr.weapon_select_using_thumbstick = (selectorType == WS_HMD);
-					vr.weapon_select_autoclose = vr.weapon_select_using_thumbstick && thumbstickAxis;
-				}
-				else
-				{
-					vr.weapon_select_using_thumbstick = qfalse;
-					vr.weapon_select_autoclose = qfalse;
-					Cbuf_AddText("weapon_select\n");
-				}
-			}
-		}
-		else if (action[0] == '+')
-		{
-			char command[256];
-			Com_sprintf(command, sizeof(command), "%s%s\n", inputActive ? "+" : "-", action + 1);
-			Cbuf_AddText(command);
-		}
-		else if (inputActive)
-		{
-			if (strcmp(action, "turnleft") == 0)
-			{
-				if (vr_snapturn->integer > 0) // snap turn
-				{
-					int snap = 45;
-					if (vr_snapturn->integer > 1)
-					{
-						snap = vr_snapturn->integer;
-					}
-					CL_SnapTurn(-snap);
-				}
-				else // yaw (smooth turn)
-				{
-					// Don't send SE_MOUSE events - turning is handled by SE_JOYSTICK_AXIS in the thumbstick handler
-					// This action is left here for compatibility with snap turn mode
-					return qfalse;
-				}
-			}
-			else if (strcmp(action, "turnright") == 0)
-			{
-				if (vr_snapturn->integer > 0) // snap turn
-				{
-					int snap = 45;
-					if (vr_snapturn->integer > 1)
-					{
-						snap = vr_snapturn->integer;
-					}
-					CL_SnapTurn(snap);
-				}
-				else // yaw (smooth turn)
-				{
-					// Don't send SE_MOUSE events - turning is handled by SE_JOYSTICK_AXIS in the thumbstick handler
-					// This action is left here for compatibility with snap turn mode
-					return qfalse;
-				}
-			}
-			else if (strcmp(action, "uturn") == 0)
-			{
-				CL_SnapTurn(180);
-			}
-			else
-			{
-				char command[256];
-				Com_sprintf(command, sizeof(command), "%s\n", action);
-				Cbuf_AddText(command);
-			}
-		}
-	}
-	return qfalse;
-}
-
-static void IN_ActivateInput(uint32_t * inputGroup, int inputFlag)
-{
-	*inputGroup |= inputFlag;
-}
-
-static void IN_DeactivateInput(uint32_t * inputGroup, int inputFlag)
-{
-	*inputGroup &= ~inputFlag;
-}
-
-static qboolean IN_InputActivated(uint32_t * inputGroup, int inputFlag)
-{
-	return (*inputGroup & inputFlag);
-}
-
-static void IN_HandleActiveInput(uint32_t * inputGroup, int inputFlag, char* inputName, float axisValue, qboolean thumbstickAxis)
-{
-	if (IN_InputActivated(inputGroup, inputFlag))
-	{
-		// Input is already in activated state, nothing to do
-		return;
-	}
-	char action[256];
-	if (IN_GetInputAction(inputName, action))
-	{
-		// Activate input action
-		if (!IN_SendInputAction(action, qtrue, axisValue, thumbstickAxis))
-		{
-			// Action should not be repeated, mark input as activated
-			IN_ActivateInput(inputGroup, inputFlag);
-		}
-	}
-	else
-	{
-		// No assigned action -> mark input as activated
-		// (to avoid unnecessary action lookup next time)
-		IN_ActivateInput(inputGroup, inputFlag);
-	}
-}
-
-static void IN_HandleInactiveInput(uint32_t * inputGroup, int inputFlag, char* inputName, float axisValue, qboolean thumbstickAxis)
-{
-	if (!IN_InputActivated(inputGroup, inputFlag))
-	{
-		// Input is not in activated state, nothing to do
-		return;
-	}
-	char action[256];
-	if (IN_GetInputAction(inputName, action))
-	{
-		// Deactivate input action and remove input activated state
-		IN_SendInputAction(action, qfalse, axisValue, thumbstickAxis);
-		IN_DeactivateInput(inputGroup, inputFlag);
-	}
-	else
-	{
-		// No assigned action -> just remove input activated state
-		IN_DeactivateInput(inputGroup, inputFlag);
-	}
-}
-
-static struct {
-	qboolean held, grips[2], reserved, blocked, needsRelease;
-	uint32_t muted[2];
-	int hand;
-} tvdInput;
-
-typedef struct {
-	char action[256];
-	qboolean thumbstick;
-} vrScrubRelease_t;
-
-/* Resolve every held mapping before dispatch: releasing +alt changes lookup. */
-static void IN_VRCollectScrubRelease(vrScrubRelease_t *releases, int *count,
-	uint32_t *group, int flag, const char *name, qboolean thumbstick)
-{
-	if (!IN_InputActivated(group, flag))
-		return;
-	if (IN_GetInputAction(name, releases[*count].action))
-	{
-		releases[*count].thumbstick = thumbstick;
-		(*count)++;
-	}
-	IN_DeactivateInput(group, flag);
-}
-
-static void IN_VRDispatchScrubReleases(vrScrubRelease_t *releases, int count)
-{
-	for (int i = 0; i < count; i++)
-		IN_SendInputAction(releases[i].action, qfalse, 0, releases[i].thumbstick);
-}
-
-static void IN_VRReleaseScrubActions(void)
-{
-	// +8: PRIMARYGRIPCLICK/SECONDARYGRIPCLICK (1 per hand), RBUMPER, LBUMPER and
-	// the 4 D-pad slots (left hand only)
-	vrScrubRelease_t releases[2 * (9 + 1 + 8) + 8];
-	int count = 0;
-	const int flags[] = { VR_Button_GripTrigger, VR_Button_Trackpad,
-		VR_Button_LThumb, VR_Button_RThumb, VR_Button_A, VR_Button_B,
-		VR_Button_X, VR_Button_Y, VR_Button_Thumbrest };
-	const char *axes[] = { "RTHUMBFORWARD", "RTHUMBFORWARDRIGHT", "RTHUMBRIGHT",
-		"RTHUMBBACKRIGHT", "RTHUMBBACK", "RTHUMBBACKLEFT", "RTHUMBLEFT", "RTHUMBFORWARDLEFT" };
-	for (int hand = 0; hand < 2; hand++)
-	{
-		vrController_t *controller = hand ? &rightController : &leftController;
-		qboolean primary = hand == (vr_righthanded->integer != 0);
-		const char *names[] = { primary ? "PRIMARYGRIP" : "SECONDARYGRIP",
-			primary ? "PRIMARYTRACKPAD" : "SECONDARYTRACKPAD",
-			"SECONDARYTHUMBSTICK", "PRIMARYTHUMBSTICK", "A", "B", "X", "Y",
-			primary ? "PRIMARYTHUMBREST" : "SECONDARYTHUMBREST" };
-		for (int i = 0; i < 9; i++)
-			IN_VRCollectScrubRelease(releases, &count, &controller->buttons, flags[i], names[i], qfalse);
-		IN_VRCollectScrubRelease(releases, &count, &controller->axisButtons, VR_TOUCH_AXIS_TRIGGER_INDEX,
-			primary ? "PRIMARYTRIGGER" : "SECONDARYTRIGGER", qfalse);
-		for (int i = 0; i < 8; i++)
-			IN_VRCollectScrubRelease(releases, &count, &controller->axisButtons, 1 << i, axes[i], qtrue);
-		IN_VRCollectScrubRelease(releases, &count, &controller->buttons, VR_BUTTON_GRIP_CLICK,
-			primary ? "PRIMARYGRIPCLICK" : "SECONDARYGRIPCLICK", qfalse);
-		if (hand)
-		{
-			IN_VRCollectScrubRelease(releases, &count, &controller->buttons, VR_Button_RShoulder, "RBUMPER", qfalse);
-		}
-		else
-		{
-			IN_VRCollectScrubRelease(releases, &count, &controller->buttons, VR_Button_LShoulder, "LBUMPER", qfalse);
-			IN_VRCollectScrubRelease(releases, &count, &controller->buttons, VR_Button_Up, "DPAD_UP", qfalse);
-			IN_VRCollectScrubRelease(releases, &count, &controller->buttons, VR_Button_Down, "DPAD_DOWN", qfalse);
-			IN_VRCollectScrubRelease(releases, &count, &controller->buttons, VR_Button_Left, "DPAD_LEFT", qfalse);
-			IN_VRCollectScrubRelease(releases, &count, &controller->buttons, VR_Button_Right, "DPAD_RIGHT", qfalse);
-		}
-	}
-	IN_VRDispatchScrubReleases(releases, count);
-	for (int axis = 0; axis < 3; axis++)
-		Com_QueueEvent(in_vrEventTime, SE_JOYSTICK_AXIS, axis, 0, 0, NULL);
-	vr.vote_holding = 0;
-	vr.walking = qfalse;
-}
-
-/* Focus or session loss can stop input frames before the grip release arrives. */
-void VR_CancelTVDInput(void)
-{
-	if (tvdInput.held)
-	{
-		Cbuf_AddText("tv_scrub_cancel\n");
-		tvdInput.held = qfalse;
-		tvdInput.needsRelease = qtrue;
-		IN_VRReleaseScrubActions();
-	}
-}
-
-static void IN_VRTVScrub(uint32_t lButtons, uint32_t rButtons,
-	XrActionStateFloat leftGrip, XrActionStateFloat rightGrip)
-{
-	VR_Engine *engine = VR_GetEngine();
-	int primary = vr_righthanded->integer != 0, other = 1 - primary;
-	qboolean down[2] = { (lButtons & VR_Button_GripTrigger) != 0,
-		(rButtons & VR_Button_GripTrigger) != 0 };
-	qboolean active[2] = { leftGrip.isActive, rightGrip.isActive };
-	qboolean seekable = tvPlay.active && tvPlay.totalDuration > 0;
-	qboolean responsive = engine->appState.Focused && engine->appState.SessionActive &&
-		active[primary] && engine->appState.TrackedController[primary].Active;
-	qboolean eligible = seekable && responsive &&
-		!vr.weapon_adjust && !vr.in_menu && !VKeyboard_IsActive() &&
-		!(Key_GetCatcher() & (KEYCATCH_UI | KEYCATCH_CONSOLE | KEYCATCH_MESSAGE)) &&
-		!((lButtons | rButtons) & VR_Button_Enter);
-	qboolean blocked = tvdInput.held || vr.menuYawLocked;
-	qboolean wasBlocked = tvdInput.blocked;
-	qboolean reserved = seekable || tvdInput.held ||
-		(tvdInput.reserved && (down[0] || down[1] || tvdInput.needsRelease));
-
-	if (tvdInput.held && (!eligible || primary != tvdInput.hand))
-		VR_CancelTVDInput();
-	if (tvdInput.needsRelease && responsive && !down[0] && !down[1])
-		tvdInput.needsRelease = qfalse;
-
-	if (eligible && !tvdInput.needsRelease)
-	{
-		/* Cancel wins if both hands press together, regardless of handedness. */
-		if (down[other] && !tvdInput.grips[other])
-		{
-			if (tvdInput.held || vr.menuYawLocked)
-				Cbuf_AddText("tv_scrub_cancel\n");
-			tvdInput.held = qfalse;
-			tvdInput.needsRelease = qtrue;
-		}
-		else if (down[primary] && !tvdInput.grips[primary] && !vr.menuYawLocked)
-		{
-			Cbuf_AddText("+tv_scrub\n");
-			tvdInput.held = qtrue;
-			tvdInput.hand = primary;
-		}
-		if (tvdInput.held && !down[primary])
-		{
-			Cbuf_AddText("-tv_scrub\n");
-			tvdInput.held = qfalse;
-		}
-	}
-
-	tvdInput.blocked = blocked || tvdInput.held;
-	if (tvdInput.blocked && !wasBlocked)
-		IN_VRReleaseScrubActions();
-	if (reserved && !tvdInput.reserved)
-	{
-		vrScrubRelease_t releases[2];
-		int count = 0;
-		IN_VRCollectScrubRelease(releases, &count, &leftController.buttons, VR_Button_GripTrigger,
-			primary ? "SECONDARYGRIP" : "PRIMARYGRIP", qfalse);
-		IN_VRCollectScrubRelease(releases, &count, &rightController.buttons, VR_Button_GripTrigger,
-			primary ? "PRIMARYGRIP" : "SECONDARYGRIP", qfalse);
-		IN_VRDispatchScrubReleases(releases, count);
-	}
-	tvdInput.reserved = reserved;
-	tvdInput.grips[0] = down[0];
-	tvdInput.grips[1] = down[1];
-	if (tvdInput.blocked)
-		vr.vote_holding = 0;
-}
-
-// Human-readable name of the input the engine synthesizes K_SPACE from in
-// menus (the A-button path in IN_VRButtons). Must track the active
-// interaction profile's actual binding: buttonAAction is suggested onto
-// menu/click on the KHR Simple profile, so "A" is only true for the
-// Touch/Index layouts until this resolves the bound source's localized name.
-const char* VR_GetMenuSkipButtonName( void )
-{
-	return "A";
-}
-
-// Human-readable name of the input the engine synthesizes K_ESCAPE from
-// (the VR_Button_Enter path in IN_VRButtons). Must track the active
-// interaction profile's actual binding of menuAction; "MENU" assumes the
-// dedicated menu/click source the suggested bindings put it on.
-const char* VR_GetMenuCancelButtonName( void )
-{
-	return "MENU";
 }
 
 void VR_HapticEvent(const char* event, int position, int flags, int intensity, float angle, float yHeight )
@@ -948,7 +512,6 @@ static int VR_SuggestIndexBindings( VR_Engine* engine )
 	int n = 0;
 	bindings[n++] = ActionSuggestedBinding(indexLeftAction, "/user/hand/left/input/trigger/value");
 	bindings[n++] = ActionSuggestedBinding(indexRightAction, "/user/hand/right/input/trigger/value");
-	bindings[n++] = ActionSuggestedBinding(menuAction, "/user/hand/left/input/system/click");
 	bindings[n++] = ActionSuggestedBinding(buttonXAction, "/user/hand/left/input/a/click");
 	bindings[n++] = ActionSuggestedBinding(buttonYAction, "/user/hand/left/input/b/click");
 	bindings[n++] = ActionSuggestedBinding(buttonAAction, "/user/hand/right/input/a/click");
@@ -976,8 +539,8 @@ static int VR_SuggestSimpleBindings( VR_Engine* engine )
 	int n = 0;
 	bindings[n++] = ActionSuggestedBinding(indexLeftAction, "/user/hand/left/input/select/click");
 	bindings[n++] = ActionSuggestedBinding(indexRightAction, "/user/hand/right/input/select/click");
-	bindings[n++] = ActionSuggestedBinding(buttonAAction, "/user/hand/left/input/menu/click");
-	bindings[n++] = ActionSuggestedBinding(buttonXAction, "/user/hand/right/input/menu/click");
+	bindings[n++] = ActionSuggestedBinding(menuAction, "/user/hand/left/input/menu/click");
+	bindings[n++] = ActionSuggestedBinding(menuAction, "/user/hand/right/input/menu/click");
 	bindings[n++] = ActionSuggestedBinding(vibrateLeftFeedback, "/user/hand/left/output/haptic");
 	bindings[n++] = ActionSuggestedBinding(vibrateRightFeedback, "/user/hand/right/output/haptic");
 	bindings[n++] = ActionSuggestedBinding(handPoseLeftAction, "/user/hand/left/input/grip/pose");
@@ -1095,12 +658,8 @@ void VR_InitSessionInput( VR_Engine* engine )
 		return;
 	}
 
-	memset(&leftController, 0, sizeof(leftController));
-	memset(&rightController, 0, sizeof(rightController));
-	// The memsets above clear activated flags without releasing them; a bumper or
-	// thumbrest held across the rebuild must not leave alt stuck on
-	altHeldCount = 0;
-	alt_key_mode_active = qfalse;
+	// a rebuilt session must not inherit holds: release them, then (re)register the router's commands
+	VR_Router_Init();
 
 	leftControllerGripSpace = CreateActionSpace(handPoseLeftAction, leftHandPath);
 	rightControllerGripSpace = CreateActionSpace(handPoseRightAction, rightHandPath);
@@ -1205,7 +764,7 @@ void VR_InitSessionInput( VR_Engine* engine )
 
 void VR_DestroySessionInput( VR_Engine* engine )
 {
-	VR_CancelTVDInput();
+	VR_Router_Reset();
 	// This will allow to recreate session-specific OpenXR input objects
 	inputInitialized = qfalse;
 	vrCurrentProfile[0] = vrCurrentProfile[1] = -1;
@@ -1236,6 +795,34 @@ static qboolean IN_VRScreenCursor( int hand, float *x, float *y )
 	dir[1] = direction.y;
 	dir[2] = direction.z;
 	return VR_VirtualScreen_Hit( origin, dir, x, y );
+}
+
+/* One hand's pointer: its ray on the virtual screen (a miss holds the cursor), else its aim angles on the HUD plane. */
+static void IN_VRCursor( int hand, const vec3_t aim, int *x, int *y )
+{
+	int targetX = *x, targetY = *y;
+
+	if ( vr.virtual_screen )
+	{
+		float hitX, hitY;
+		if ( IN_VRScreenCursor( hand, &hitX, &hitY ) )
+		{
+			targetX = (int)hitX;
+			targetY = (int)hitY;
+		}
+	}
+	else
+	{
+		// During SP intermission the HUD is world-fixed, so the anchored yaw is the reference
+		const float referenceYaw = vr.sp_intermission_active ? vr.sp_intermission_yaw : vr.menuYaw;
+		const float yaw = Com_Clamp( -85, 85, AngleSubtract( aim[YAW], referenceYaw ) );
+		const float pitch = Com_Clamp( -85, 85, aim[PITCH] );
+		targetX = (int)Com_Clamp( -8000, 8000, 320 - tanf( yaw * (float)M_PI / 180 ) * 800 );
+		targetY = (int)Com_Clamp( -8000, 8000, 240 + tanf( pitch * (float)M_PI / 180 ) * 800 );
+	}
+	// Smooth toward the target so rapid hand or head motion does not jitter the pointer
+	*x = (int)( 0.5f * targetX + 0.5f * *x );
+	*y = (int)( 0.5f * targetY + 0.5f * *y );
 }
 
 static void IN_VRController( qboolean isRightController, XrPosef pose )
@@ -1277,131 +864,41 @@ static void IN_VRController( qboolean isRightController, XrPosef pose )
 		VectorSubtract(vr.offhandposition, vr.hmdposition, vr.offhandoffset);
 	}
 
-	// Update cursor for virtual screen, intermission, or when scoreboard is active
-	if ((vr.virtual_screen && (!vr.first_person_following || vr.in_menu)) || cl.snap.ps.pm_type == PM_INTERMISSION || vr.scoreboardCursorActive)
+	// The cursor follows whichever context owns the pointer (menu, text entry, scoreboard)
+	if (VR_Router_PointerLayer())
 	{
 		vr.weapon_zoomed = qfalse;
 		if (vr.menuCursorActive)
 		{
-			float yaw;
-			float pitch;
-			if (vr.menuLeftHanded)
+			// Both hands' pointers, so a click from either hand lands where that hand points
+			const int menuHand = vr.menuLeftHanded ? 0 : 1;
+			const qboolean menuWeapon = (vr_righthanded->integer != 0) == (menuHand == 1);
+			IN_VRCursor(menuHand, menuWeapon ? vr.weaponaimangles : vr.offhandaimangles, &vr.menuCursorX, &vr.menuCursorY);
+			IN_VRCursor(1 - menuHand, menuWeapon ? vr.offhandaimangles : vr.weaponaimangles, &vr.offhandCursorX, &vr.offhandCursorY);
+
+			// UI_MOUSE_EVENT updates hover; stick navigation owns the selection while it runs
+			if ((Key_GetCatcher() & KEYCATCH_UI) && !vr.menuStickNavActive && !VKeyboard_IsActive() &&
+				!vr.weapon_adjust && !vr.menuYawLocked)
 			{
-				yaw = (vr_righthanded->integer != 0) ? vr.offhandaimangles[YAW] : vr.weaponaimangles[YAW];
-				pitch = (vr_righthanded->integer != 0) ? vr.offhandaimangles[PITCH] : vr.weaponaimangles[PITCH];
-			}
-			else
-			{
-				yaw = (vr_righthanded->integer != 0) ? vr.weaponaimangles[YAW] : vr.offhandaimangles[YAW];
-				pitch = (vr_righthanded->integer != 0) ? vr.weaponaimangles[PITCH] : vr.offhandaimangles[PITCH];
-			}
-			// During SP intermission, use the anchored yaw for cursor calculation
-			// since the HUD is world-fixed rather than head-locked
-			float referenceYaw = vr.sp_intermission_active ? vr.sp_intermission_yaw : vr.menuYaw;
-			static int lastMenuCursorX = 320;
-			static int lastMenuCursorY = 240;
-			int x, y;
-
-			if (vr.virtual_screen)
-			{
-				// The menu hand's ray; a miss holds the cursor where it last was
-				float hitX, hitY;
-				if (IN_VRScreenCursor(vr.menuLeftHanded ? 0 : 1, &hitX, &hitY))
-				{
-					x = (int)hitX;
-					y = (int)hitY;
-				}
-				else
-				{
-					x = lastMenuCursorX;
-					y = lastMenuCursorY;
-				}
-			}
-			else
-			{
-				x = 320 - tan((yaw - referenceYaw) * (M_PI*2 / 360)) * 800;
-				// Aim-pose angles: no vr_weaponPitch term, the cursor is not the weapon
-				y = 240 + tan(pitch * (M_PI*2 / 360)) * 800;
-			}
-
-			// lepr from old position to new position by given factor
-			// this is needed to avoid artifacts when moving rapidly hand or HMD
-			const float factor = 0.5f;
-			x = factor * x + (1.0f - factor) * lastMenuCursorX;
-			y = factor * y + (1.0f - factor) * lastMenuCursorY;
-
-			lastMenuCursorX = vr.menuCursorX = x;
-			lastMenuCursorY = vr.menuCursorY = y;
-
-			Com_QueueEvent(in_vrEventTime, SE_MOUSE, 0, 0, 0, NULL);
-
-			// When virtual keyboard is active, also compute offhand cursor
-			// from the OTHER controller's angles (opposite of primary)
-			if (VKeyboard_IsActive())
-			{
-				float ohYaw, ohPitch;
-				if (vr.menuLeftHanded)
-				{
-					ohYaw = (vr_righthanded->integer != 0) ? vr.weaponaimangles[YAW] : vr.offhandaimangles[YAW];
-					ohPitch = (vr_righthanded->integer != 0) ? vr.weaponaimangles[PITCH] : vr.offhandaimangles[PITCH];
-				}
-				else
-				{
-					ohYaw = (vr_righthanded->integer != 0) ? vr.offhandaimangles[YAW] : vr.weaponaimangles[YAW];
-					ohPitch = (vr_righthanded->integer != 0) ? vr.offhandaimangles[PITCH] : vr.weaponaimangles[PITCH];
-				}
-				static int lastOffhandCursorX = 320;
-				static int lastOffhandCursorY = 240;
-				int ohx, ohy;
-
-				if (vr.virtual_screen)
-				{
-					float hitX, hitY;
-					if (IN_VRScreenCursor(vr.menuLeftHanded ? 1 : 0, &hitX, &hitY))
-					{
-						ohx = (int)hitX;
-						ohy = (int)hitY;
-					}
-					else
-					{
-						ohx = lastOffhandCursorX;
-						ohy = lastOffhandCursorY;
-					}
-				}
-				else
-				{
-					ohx = 320 - tan((ohYaw - referenceYaw) * (M_PI*2 / 360)) * 800;
-					ohy = 240 + tan(ohPitch * (M_PI*2 / 360)) * 800;
-				}
-				ohx = factor * ohx + (1.0f - factor) * lastOffhandCursorX;
-				ohy = factor * ohy + (1.0f - factor) * lastOffhandCursorY;
-				lastOffhandCursorX = vr.offhandCursorX = ohx;
-				lastOffhandCursorY = vr.offhandCursorY = ohy;
+				CL_MouseEvent(0, 0, com_frameTime);
 			}
 		}
 		if (vr.scoreboardCursorActive)
 		{
-			float yaw;
-			float pitch;
-			if (vr.menuLeftHanded)
+			if (vr.virtual_screen)
 			{
-				yaw = (vr_righthanded->integer != 0) ? vr.offhandaimangles[YAW] : vr.weaponaimangles[YAW];
-				pitch = (vr_righthanded->integer != 0) ? vr.offhandaimangles[PITCH] : vr.weaponaimangles[PITCH];
+				vr.scoreboardCursorX = vr.menuCursorX;
+				vr.scoreboardCursorY = vr.menuCursorY;
 			}
 			else
 			{
-				yaw = (vr_righthanded->integer != 0) ? vr.weaponaimangles[YAW] : vr.offhandaimangles[YAW];
-				pitch = (vr_righthanded->integer != 0) ? vr.weaponaimangles[PITCH] : vr.offhandaimangles[PITCH];
+				const int menuHand = vr.menuLeftHanded ? 0 : 1;
+				const float *aim = (vr_righthanded->integer != 0) == (menuHand == 1) ? vr.weaponaimangles : vr.offhandaimangles;
+				vr.scoreboardCursorX = (int)Com_Clamp( 0, 640,
+					320 - tanf( Com_Clamp( -85, 85, AngleSubtract( aim[YAW], vr.menuYaw ) ) * (float)M_PI / 180 ) * 400 );
+				vr.scoreboardCursorY = (int)Com_Clamp( 0, 480,
+					240 + tanf( Com_Clamp( -85, 85, aim[PITCH] ) * (float)M_PI / 180 ) * 400 );
 			}
-			int x = 320 - tan((yaw - vr.menuYaw) * (M_PI*2 / 360)) * 400;
-			int y = 240 + tan(pitch * (M_PI*2 / 360)) * 400;
-			// Clamp cursor to HUD bounds (640x480 virtual screen)
-			if (x < 0) x = 0;
-			if (x > 640) x = 640;
-			if (y < 0) y = 0;
-			if (y > 480) y = 480;
-			vr.scoreboardCursorX = x;
-			vr.scoreboardCursorY = y;
 		}
 	}
 	else
@@ -1452,945 +949,6 @@ static void IN_VRController( qboolean isRightController, XrPosef pose )
 	}
 }
 
-static qboolean IN_VRJoystickUse8WayMapping( void )
-{
-	char action[256];
-	return 
-		IN_GetInputAction("RTHUMBFORWARDRIGHT", action)
-		|| IN_GetInputAction("RTHUMBBACKRIGHT", action)
-		|| IN_GetInputAction("RTHUMBBACKLEFT", action)
-		|| IN_GetInputAction("RTHUMBFORWARDLEFT", action);
-}
-
-static void IN_VRJoystickHandle4WayMapping( uint32_t * inputGroup, float joystickAngle, float joystickValue )
-{
-	if (joystickAngle >= 315.0 || joystickAngle < 45.0) // UP
-	{
-		// Deactivate neighboring inputs
-		IN_HandleInactiveInput(inputGroup, VR_TOUCH_AXIS_UPRIGHT, "RTHUMBFORWARDRIGHT", joystickValue, qtrue);
-		IN_HandleInactiveInput(inputGroup, VR_TOUCH_AXIS_RIGHT, "RTHUMBRIGHT", joystickValue, qtrue);
-		IN_HandleInactiveInput(inputGroup, VR_TOUCH_AXIS_LEFT, "RTHUMBLEFT", joystickValue, qtrue);
-		IN_HandleInactiveInput(inputGroup, VR_TOUCH_AXIS_UPLEFT, "RTHUMBFORWARDLEFT", joystickValue, qtrue);
-		// Activate UP
-		IN_HandleActiveInput(inputGroup, VR_TOUCH_AXIS_UP, "RTHUMBFORWARD", joystickValue, qtrue);
-	}
-	else if (joystickAngle < 135.0) // RIGHT
-	{
-		// Deactivate neighboring inputs
-		IN_HandleInactiveInput(inputGroup, VR_TOUCH_AXIS_UP, "RTHUMBFORWARD", joystickValue, qtrue);
-		IN_HandleInactiveInput(inputGroup, VR_TOUCH_AXIS_UPRIGHT, "RTHUMBFORWARDRIGHT", joystickValue, qtrue);
-		IN_HandleInactiveInput(inputGroup, VR_TOUCH_AXIS_DOWNRIGHT, "RTHUMBBACKRIGHT", joystickValue, qtrue);
-		IN_HandleInactiveInput(inputGroup, VR_TOUCH_AXIS_DOWN, "RTHUMBBACK", joystickValue, qtrue);
-		// Activate RIGHT
-		IN_HandleActiveInput(inputGroup, VR_TOUCH_AXIS_RIGHT, "RTHUMBRIGHT", joystickValue, qtrue);
-	}
-	else if (joystickAngle < 225.0) // DOWN
-	{
-		// Deactivate neighboring inputs
-		IN_HandleInactiveInput(inputGroup, VR_TOUCH_AXIS_RIGHT, "RTHUMBRIGHT", joystickValue, qtrue);
-		IN_HandleInactiveInput(inputGroup, VR_TOUCH_AXIS_DOWNRIGHT, "RTHUMBBACKRIGHT", joystickValue, qtrue);
-		IN_HandleInactiveInput(inputGroup, VR_TOUCH_AXIS_DOWNLEFT, "RTHUMBBACKLEFT", joystickValue, qtrue);
-		IN_HandleInactiveInput(inputGroup, VR_TOUCH_AXIS_LEFT, "RTHUMBLEFT", joystickValue, qtrue);
-		// Activate DOWN
-		IN_HandleActiveInput(inputGroup, VR_TOUCH_AXIS_DOWN, "RTHUMBBACK", joystickValue, qtrue);
-	}
-	else // LEFT
-	{
-		// Deactivate neighboring inputs
-		IN_HandleInactiveInput(inputGroup, VR_TOUCH_AXIS_DOWN, "RTHUMBBACK", joystickValue, qtrue);
-		IN_HandleInactiveInput(inputGroup, VR_TOUCH_AXIS_DOWNLEFT, "RTHUMBBACKLEFT", joystickValue, qtrue);
-		IN_HandleInactiveInput(inputGroup, VR_TOUCH_AXIS_UPLEFT, "RTHUMBFORWARDLEFT", joystickValue, qtrue);
-		IN_HandleInactiveInput(inputGroup, VR_TOUCH_AXIS_UP, "RTHUMBFORWARD", joystickValue, qtrue);
-		// Activate LEFT
-		IN_HandleActiveInput(inputGroup, VR_TOUCH_AXIS_LEFT, "RTHUMBLEFT", joystickValue, qtrue);
-	}
-}
-
-static void IN_VRJoystickHandle8WayMapping( uint32_t * inputGroup, float joystickAngle, float joystickValue )
-{
-	if (joystickAngle > 337.5 || joystickAngle < 22.5) // UP
-	{
-		// Deactivate neighboring inputs
-		IN_HandleInactiveInput(inputGroup, VR_TOUCH_AXIS_UPRIGHT, "RTHUMBFORWARDRIGHT", joystickValue, qtrue);
-		IN_HandleInactiveInput(inputGroup, VR_TOUCH_AXIS_RIGHT, "RTHUMBRIGHT", joystickValue, qtrue);
-		IN_HandleInactiveInput(inputGroup, VR_TOUCH_AXIS_LEFT, "RTHUMBLEFT", joystickValue, qtrue);
-		IN_HandleInactiveInput(inputGroup, VR_TOUCH_AXIS_UPLEFT, "RTHUMBFORWARDLEFT", joystickValue, qtrue);
-		// Activate UP
-		IN_HandleActiveInput(inputGroup, VR_TOUCH_AXIS_UP, "RTHUMBFORWARD", joystickValue, qtrue);
-	}
-	else if (joystickAngle < 67.5) // UP-RIGHT
-	{
-		// Deactivate neighboring inputs
-		IN_HandleInactiveInput(inputGroup, VR_TOUCH_AXIS_UP, "RTHUMBFORWARD", joystickValue, qtrue);
-		IN_HandleInactiveInput(inputGroup, VR_TOUCH_AXIS_RIGHT, "RTHUMBRIGHT", joystickValue, qtrue);
-		IN_HandleInactiveInput(inputGroup, VR_TOUCH_AXIS_DOWNRIGHT, "RTHUMBBACKRIGHT", joystickValue, qtrue);
-		IN_HandleInactiveInput(inputGroup, VR_TOUCH_AXIS_UPLEFT, "RTHUMBFORWARDLEFT", joystickValue, qtrue);
-		// Activate UP-RIGHT
-		IN_HandleActiveInput(inputGroup, VR_TOUCH_AXIS_UPRIGHT, "RTHUMBFORWARDRIGHT", joystickValue, qtrue);
-	}
-	else if (joystickAngle < 112.5) // RIGHT
-	{
-		// Deactivate neighboring inputs
-		IN_HandleInactiveInput(inputGroup, VR_TOUCH_AXIS_UP, "RTHUMBFORWARD", joystickValue, qtrue);
-		IN_HandleInactiveInput(inputGroup, VR_TOUCH_AXIS_UPRIGHT, "RTHUMBFORWARDRIGHT", joystickValue, qtrue);
-		IN_HandleInactiveInput(inputGroup, VR_TOUCH_AXIS_DOWNRIGHT, "RTHUMBBACKRIGHT", joystickValue, qtrue);
-		IN_HandleInactiveInput(inputGroup, VR_TOUCH_AXIS_DOWN, "RTHUMBBACK", joystickValue, qtrue);
-		// Activate RIGHT
-		IN_HandleActiveInput(inputGroup, VR_TOUCH_AXIS_RIGHT, "RTHUMBRIGHT", joystickValue, qtrue);
-	}
-	else if (joystickAngle < 157.5) // DOWN-RIGHT
-	{
-		// Deactivate neighboring inputs
-		IN_HandleInactiveInput(inputGroup, VR_TOUCH_AXIS_UPRIGHT, "RTHUMBFORWARDRIGHT", joystickValue, qtrue);
-		IN_HandleInactiveInput(inputGroup, VR_TOUCH_AXIS_RIGHT, "RTHUMBRIGHT", joystickValue, qtrue);
-		IN_HandleInactiveInput(inputGroup, VR_TOUCH_AXIS_DOWN, "RTHUMBBACK", joystickValue, qtrue);
-		IN_HandleInactiveInput(inputGroup, VR_TOUCH_AXIS_DOWNLEFT, "RTHUMBBACKLEFT", joystickValue, qtrue);
-		// Activate DOWN-RIGHT
-		IN_HandleActiveInput(inputGroup, VR_TOUCH_AXIS_DOWNRIGHT, "RTHUMBBACKRIGHT", joystickValue, qtrue);
-	}
-	else if (joystickAngle < 202.5) // DOWN
-	{
-		// Deactivate neighboring inputs
-		IN_HandleInactiveInput(inputGroup, VR_TOUCH_AXIS_RIGHT, "RTHUMBRIGHT", joystickValue, qtrue);
-		IN_HandleInactiveInput(inputGroup, VR_TOUCH_AXIS_DOWNRIGHT, "RTHUMBBACKRIGHT", joystickValue, qtrue);
-		IN_HandleInactiveInput(inputGroup, VR_TOUCH_AXIS_DOWNLEFT, "RTHUMBBACKLEFT", joystickValue, qtrue);
-		IN_HandleInactiveInput(inputGroup, VR_TOUCH_AXIS_LEFT, "RTHUMBLEFT", joystickValue, qtrue);
-		// Activate DOWN
-		IN_HandleActiveInput(inputGroup, VR_TOUCH_AXIS_DOWN, "RTHUMBBACK", joystickValue, qtrue);
-	}
-	else if (joystickAngle < 247.5) // DOWN-LEFT
-	{
-		// Deactivate neighboring inputs
-		IN_HandleInactiveInput(inputGroup, VR_TOUCH_AXIS_DOWNRIGHT, "RTHUMBBACKRIGHT", joystickValue, qtrue);
-		IN_HandleInactiveInput(inputGroup, VR_TOUCH_AXIS_DOWN, "RTHUMBBACK", joystickValue, qtrue);
-		IN_HandleInactiveInput(inputGroup, VR_TOUCH_AXIS_LEFT, "RTHUMBLEFT", joystickValue, qtrue);
-		IN_HandleInactiveInput(inputGroup, VR_TOUCH_AXIS_UPLEFT, "RTHUMBFORWARDLEFT", joystickValue, qtrue);
-		// Activate DOWN-LEFT
-		IN_HandleActiveInput(inputGroup, VR_TOUCH_AXIS_DOWNLEFT, "RTHUMBBACKLEFT", joystickValue, qtrue);
-	}
-	else if (joystickAngle < 292.5) // LEFT
-	{
-		// Deactivate neighboring inputs
-		IN_HandleInactiveInput(inputGroup, VR_TOUCH_AXIS_DOWN, "RTHUMBBACK", joystickValue, qtrue);
-		IN_HandleInactiveInput(inputGroup, VR_TOUCH_AXIS_DOWNLEFT, "RTHUMBBACKLEFT", joystickValue, qtrue);
-		IN_HandleInactiveInput(inputGroup, VR_TOUCH_AXIS_UPLEFT, "RTHUMBFORWARDLEFT", joystickValue, qtrue);
-		IN_HandleInactiveInput(inputGroup, VR_TOUCH_AXIS_UP, "RTHUMBFORWARD", joystickValue, qtrue);
-		// Activate LEFT
-		IN_HandleActiveInput(inputGroup, VR_TOUCH_AXIS_LEFT, "RTHUMBLEFT", joystickValue, qtrue);
-	}
-	else // UP-LEFT
-	{
-		// Deactivate neighboring inputs
-		IN_HandleInactiveInput(inputGroup, VR_TOUCH_AXIS_DOWNLEFT, "RTHUMBBACKLEFT", joystickValue, qtrue);
-		IN_HandleInactiveInput(inputGroup, VR_TOUCH_AXIS_LEFT, "RTHUMBLEFT", joystickValue, qtrue);
-		IN_HandleInactiveInput(inputGroup, VR_TOUCH_AXIS_UP, "RTHUMBFORWARD", joystickValue, qtrue);
-		IN_HandleInactiveInput(inputGroup, VR_TOUCH_AXIS_UPRIGHT, "RTHUMBFORWARDRIGHT", joystickValue, qtrue);
-		// Activate UP-LEFT
-		IN_HandleActiveInput(inputGroup, VR_TOUCH_AXIS_UPLEFT, "RTHUMBFORWARDLEFT", joystickValue, qtrue);
-	}
-}
-
-static void IN_VRJoystick( qboolean isRightController, float joystickX, float joystickY )
-{
-	vrController_t* controller = isRightController == qtrue ? &rightController : &leftController;
-
-	vr.thumbstick_location[isRightController][0] = joystickX;
-	vr.thumbstick_location[isRightController][1] = joystickY;
-
-	// Weapon adjustment / TVD scrub mode: suppress normal joystick processing.
-	// Thumbstick values are already stored above for cgame to read.
-	if (vr.weapon_adjust || vr.menuYawLocked)
-	{
-		return;
-	}
-
-	// Apply analog curve to joystick input for smoother control
-	float curvedX = IN_ApplyThumbstickCurve(joystickX, vr_thumbstickDeadzone->value);
-	float curvedY = IN_ApplyThumbstickCurve(joystickY, vr_thumbstickDeadzone->value);
-
-	// Menu / intermission / scoreboard: suppress locomotion. In actual VR menus, vertical
-	// stick is handled by IN_VRMenuThumbstickNav (PGUP/PGDN with delayed repeat): do NOT
-	// also emit PGUP/PGDN here or it doubles up. Keep the direct page-scroll for the
-	// intermission/scoreboard cases only.
-	qboolean inVrMenu = (vr.virtual_screen && (!vr.first_person_following || vr.in_menu));
-	if (inVrMenu || cl.snap.ps.pm_type == PM_INTERMISSION || vr.scoreboardCursorActive)
-	{
-		if (!inVrMenu)
-		{
-			// Check curved values: 0.05 = 5% into usable range past deadzone (hysteresis)
-			if (curvedY > 0.05f)
-			{
-				if (!IN_InputActivated(&controller->axisButtons, VR_TOUCH_AXIS_UP))
-				{
-					IN_ActivateInput(&controller->axisButtons, VR_TOUCH_AXIS_UP);
-					// One page per push (was every frame -> instant scroll, no delay)
-					Com_QueueEvent(in_vrEventTime, SE_KEY, K_PGUP, qtrue, 0, NULL);
-				}
-			}
-			else if (curvedY < -0.05f)
-			{
-				if (!IN_InputActivated(&controller->axisButtons, VR_TOUCH_AXIS_DOWN))
-				{
-					IN_ActivateInput(&controller->axisButtons, VR_TOUCH_AXIS_DOWN);
-					// One page per push (was every frame -> instant scroll, no delay)
-					Com_QueueEvent(in_vrEventTime, SE_KEY, K_PGDN, qtrue, 0, NULL);
-				}
-			}
-			else if (curvedY < 0.05f && curvedY > -0.05f)
-			{
-				if (IN_InputActivated(&controller->axisButtons, VR_TOUCH_AXIS_UP))
-				{
-					IN_DeactivateInput(&controller->axisButtons, VR_TOUCH_AXIS_UP);
-					Com_QueueEvent(in_vrEventTime, SE_KEY, K_PGUP, qfalse, 0, NULL);
-				}
-				if (IN_InputActivated(&controller->axisButtons, VR_TOUCH_AXIS_DOWN))
-				{
-					IN_DeactivateInput(&controller->axisButtons, VR_TOUCH_AXIS_DOWN);
-					Com_QueueEvent(in_vrEventTime, SE_KEY, K_PGDN, qfalse, 0, NULL);
-				}
-			}
-		}
-	}
-	else
-	{
-		if (isRightController == (vr_switchThumbsticks->integer != 0))
-		{
-			vec3_t positional;
-			VectorClear(positional);
-
-			vec2_t joystick;
-			if ( !vr.use_6dof )
-			{
-				//not using true 6DoF
-				if (!vr_directionMode->integer)
-				{
-					//HMD Based
-					rotateAboutOrigin(curvedX, curvedY, vr.hmdorientation[YAW], joystick);
-				}
-				else
-				{
-					//Off-hand based
-					rotateAboutOrigin(curvedX, curvedY, vr.offhandangles2[YAW], joystick);
-				}
-			}
-			else
-			{
-				//Positional movement speed correction for when we are not hitting target framerate
-				const float refresh = VR_GetEngine()->appState.Renderer.RefreshRate;
-				float multiplier = (float)((1000.0 / refresh) / (in_vrEventTime - lastframetime));
-
-				float factor = (refresh / 72.0F) * 10.0f; // adjust positional factor based on refresh rate
-				rotateAboutOrigin(
-					-vr.hmdposition_delta[0] * factor * multiplier,
-					vr.hmdposition_delta[2] * factor * multiplier,
-					-vr.hmdorientation[YAW], positional);
-
-				if (!vr_directionMode->integer)
-				{
-					//HMD Based
-					joystick[0] = curvedX;
-					joystick[1] = curvedY;
-				}
-				else
-				{
-					//Off-hand based
-					rotateAboutOrigin(curvedX, curvedY, vr.offhandangles2[YAW] - vr.hmdorientation[YAW], joystick);
-				}
-			}
-
-			// After rotation, ensure something close to maximum deflection is scaled to full
-			// deflection on the high axis. Otherwise, we end up running slower max speed when
-			// use_6dof is false, and this gets us fragged by our KBM-using friends.
-			float magnitude = sqrtf(joystick[0] * joystick[0] + joystick[1] * joystick[1]);
-			if (magnitude >= vr_thumbstickFullDeflection->value) {
-				// Input is at or near full deflection - scale so max component is 1.0
-				float absX = fabsf(joystick[0]);
-				float absY = fabsf(joystick[1]);
-				float maxComponent = (absX > absY) ? absX : absY;
-				if (maxComponent > 0.0f) {
-					float scaleFactor = 1.0f / maxComponent;
-					joystick[0] *= scaleFactor;
-					joystick[1] *= scaleFactor;
-				}
-			}
-
-			// Analog walk/run: gentle pushes walk silently, firm pushes run (footsteps).
-			// We only decide the BUTTON_WALKING flag here: the emitted axis values are
-			// left untouched, so movement speed stays the same continuous curve and there
-			// is no jolt when crossing the threshold (see CG/server PM_CmdScale).
-			if ( vr_analogWalk->integer )
-			{
-				float maxc = fabsf(joystick[0]) > fabsf(joystick[1]) ? fabsf(joystick[0]) : fabsf(joystick[1]);
-				// The run-line is the server's component=64 boundary (~160 u/s): below it
-				// the player walks silently, above it they run and generate footsteps.
-				// Anchoring here means we never assert a "walking" state the anti-cheat in
-				// bg_pmove.c would override. The flag only gates footsteps/animation: the
-				// emitted axis values are untouched, so speed stays a smooth 0..320 curve.
-				const float runLine = 64.0f / 127.0f; // ~0.5039
-				const float hyst = 0.04f; // asymmetric drop-to-walk band prevents flicker
-				if ( vr.walking )
-				{
-					if ( maxc > runLine ) vr.walking = qfalse;       // crossed up -> run
-				}
-				else
-				{
-					if ( maxc < runLine - hyst ) vr.walking = qtrue; // eased down -> walk
-				}
-			}
-			else
-			{
-				vr.walking = qfalse; // feature off => classic always-run
-			}
-
-			//sideways
-			Com_QueueEvent(in_vrEventTime, SE_JOYSTICK_AXIS, 0, joystick[0] * 127.0f + positional[0] * 127.0f, 0, NULL);
-
-			//forward/back
-			Com_QueueEvent(in_vrEventTime, SE_JOYSTICK_AXIS, 1, joystick[1] * 127.0f + positional[1] * 127.0f, 0, NULL);
-		}
-
-		// In case thumbstick is used by weapon wheel (is in HMD/thumbstick mode), ignore standard thumbstick inputs
-		else if (!vr.weapon_select_using_thumbstick)
-		{
-			// Use joystick X axis for analog turning in smooth turn mode only
-			// This provides smooth analog turn speed control like gamepads
-			// Scale to match SDL joystick range (-32768 to +32767) since j_yaw is calibrated for that range
-			// Skip analog turning if weapon selector uses thumbstick (WS_HMD mode) to avoid
-			// turning while initiating weapon selection with a sideways thumbstick push
-			if (vr_snapturn->integer <= 0 && vr_weaponSelectorMode->integer != WS_HMD)
-			{
-				Com_QueueEvent(in_vrEventTime, SE_JOYSTICK_AXIS, 2, curvedX * (vr_sensitivity->value / 100.0f) * 32767.0f, 0, NULL);
-			}
-
-			float joystickValue = length(curvedX, curvedY);
-			if (joystickValue == 0.0f)
-			{
-				// Joystick within deadzone -> disable all inputs
-				IN_HandleInactiveInput(&controller->axisButtons, VR_TOUCH_AXIS_UP, "RTHUMBFORWARD", joystickValue, qtrue);
-				IN_HandleInactiveInput(&controller->axisButtons, VR_TOUCH_AXIS_UPRIGHT, "RTHUMBFORWARDRIGHT", joystickValue, qtrue);
-				IN_HandleInactiveInput(&controller->axisButtons, VR_TOUCH_AXIS_RIGHT, "RTHUMBRIGHT", joystickValue, qtrue);
-				IN_HandleInactiveInput(&controller->axisButtons, VR_TOUCH_AXIS_DOWNRIGHT, "RTHUMBBACKRIGHT", joystickValue, qtrue);
-				IN_HandleInactiveInput(&controller->axisButtons, VR_TOUCH_AXIS_DOWN, "RTHUMBBACK", joystickValue, qtrue);
-				IN_HandleInactiveInput(&controller->axisButtons, VR_TOUCH_AXIS_DOWNLEFT, "RTHUMBBACKLEFT", joystickValue, qtrue);
-				IN_HandleInactiveInput(&controller->axisButtons, VR_TOUCH_AXIS_LEFT, "RTHUMBLEFT", joystickValue, qtrue);
-				IN_HandleInactiveInput(&controller->axisButtons, VR_TOUCH_AXIS_UPLEFT, "RTHUMBFORWARDLEFT", joystickValue, qtrue);
-			}
-			else if (joystickValue > 0.05f)
-			{
-				float joystickAngle = AngleNormalize360(RAD2DEG(atan2(curvedX, curvedY)));
-				if (IN_VRJoystickUse8WayMapping())
-				{
-						IN_VRJoystickHandle8WayMapping(&controller->axisButtons, joystickAngle, joystickValue);
-				}
-				else
-				{
-						IN_VRJoystickHandle4WayMapping(&controller->axisButtons, joystickAngle, joystickValue);
-				}
-			}
-		}
-	}
-}
-
-static void IN_VRTriggers( qboolean isRightController, float triggerValue )
-{
-	vrController_t* controller = isRightController == qtrue ? &rightController : &leftController;
-
-	// Menu trigger latch, per controller: which key this hand pressed and whether
-	// that press is still outstanding.  An off-hand press swaps hands (see below),
-	// so keying the release off isActiveController would swallow the release of a
-	// press already in flight and invent one for the hand that only swapped.
-	static int		menuTriggerKey[2]  = { K_MOUSE1, K_MOUSE1 };
-	static qboolean	menuTriggerDown[2] = { qfalse, qfalse };
-	const int		hand = isRightController ? 1 : 0;
-
-	// Weapon adjustment / TVD scrub mode: suppress all trigger actions
-	if (vr.weapon_adjust || vr.menuYawLocked)
-	{
-		// flush a held menu trigger; no release can be delivered from here
-		if (menuTriggerDown[hand])
-		{
-			menuTriggerDown[hand] = qfalse;
-			Com_QueueEvent(in_vrEventTime, SE_KEY, menuTriggerKey[hand], qfalse, 0, NULL);
-		}
-		return;
-	}
-
-	// Detect if we're in menu mode (virtual screen, intermission, or scoreboard)
-	qboolean inMenuMode = (vr.virtual_screen && (!vr.first_person_following || vr.in_menu)) ||
-	                      cl.snap.ps.pm_type == PM_INTERMISSION ||
-	                      vr.scoreboardCursorActive;
-
-	// On transition into menu mode, release any held +attack from gameplay.
-	// Only check primary trigger since that's what sends +attack.
-	qboolean isPrimaryTrigger = (isRightController == (vr_righthanded->integer != 0));
-	if (inMenuMode && !wasInMenuMode && isPrimaryTrigger && triggerValue > IN_TriggerPressedThreshold())
-	{
-		Cbuf_AddText("-attack\n");
-	}
-	if (isPrimaryTrigger)
-	{
-		wasInMenuMode = inMenuMode;
-	}
-
-	// Leaving menu mode with a menu trigger still held would leave the UI holding
-	// a button it will never see released.  Flush it on the way out.
-	if (!inMenuMode && menuTriggerDown[hand])
-	{
-		menuTriggerDown[hand] = qfalse;
-		Com_QueueEvent(in_vrEventTime, SE_KEY, menuTriggerKey[hand], qfalse, 0, NULL);
-	}
-
-	if (inMenuMode)
-	{
-		qboolean isActiveController = (isRightController && !vr.menuLeftHanded) ||
-		                              (!isRightController && vr.menuLeftHanded);
-
-		if (VKeyboard_IsActive())
-		{
-			// Dual-cursor keyboard mode: both controllers type independently
-			if (isActiveController)
-			{
-				// Primary hand: use K_MOUSE1 as normal
-				if (triggerValue > IN_TriggerPressedThreshold() && !IN_InputActivated(&controller->axisButtons, VR_TOUCH_AXIS_TRIGGER_INDEX))
-				{
-					IN_ActivateInput(&controller->axisButtons, VR_TOUCH_AXIS_TRIGGER_INDEX);
-					Com_QueueEvent(in_vrEventTime, SE_KEY, K_MOUSE1, qtrue, 0, NULL);
-					VR_Vibrate(200, isRightController ? 2 : 1, 0.8);
-				}
-				else if (triggerValue < IN_TriggerReleasedThreshold() && IN_InputActivated(&controller->axisButtons, VR_TOUCH_AXIS_TRIGGER_INDEX))
-				{
-					IN_DeactivateInput(&controller->axisButtons, VR_TOUCH_AXIS_TRIGGER_INDEX);
-					// this release also ends any menu press held across the keyboard
-					// opening (clicking a text field does exactly that)
-					menuTriggerDown[hand] = qfalse;
-					Com_QueueEvent(in_vrEventTime, SE_KEY, K_MOUSE1, qfalse, 0, NULL);
-				}
-			}
-			else
-			{
-				// Offhand: drive keyboard directly, bypass event system
-				if (triggerValue > IN_TriggerPressedThreshold() && !IN_InputActivated(&controller->axisButtons, VR_TOUCH_AXIS_TRIGGER_INDEX))
-				{
-					IN_ActivateInput(&controller->axisButtons, VR_TOUCH_AXIS_TRIGGER_INDEX);
-					vr.vkbOffhandTriggerDown = qtrue;
-					VKeyboard_HandleOffhandKey(qtrue);
-					VR_Vibrate(200, isRightController ? 2 : 1, 0.8);
-				}
-				else if (triggerValue < IN_TriggerReleasedThreshold() && IN_InputActivated(&controller->axisButtons, VR_TOUCH_AXIS_TRIGGER_INDEX))
-				{
-					IN_DeactivateInput(&controller->axisButtons, VR_TOUCH_AXIS_TRIGGER_INDEX);
-					vr.vkbOffhandTriggerDown = qfalse;
-					VKeyboard_HandleOffhandKey(qfalse);
-				}
-			}
-		}
-		else
-		{
-			// Normal single-cursor menu mode. During thumbstick nav the point cursor is
-			// hidden and selection is arrow-driven, so the trigger activates the
-			// highlighted item (Enter) rather than clicking the now-stale cursor spot
-			// (Mouse1). Latch the key at press so the release matches if nav flips mid-hold.
-			if (triggerValue > IN_TriggerPressedThreshold() && !IN_InputActivated(&controller->axisButtons, VR_TOUCH_AXIS_TRIGGER_INDEX))
-			{
-				IN_ActivateInput(&controller->axisButtons, VR_TOUCH_AXIS_TRIGGER_INDEX);
-				if (isActiveController)
-				{
-					menuTriggerKey[hand] = vr.menuStickNavActive ? K_ENTER : K_MOUSE1;
-					menuTriggerDown[hand] = qtrue;
-					Com_QueueEvent(in_vrEventTime, SE_KEY, menuTriggerKey[hand], qtrue, 0, NULL);
-					VR_Vibrate(200, vr.menuLeftHanded ? 1 : 2, 0.8);
-				}
-				else
-				{
-					// Inactive controller becomes active one
-					vr.menuLeftHanded = !vr.menuLeftHanded;
-				}
-			}
-			else if (triggerValue < IN_TriggerReleasedThreshold() && IN_InputActivated(&controller->axisButtons, VR_TOUCH_AXIS_TRIGGER_INDEX))
-			{
-				IN_DeactivateInput(&controller->axisButtons, VR_TOUCH_AXIS_TRIGGER_INDEX);
-				// release what this hand actually pressed, not what the current
-				// active hand would press now
-				if (menuTriggerDown[hand])
-				{
-					menuTriggerDown[hand] = qfalse;
-					Com_QueueEvent(in_vrEventTime, SE_KEY, menuTriggerKey[hand], qfalse, 0, NULL);
-				}
-			}
-		}
-	}
-	else
-	{
-		// Primary trigger
-		if (isRightController == (vr_righthanded->integer != 0))
-		{
-			if (triggerValue > IN_TriggerPressedThreshold())
-			{
-				IN_HandleActiveInput(&controller->axisButtons, VR_TOUCH_AXIS_TRIGGER_INDEX, "PRIMARYTRIGGER", triggerValue, qfalse);
-			}
-			else if (triggerValue < IN_TriggerReleasedThreshold())
-			{
-				IN_HandleInactiveInput(&controller->axisButtons, VR_TOUCH_AXIS_TRIGGER_INDEX, "PRIMARYTRIGGER", triggerValue, qfalse);
-			}
-		}
-
-		// Off hand trigger
-		if (isRightController != (vr_righthanded->integer != 0))
-		{
-			if (triggerValue > IN_TriggerPressedThreshold())
-			{
-				IN_HandleActiveInput(&controller->axisButtons, VR_TOUCH_AXIS_TRIGGER_INDEX, "SECONDARYTRIGGER", triggerValue, qfalse);
-			}
-			else if (triggerValue < IN_TriggerReleasedThreshold())
-			{
-				IN_HandleInactiveInput(&controller->axisButtons, VR_TOUCH_AXIS_TRIGGER_INDEX, "SECONDARYTRIGGER", triggerValue, qfalse);
-			}
-		}
-	}
-}
-
-static void IN_VRButtonSlot( vrController_t* controller, uint32_t buttons, int flag, char* slot )
-{
-	if (buttons & flag)
-	{
-		IN_HandleActiveInput(&controller->buttons, flag, slot, 0, qfalse);
-	}
-	else
-	{
-		IN_HandleInactiveInput(&controller->buttons, flag, slot, 0, qfalse);
-	}
-}
-
-static void IN_VRButtons( qboolean isRightController, uint32_t buttons )
-{
-	vrController_t* controller = isRightController == qtrue ? &rightController : &leftController;
-	/* Holds that begin while blocked stay muted until physically released. */
-	tvdInput.muted[isRightController] &= buttons;
-	if (tvdInput.blocked)
-		tvdInput.muted[isRightController] |= buttons & ~VR_Button_Enter;
-	buttons &= ~tvdInput.muted[isRightController];
-
-	// Weapon adjustment mode: suppress most buttons, handle A (reset) and B (exit)
-	if (vr.weapon_adjust && !tvdInput.blocked)
-	{
-		// Still allow menu button
-		if ((buttons & VR_Button_Enter) && !IN_InputActivated(&controller->buttons, VR_Button_Enter))
-		{
-			IN_ActivateInput(&controller->buttons, VR_Button_Enter);
-			Com_QueueEvent(in_vrEventTime, SE_KEY, K_ESCAPE, qtrue, 0, NULL);
-		}
-		else if (!(buttons & VR_Button_Enter) && IN_InputActivated(&controller->buttons, VR_Button_Enter))
-		{
-			IN_DeactivateInput(&controller->buttons, VR_Button_Enter);
-			Com_QueueEvent(in_vrEventTime, SE_KEY, K_ESCAPE, qfalse, 0, NULL);
-		}
-
-		// A button: accept and exit adjustment mode
-		if ((buttons & VR_Button_A) && !IN_InputActivated(&controller->buttons, VR_Button_A))
-		{
-			IN_ActivateInput(&controller->buttons, VR_Button_A);
-			Cbuf_AddText("weapon_adjust\n");
-		}
-		else if (!(buttons & VR_Button_A))
-		{
-			IN_DeactivateInput(&controller->buttons, VR_Button_A);
-		}
-
-		// B button: reset to default (tap = single param, hold 2s = all params)
-		if (buttons & VR_Button_B)
-		{
-			if (!IN_InputActivated(&controller->buttons, VR_Button_B))
-			{
-				IN_ActivateInput(&controller->buttons, VR_Button_B);
-				weaponAdjustBHoldStart = in_vrEventTime;
-			}
-			else if (weaponAdjustBHoldStart > 0 &&
-				(in_vrEventTime - weaponAdjustBHoldStart) > 2000)
-			{
-				Cbuf_AddText("weapon_adjust_reset_all\n");
-				VR_Vibrate(200, 3, 0.8f);
-				weaponAdjustBHoldStart = 0; // prevent repeated triggers
-			}
-		}
-		else
-		{
-			if (IN_InputActivated(&controller->buttons, VR_Button_B))
-			{
-				IN_DeactivateInput(&controller->buttons, VR_Button_B);
-				// If released before 2s, treat as single-param default reset
-				if (weaponAdjustBHoldStart > 0)
-				{
-					Cbuf_AddText("weapon_adjust_reset\n");
-					VR_Vibrate(50, 3, 0.4f);
-				}
-				weaponAdjustBHoldStart = 0;
-			}
-		}
-
-		// Release any held grip/other button states to prevent stuck actions
-		if (!(buttons & VR_Button_GripTrigger))
-		{
-			IN_DeactivateInput(&controller->buttons, VR_Button_GripTrigger);
-		}
-
-		return;
-	}
-
-	// Menu button
-	if ((buttons & VR_Button_Enter) && !IN_InputActivated(&controller->buttons, VR_Button_Enter))
-	{
-		IN_ActivateInput(&controller->buttons, VR_Button_Enter);
-		Com_QueueEvent(in_vrEventTime, SE_KEY, K_ESCAPE, qtrue, 0, NULL);
-	}
-	else if (!(buttons & VR_Button_Enter) && IN_InputActivated(&controller->buttons, VR_Button_Enter))
-	{
-		IN_DeactivateInput(&controller->buttons, VR_Button_Enter);
-		Com_QueueEvent(in_vrEventTime, SE_KEY, K_ESCAPE, qfalse, 0, NULL);
-	}
-
-	// View (Steam Frame) is hard-wired like Menu so it can close the console it opened
-	if ((buttons & VR_Button_Back) && !IN_InputActivated(&controller->buttons, VR_Button_Back))
-	{
-		IN_ActivateInput(&controller->buttons, VR_Button_Back);
-		Cbuf_AddText("toggleconsole\n");
-	}
-	else if (!(buttons & VR_Button_Back))
-	{
-		IN_DeactivateInput(&controller->buttons, VR_Button_Back);
-	}
-
-	/* IN_VRTVScrub settles grip ownership for both hands before either dispatches. */
-	if (tvdInput.blocked)
-	{
-		return;
-	}
-	if (!tvdInput.reserved)
-	{
-		char *name = isRightController == (vr_righthanded->integer != 0) ? "PRIMARYGRIP" : "SECONDARYGRIP";
-		if (buttons & VR_Button_GripTrigger)
-			IN_HandleActiveInput(&controller->buttons, VR_Button_GripTrigger, name, 0, qfalse);
-		else
-			IN_HandleInactiveInput(&controller->buttons, VR_Button_GripTrigger, name, 0, qfalse);
-	}
-	else
-	{
-		/* These grip bits do not represent configurable gameplay actions. */
-		IN_DeactivateInput(&controller->buttons, VR_Button_GripTrigger);
-	}
-
-	// Trackpad
-	if (isRightController == !vr_righthanded->integer)
-	{
-		if (buttons & VR_Button_Trackpad)
-		{
-			IN_HandleActiveInput(&controller->buttons, VR_Button_Trackpad, "SECONDARYTRACKPAD", 0, qfalse);
-		}
-		else
-		{
-			IN_HandleInactiveInput(&controller->buttons, VR_Button_Trackpad, "SECONDARYTRACKPAD", 0, qfalse);
-		}
-	}
-	else
-	{
-		if (buttons & VR_Button_Trackpad)
-		{
-			IN_HandleActiveInput(&controller->buttons, VR_Button_Trackpad, "PRIMARYTRACKPAD", 0, qfalse);
-		}
-		else
-		{
-			IN_HandleInactiveInput(&controller->buttons, VR_Button_Trackpad, "PRIMARYTRACKPAD", 0, qfalse);
-		}
-	}
-
-	IN_VRButtonSlot(controller, buttons, VR_BUTTON_GRIP_CLICK,
-		isRightController == !vr_righthanded->integer ? "SECONDARYGRIPCLICK" : "PRIMARYGRIPCLICK");
-	if (isRightController)
-	{
-		IN_VRButtonSlot(controller, buttons, VR_Button_RShoulder, "RBUMPER");
-	}
-	else
-	{
-		IN_VRButtonSlot(controller, buttons, VR_Button_LShoulder, "LBUMPER");
-		IN_VRButtonSlot(controller, buttons, VR_Button_Up, "DPAD_UP");
-		IN_VRButtonSlot(controller, buttons, VR_Button_Down, "DPAD_DOWN");
-		IN_VRButtonSlot(controller, buttons, VR_Button_Left, "DPAD_LEFT");
-		IN_VRButtonSlot(controller, buttons, VR_Button_Right, "DPAD_RIGHT");
-	}
-
-	if (isRightController == !vr_righthanded->integer)
-	{
-		if (buttons & VR_Button_LThumb)
-		{
-			if (!IN_InputActivated(&controller->buttons, VR_Button_LThumb))
-			{
-				// Initiate position reset for fake 6DoF
-				vr.realign = 3;
-			}
-			IN_HandleActiveInput(&controller->buttons, VR_Button_LThumb, "SECONDARYTHUMBSTICK", 0, qfalse);
-		}
-		else
-		{
-			IN_HandleInactiveInput(&controller->buttons, VR_Button_LThumb, "SECONDARYTHUMBSTICK", 0, qfalse);
-		}
-	}
-	else
-	{
-		if (buttons & VR_Button_RThumb)
-		{
-			if ((clc.demoplaying || tvPlay.active) && !IN_InputActivated(&controller->buttons, VR_Button_RThumb))
-			{
-				IN_ActivateInput(&controller->buttons, VR_Button_RThumb);
-				Cbuf_AddText("demopause\n");
-			}
-			IN_HandleActiveInput(&controller->buttons, VR_Button_RThumb, "PRIMARYTHUMBSTICK", 0, qfalse);
-		}
-		else
-		{
-			IN_HandleInactiveInput(&controller->buttons, VR_Button_RThumb, "PRIMARYTHUMBSTICK", 0, qfalse);
-		}
-	}
-
-	if (buttons & VR_Button_A)
-	{
-		// Track hold state for cgame vote processing (runs alongside normal actions)
-		if (vr.vote_active)
-		{
-			vr.vote_holding = 1;
-		}
-
-		if (cl.snap.ps.pm_flags & PMF_FOLLOW)
-		{
-			// Go back to free spectator mode if following player
-			if (!IN_InputActivated(&controller->buttons, VR_Button_A))
-			{
-				IN_ActivateInput(&controller->buttons, VR_Button_A);
-				Cbuf_AddText("cmd team spectator\n");
-			}
-		}
-		else if (tvPlay.active)
-		{
-			// TV playback: cycle to next viewpoint
-			if (!IN_InputActivated(&controller->buttons, VR_Button_A))
-			{
-				IN_ActivateInput(&controller->buttons, VR_Button_A);
-				Cbuf_AddText("follownext\n");
-			}
-		}
-		else if (VR_Gameplay_ShouldRenderInVirtualScreen() || cl.snap.ps.pm_type == PM_INTERMISSION)
-		{
-			// Skip server search in the server menu
-			if (!IN_InputActivated(&controller->buttons, VR_Button_A))
-			{
-				IN_ActivateInput(&controller->buttons, VR_Button_A);
-				Com_QueueEvent(in_vrEventTime, SE_KEY, K_SPACE, qtrue, 0, NULL);
-			}
-		}
-		else
-		{
-			IN_HandleActiveInput(&controller->buttons, VR_Button_A, "A", 0, qfalse);
-		}
-	}
-	else
-	{
-		if (vr.vote_holding == 1)
-		{
-			vr.vote_holding = 0;
-		}
-
-		if (VR_Gameplay_ShouldRenderInVirtualScreen() || cl.snap.ps.pm_type == PM_INTERMISSION)
-		{
-			// Skip server search in the server menu
-			if (IN_InputActivated(&controller->buttons, VR_Button_A))
-			{
-				IN_DeactivateInput(&controller->buttons, VR_Button_A);
-				Com_QueueEvent(in_vrEventTime, SE_KEY, K_SPACE, qfalse, 0, NULL);
-			}
-		}
-		else
-		{
-			IN_HandleInactiveInput(&controller->buttons, VR_Button_A, "A", 0, qfalse);
-		}
-	}
-
-	if (buttons & VR_Button_B)
-	{
-		// Track hold state for cgame vote processing (runs alongside normal actions)
-		if (vr.vote_active)
-		{
-			vr.vote_holding = -1;
-		}
-
-		if (!IN_InputActivated(&controller->buttons, VR_Button_B))
-		{
-			// If in any third-person follow mode or playing demo, recenter camera
-			if (((cl.snap.ps.pm_flags & PMF_FOLLOW) || clc.demoplaying) &&
-			    (vr.follow_mode == VRFM_THIRDPERSON_1 || vr.follow_mode == VRFM_THIRDPERSON_2))
-			{
-				IN_ActivateInput(&controller->buttons, VR_Button_B);
-				vr.recenter_follow_camera = qtrue;
-			}
-			else
-			{
-				VR_VirtualScreen_Reanchor();
-			}
-		}
-		IN_HandleActiveInput(&controller->buttons, VR_Button_B, "B", 0, qfalse);
-	}
-	else
-	{
-		if (vr.vote_holding == -1)
-		{
-			vr.vote_holding = 0;
-		}
-		IN_HandleInactiveInput(&controller->buttons, VR_Button_B, "B", 0, qfalse);
-	}
-
-	if (buttons & VR_Button_X)
-	{
-		if ((cl.snap.ps.pm_flags & PMF_FOLLOW) || clc.demoplaying)
-		{
-			// Switch follow mode when following player or playing demo
-			if (!IN_InputActivated(&controller->buttons, VR_Button_X))
-			{
-				IN_ActivateInput(&controller->buttons, VR_Button_X);
-				vr.follow_mode = vr.follow_mode + 1;
-				if (vr.follow_mode >= VRFM_NUM_FOLLOWMODES)
-				{
-					vr.follow_mode = VRFM_THIRDPERSON_1; // wrap past FP, skipping VRFM_NONE
-				}
-				if (vr.follow_mode == VRFM_THIRDPERSON_1)
-				{
-					if (!tvPlay.active) {
-						Cbuf_ExecuteText(EXEC_APPEND, "follow\n");
-					}
-				}
-
-				// Initiate realign
-				vr.realign = 3;
-			}
-		}
-		else
-		{
-			IN_HandleActiveInput(&controller->buttons, VR_Button_X, "X", 0, qfalse);
-		}
-	}
-	else
-	{
-		IN_HandleInactiveInput(&controller->buttons, VR_Button_X, "X", 0, qfalse);
-	}
-
-	if (buttons & VR_Button_Y)
-	{
-		IN_HandleActiveInput(&controller->buttons, VR_Button_Y, "Y", 0, qfalse);
-	}
-	else
-	{
-		IN_HandleInactiveInput(&controller->buttons, VR_Button_Y, "Y", 0, qfalse);
-	}
-
-	if (isRightController == !vr_righthanded->integer)
-	{
-		if (buttons & VR_Button_Thumbrest)
-		{
-			IN_HandleActiveInput(&controller->buttons, VR_Button_Thumbrest, "SECONDARYTHUMBREST", 0, qfalse);
-		}
-		else
-		{
-			IN_HandleInactiveInput(&controller->buttons, VR_Button_Thumbrest, "SECONDARYTHUMBREST", 0, qfalse);
-		}
-	}
-	else
-	{
-		if (buttons & VR_Button_Thumbrest)
-		{
-			IN_HandleActiveInput(&controller->buttons, VR_Button_Thumbrest, "PRIMARYTHUMBREST", 0, qfalse);
-		}
-		else
-		{
-			IN_HandleInactiveInput(&controller->buttons, VR_Button_Thumbrest, "PRIMARYTHUMBREST", 0, qfalse);
-		}
-	}
-}
-
-// Menu thumbstick navigation. Drives menus like a HELD KEY: press down while the stick
-// is deflected, release (up) when it centres or switches direction, and re-press at a
-// delayed repeat rate. Vertical -> UP/DOWN arrows (single-item nav); horizontal ->
-// LEFT/RIGHT (slider/feeder step). Paging is done via the UI's own scroll-arrow
-// buttons, not the stick. Emitting a real down/up pair across
-// separate frames (NOT down+up in one frame) matches the keyboard, which single-steps
-// feeders instead of snapping them to the end. Sets vr.menuStickNavActive so the UI
-// freezes hover / hides the point cursor; clears it only on a meaningful re-point.
-static void IN_VRMenuThumbstickNav( qboolean menuActive, float lx, float ly, float rx, float ry )
-{
-	static int navKey        = 0;   // key currently held down (0 = none)
-	static int navNextRepeat = 0;   // in_vrEventTime of the next repeat
-	static int navAnchorX    = 0;   // menu cursor when nav took over (re-point reference)
-	static int navAnchorY    = 0;
-
-	const float ACT = 0.50f;        // activation magnitude
-	const float REL = 0.35f;        // release magnitude (hysteresis)
-	const int   INITIAL_DELAY = 400;
-	const int   REPEAT        = 140;
-	const int   REPOINT_PX    = 60;
-
-	// Dominant deflection across both sticks, per axis.
-	float ax  = ( fabsf( lx ) >= fabsf( rx ) ) ? lx : rx;
-	float ay  = ( fabsf( ly ) >= fabsf( ry ) ) ? ly : ry;
-	float mag = fabsf( ax ) > fabsf( ay ) ? fabsf( ax ) : fabsf( ay );
-
-	qboolean console = VR_IsInConsole();
-
-	int desired = 0;
-	if ( menuActive ) {
-		if ( fabsf( ax ) >= fabsf( ay ) ) {
-			if ( ax >  ACT ) desired = K_RIGHTARROW;
-			else if ( ax < -ACT ) desired = K_LEFTARROW;
-		} else {
-			// the console scrolls its buffer on PGUP/PGDN; arrows there would
-			// walk command history instead, which is not what a stick means
-			if ( ay >  ACT ) desired = console ? K_PGUP : K_UPARROW;   // stick forward -> previous item
-			else if ( ay < -ACT ) desired = console ? K_PGDN : K_DOWNARROW;
-		}
-	}
-
-	// Release the held key when the stick centres (< REL), switches direction, or we
-	// leave the menu, so a real up follows every down (feeders single-step).
-	if ( navKey && ( !menuActive || mag < REL || ( desired != 0 && desired != navKey ) ) ) {
-		Com_QueueEvent( in_vrEventTime, SE_KEY, navKey, qfalse, 0, NULL );
-		navKey = 0;
-	}
-
-	if ( !menuActive ) {
-		vr.menuStickNavActive = qfalse;
-		return;
-	}
-
-	if ( desired != 0 && navKey == 0 ) {
-		// press
-		Com_QueueEvent( in_vrEventTime, SE_KEY, desired, qtrue, 0, NULL );
-		navKey = desired;
-		navNextRepeat = in_vrEventTime + INITIAL_DELAY;
-		navAnchorX = vr.menuCursorX;
-		navAnchorY = vr.menuCursorY;
-		vr.menuStickNavActive = qtrue;
-	} else if ( desired != 0 && desired == navKey && in_vrEventTime >= navNextRepeat ) {
-		// auto-repeat: re-press (new key-down edge) at the repeat rate
-		Com_QueueEvent( in_vrEventTime, SE_KEY, desired, qtrue, 0, NULL );
-		navNextRepeat = in_vrEventTime + REPEAT;
-	}
-
-	// Hand control back to pointing on a meaningful re-point of the ray, but ONLY once
-	// the stick is at rest (navKey == 0), so the small controller rotation from flicking
-	// the stick can't trip the re-point mid-hold.
-	if ( vr.menuStickNavActive && navKey == 0 ) {
-		int dx = vr.menuCursorX - navAnchorX;
-		int dy = vr.menuCursorY - navAnchorY;
-		if ( ( dx * dx + dy * dy ) > REPOINT_PX * REPOINT_PX ) {
-			vr.menuStickNavActive = qfalse;
-		}
-	}
-}
-
 // The runtime's FOV, before VR_PublishFov decides what the frame sees
 static float rawFovX, rawFovUp, rawFovDown;
 
@@ -2432,11 +990,70 @@ void VR_RefreshDerivedModeState( void )
 	// would latch false before any map is loaded
 	vr.use_6dof = vr.single_player && vr_6dof->integer;
 
+	vr.follow_mode = VR_FollowModeFor( Cvar_VariableIntegerValue( "cg_followMode" ), tvPlay.active );
+
 	vr.virtual_screen = VR_Gameplay_ShouldRenderInVirtualScreen();
 	vr.first_person_following = vr.virtual_screen && VR_IsFollowingInFirstPerson();
 	vr.in_menu = VR_IsInMenu();
 
 	VR_PublishFov();
+}
+
+/* The engine's per-hand sample from this port's actions; one-hand buttons land on the hand that carries them. */
+static void VR_SampleHands( clXRHandInput_t hands[2] )
+{
+	XrAction trigger[2] = { indexLeftAction, indexRightAction }, grip[2] = { gripLeftAction, gripRightAction };
+	XrAction stick[2] = { moveOnLeftJoystickAction, moveOnRightJoystickAction };
+	XrAction click[2] = { thumbstickLeftClickAction, thumbstickRightClickAction };
+	XrAction rest[2] = { thumbrestLeftTouchAction, thumbrestRightTouchAction };
+	XrAction bumper[2] = { bumperLeftAction, bumperRightAction }, pad[2] = { trackpadLeftAction, trackpadRightAction };
+	XrAction gripClick[2] = { gripClickLeftAction, gripClickRightAction };
+	const int frame = vrCurrentProfile[1] == CL_XRP_FRAME || vrCurrentProfile[0] == CL_XRP_FRAME;
+	int h;
+
+	memset( hands, 0, sizeof( clXRHandInput_t ) * 2 );
+	for ( h = 0; h < 2; h++ ) {
+		XrActionStateFloat t = GetActionStateFloat( trigger[h] ), g = GetActionStateFloat( grip[h] );
+		XrActionStateVector2f s = GetActionStateVector2( stick[h] );
+		hands[h].profile = vrCurrentProfile[h];
+		hands[h].grip.positionValid = VR_GetEngine()->appState.TrackedController[h].Active;
+		hands[h].aim.orientationValid = aimOrientationValid[h];
+		hands[h].active = t.isActive || g.isActive || s.isActive;
+		hands[h].trigger = t.currentState;
+		hands[h].squeeze = g.isActive ? g.currentState : 0;
+		hands[h].stick[0] = s.currentState.x;
+		hands[h].stick[1] = s.currentState.y;
+		hands[h].trackpad = GetActionStateFloat( pad[h] ).currentState;
+		if ( GetActionStateBoolean( click[h] ).currentState ) hands[h].buttons |= CL_XRI_STICK_BUTTON;
+		if ( GetActionStateBoolean( rest[h] ).currentState ) hands[h].buttons |= CL_XRI_THUMBREST_BUTTON;
+		if ( GetActionStateBoolean( bumper[h] ).currentState ) hands[h].buttons |= CL_XRI_BUMPER_BUTTON;
+		if ( GetActionStateBoolean( gripClick[h] ).currentState ) hands[h].buttons |= CL_XRI_SQUEEZE_CLICK_BUTTON;
+	}
+	/* Touch/PICO/Index: left X/Y and right A/B are each hand's primary/secondary; the Frame keeps A/B/X/Y on the right. */
+	if ( frame ) {
+		if ( GetActionStateBoolean( buttonAAction ).currentState ) hands[1].buttons |= CL_XRI_PRIMARY_BUTTON;
+		if ( GetActionStateBoolean( buttonBAction ).currentState ) hands[1].buttons |= CL_XRI_SECONDARY_BUTTON;
+		if ( GetActionStateBoolean( buttonXAction ).currentState ) hands[1].buttons |= CL_XRI_X_BUTTON;
+		if ( GetActionStateBoolean( buttonYAction ).currentState ) hands[1].buttons |= CL_XRI_Y_BUTTON;
+		if ( GetActionStateBoolean( menuAction ).currentState ) hands[1].buttons |= CL_XRI_MENU_BUTTON;
+		if ( GetActionStateBoolean( viewAction ).currentState ) hands[0].buttons |= CL_XRI_VIEW_BUTTON;
+		if ( GetActionStateBoolean( dpadUpAction ).currentState ) hands[0].buttons |= CL_XRI_DPAD_UP_BUTTON;
+		if ( GetActionStateBoolean( dpadDownAction ).currentState ) hands[0].buttons |= CL_XRI_DPAD_DOWN_BUTTON;
+		if ( GetActionStateBoolean( dpadLeftAction ).currentState ) hands[0].buttons |= CL_XRI_DPAD_LEFT_BUTTON;
+		if ( GetActionStateBoolean( dpadRightAction ).currentState ) hands[0].buttons |= CL_XRI_DPAD_RIGHT_BUTTON;
+	} else {
+		if ( GetActionStateBoolean( buttonXAction ).currentState ) hands[0].buttons |= CL_XRI_PRIMARY_BUTTON;
+		if ( GetActionStateBoolean( buttonYAction ).currentState ) hands[0].buttons |= CL_XRI_SECONDARY_BUTTON;
+		if ( GetActionStateBoolean( buttonAAction ).currentState ) hands[1].buttons |= CL_XRI_PRIMARY_BUTTON;
+		if ( GetActionStateBoolean( buttonBAction ).currentState ) hands[1].buttons |= CL_XRI_SECONDARY_BUTTON;
+		/* Touch's menu is on the left. Simple binds menu on both hands into one action, so it reports on both:
+		 * an inactive hand is skipped, and a lone Simple controller may be either hand. */
+		if ( GetActionStateBoolean( menuAction ).currentState ) {
+			hands[0].buttons |= CL_XRI_MENU_BUTTON;
+			if ( vrCurrentProfile[0] == CL_XRP_SIMPLE || vrCurrentProfile[1] == CL_XRP_SIMPLE )
+				hands[1].buttons |= CL_XRI_MENU_BUTTON;
+		}
+	}
 }
 
 void VR_ProcessInputActions( void )
@@ -2451,97 +1068,15 @@ void VR_ProcessInputActions( void )
 
 	VR_ProcessHaptics();
 
-	//button mapping
-	uint32_t lButtons = 0;
-	if (GetActionStateBoolean(menuAction).currentState) lButtons |= VR_Button_Enter;
-	if (GetActionStateBoolean(buttonXAction).currentState) lButtons |= VR_Button_X;
-	if (GetActionStateBoolean(buttonYAction).currentState) lButtons |= VR_Button_Y;
-	XrActionStateFloat leftGrip = GetActionStateFloat(gripLeftAction);
-	if (leftGrip.isActive && leftGrip.currentState > 0.5f) lButtons |= VR_Button_GripTrigger;
-	if (GetActionStateFloat(trackpadLeftAction).currentState > 0.3f) lButtons |= VR_Button_Trackpad;
-	if (GetActionStateBoolean(thumbstickLeftClickAction).currentState) lButtons |= VR_Button_LThumb;
-	if (GetActionStateBoolean(thumbrestLeftTouchAction).currentState) lButtons |= VR_Button_Thumbrest;
-	if (GetActionStateBoolean(bumperLeftAction).currentState) lButtons |= VR_Button_LShoulder;
-	if (GetActionStateBoolean(dpadUpAction).currentState) lButtons |= VR_Button_Up;
-	if (GetActionStateBoolean(dpadDownAction).currentState) lButtons |= VR_Button_Down;
-	if (GetActionStateBoolean(dpadLeftAction).currentState) lButtons |= VR_Button_Left;
-	if (GetActionStateBoolean(dpadRightAction).currentState) lButtons |= VR_Button_Right;
-	if (GetActionStateBoolean(viewAction).currentState) lButtons |= VR_Button_Back;
-	if (GetActionStateBoolean(gripClickLeftAction).currentState) lButtons |= VR_BUTTON_GRIP_CLICK;
-	uint32_t rButtons = 0;
-	if (GetActionStateBoolean(buttonAAction).currentState) rButtons |= VR_Button_A;
-	if (GetActionStateBoolean(buttonBAction).currentState) rButtons |= VR_Button_B;
-	XrActionStateFloat rightGrip = GetActionStateFloat(gripRightAction);
-	if (rightGrip.isActive && rightGrip.currentState > 0.5f) rButtons |= VR_Button_GripTrigger;
-	if (GetActionStateFloat(trackpadRightAction).currentState > 0.3f) rButtons |= VR_Button_Trackpad;
-	if (GetActionStateBoolean(thumbstickRightClickAction).currentState) rButtons |= VR_Button_RThumb;
-	if (GetActionStateBoolean(thumbrestRightTouchAction).currentState) rButtons |= VR_Button_Thumbrest;
-	if (GetActionStateBoolean(bumperRightAction).currentState) rButtons |= VR_Button_RShoulder;
-	if (GetActionStateBoolean(gripClickRightAction).currentState) rButtons |= VR_BUTTON_GRIP_CLICK;
-	IN_VRTVScrub(lButtons, rButtons, leftGrip, rightGrip);
-	IN_VRButtons(qfalse, lButtons);
-	IN_VRButtons(qtrue, rButtons);
-
-	// Dual-grip hold detection for weapon adjustment mode activation
-	if (vr_weaponAdjust->integer && !tvdInput.reserved && !tvdInput.blocked)
 	{
-		qboolean bothGripsHeld = (lButtons & VR_Button_GripTrigger) && (rButtons & VR_Button_GripTrigger);
-		if (bothGripsHeld)
-		{
-			if (!dualGripWasActive)
-			{
-				dualGripHoldStartTime = in_vrEventTime;
-				dualGripWasActive = qtrue;
-			}
-			else if (dualGripHoldStartTime > 0 &&
-				(in_vrEventTime - dualGripHoldStartTime) > 1000)
-			{
-				// Toggle weapon adjustment mode
-				Cbuf_AddText("weapon_adjust\n");
-				VR_Vibrate(150, 3, 0.5f);
-				dualGripHoldStartTime = 0; // prevent repeated triggers while still held
-			}
-		}
+		clXRHandInput_t hands[2];
+		VR_SampleHands( hands );
+		if ( VR_GetEngine()->appState.Focused )
+			VR_Router_Frame( hands );
 		else
-		{
-			dualGripWasActive = qfalse;
-			dualGripHoldStartTime = 0;
-		}
+			// the system has input focus: release every hold from the frame, never from the event handler
+			VR_Router_Reset();
 	}
-	else
-	{
-		dualGripWasActive = qfalse;
-		dualGripHoldStartTime = 0;
-	}
-
-	//index finger trigger
-	XrActionStateFloat indexState;
-	indexState = GetActionStateFloat(indexLeftAction);
-	if (!tvdInput.blocked) IN_VRTriggers(qfalse, indexState.currentState);
-	indexState = GetActionStateFloat(indexRightAction);
-	if (!tvdInput.blocked) IN_VRTriggers(qtrue, indexState.currentState);
-
-	//thumbstick
-	XrActionStateVector2f moveJoystickState;
-	moveJoystickState = GetActionStateVector2(moveOnLeftJoystickAction);
-	float navLX = moveJoystickState.currentState.x, navLY = moveJoystickState.currentState.y;
-	if (!tvdInput.blocked) IN_VRJoystick(qfalse, navLX, navLY);
-	moveJoystickState = GetActionStateVector2(moveOnRightJoystickAction);
-	float navRX = moveJoystickState.currentState.x, navRY = moveJoystickState.currentState.y;
-	if (!tvdInput.blocked) IN_VRJoystick(qtrue, navRX, navRY);
-
-	// Menu thumbstick navigation: only in an actual menu (virtual screen, not
-	// follow-mode gameplay): the same menu gate the PGUP/PGDN path uses, minus
-	// intermission/scoreboard (no items to navigate there). NOTE: vr.menuCursorActive
-	// is a UI-VM-lifetime flag (true during gameplay/follow), so it must NOT gate this,
-	// or arrows would fire while playing. The helper resets its own repeat state when
-	// the gate is closed; we reuse the stick values already read above (no extra XR query).
-	IN_VRMenuThumbstickNav(
-		( !tvdInput.blocked && vr.virtual_screen && ( !vr.first_person_following || vr.in_menu ) ),
-		navLX, navLY, navRX, navRY );
-
-	lastframetime = in_vrEventTime;
-	in_vrEventTime = Sys_Milliseconds( );
 }
 
 void IN_VRSyncActions( VR_Engine* engine )
@@ -2611,6 +1146,7 @@ void IN_VRUpdateControllers( VR_Engine* engine, XrTime predictedDisplayTime )
 		for (i = 0; i < 2; i++)
 		{
 			aimPoseValid[i] = qfalse;
+			aimOrientationValid[i] = qfalse;
 
 			XrSpaceLocation loc = {};
 			loc.type = XR_TYPE_SPACE_LOCATION;
@@ -2625,6 +1161,7 @@ void IN_VRUpdateControllers( VR_Engine* engine, XrTime predictedDisplayTime )
 				IN_VRControllerAim(i == 1 ? qtrue : qfalse, loc.pose);
 			}
 			// The ray starts at the controller, so an untracked position would cast it from a stale origin
+			aimOrientationValid[i] = (loc.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT) != 0;
 			aimPoseValid[i] = (loc.locationFlags & (XR_SPACE_LOCATION_ORIENTATION_VALID_BIT | XR_SPACE_LOCATION_POSITION_VALID_BIT)) ==
 				(XR_SPACE_LOCATION_ORIENTATION_VALID_BIT | XR_SPACE_LOCATION_POSITION_VALID_BIT) ? qtrue : qfalse;
 		}

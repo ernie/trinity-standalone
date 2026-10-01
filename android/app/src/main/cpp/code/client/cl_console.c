@@ -87,15 +87,6 @@ void Con_ToggleConsole_f (void) {
 
 	Con_ClearNotify ();
 
-	// Toggle keyboard along with console
-	if ( Key_GetCatcher( ) & KEYCATCH_CONSOLE ) {
-		// Console is being closed
-		VKeyboard_Hide();
-	} else {
-		// Console is being opened
-		VKeyboard_Show();
-	}
-
 	Key_SetCatcher( Key_GetCatcher( ) ^ KEYCATCH_CONSOLE );
 }
 
@@ -107,6 +98,14 @@ Con_ToggleMenu_f
 void Con_ToggleMenu_f( void ) {
 	CL_KeyEvent( K_ESCAPE, qtrue, Sys_Milliseconds() );
 	CL_KeyEvent( K_ESCAPE, qfalse, Sys_Milliseconds() );
+}
+
+/* Closes the console and the in-game menu. Game-view commands run from them, the only way in on headsets without a keyboard. */
+static void Con_ReturnToGame_f( void ) {
+	if ( Key_GetCatcher() & KEYCATCH_CONSOLE )
+		Con_Close();
+	if ( (Key_GetCatcher() & KEYCATCH_UI) && uivm && clc.state == CA_ACTIVE )
+		VM_Call( uivm, 1, UI_SET_ACTIVE_MENU, UIMENU_NONE );
 }
 
 /*
@@ -394,6 +393,7 @@ void Con_Init (void) {
 	Cmd_AddCommand ("messagemode2", Con_MessageMode2_f);
 	Cmd_AddCommand ("messagemode3", Con_MessageMode3_f);
 	Cmd_AddCommand ("messagemode4", Con_MessageMode4_f);
+	Cmd_AddCommand ("returntogame", Con_ReturnToGame_f);
 	Cmd_AddCommand ("clear", Con_Clear_f);
 	Cmd_AddCommand ("condump", Con_Dump_f);
 	Cmd_SetCommandCompletionFunc( "condump", Cmd_CompleteTxtName );
@@ -412,6 +412,7 @@ void Con_Shutdown(void)
 	Cmd_RemoveCommand("messagemode2");
 	Cmd_RemoveCommand("messagemode3");
 	Cmd_RemoveCommand("messagemode4");
+	Cmd_RemoveCommand("returntogame");
 	Cmd_RemoveCommand("clear");
 	Cmd_RemoveCommand("condump");
 }
