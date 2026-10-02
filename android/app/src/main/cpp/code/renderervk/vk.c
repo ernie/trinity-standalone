@@ -7,6 +7,7 @@
 #include "../vrcommon/vr_clientinfo.h"
 #include "../vrcommon/vr_gameplay.h"  // For VR_ShouldDisableStereo
 #include "../vrcommon/vr_virtual_screen.h"
+#include "../vrcommon/vr_controller_models.h"
 
 // VR client state accessible from renderer
 extern vr_clientinfo_t vr;
@@ -2761,6 +2762,61 @@ static void vk_create_storage_buffer( uint32_t size )
 }
 
 
+static void vk_create_static_buffer( const byte *data, VkDeviceSize size, VkBuffer *buffer, VkDeviceMemory *memory )
+{
+	VkMemoryRequirements vb_mem_reqs;
+	VkMemoryAllocateInfo alloc_info;
+	VkBufferCreateInfo desc;
+	VkCommandBuffer command_buffer;
+	VkBufferCopy copyRegion[1];
+	VkDeviceSize uploadDone;
+
+	desc.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+	desc.pNext = NULL;
+	desc.flags = 0;
+	desc.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+	desc.queueFamilyIndexCount = 0;
+	desc.pQueueFamilyIndices = NULL;
+
+	// device-local buffer
+	desc.size = size;
+	desc.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
+	VK_CHECK( qvkCreateBuffer( vk.device, &desc, NULL, buffer ) );
+
+	// memory requirements
+	qvkGetBufferMemoryRequirements( vk.device, *buffer, &vb_mem_reqs );
+
+	alloc_info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+	alloc_info.pNext = NULL;
+	alloc_info.allocationSize = vb_mem_reqs.size;
+	alloc_info.memoryTypeIndex = find_memory_type( vb_mem_reqs.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT );
+	VK_CHECK( qvkAllocateMemory( vk.device, &alloc_info, NULL, memory ) );
+	qvkBindBufferMemory( vk.device, *buffer, *memory, 0 );
+
+	// staging buffers
+
+#ifdef USE_UPLOAD_QUEUE
+	vk_flush_staging_buffer( qfalse );
+#endif
+	// utilize existing staging buffer
+	uploadDone = 0;
+	while ( uploadDone < size ) {
+		VkDeviceSize uploadSize = vk.staging_buffer.size;
+		if ( uploadDone + uploadSize > size ) {
+			uploadSize = size - uploadDone;
+		}
+		memcpy(vk.staging_buffer.ptr + 0, data + uploadDone, uploadSize);
+		command_buffer = begin_command_buffer();
+		copyRegion[0].srcOffset = 0;
+		copyRegion[0].dstOffset = uploadDone;
+		copyRegion[0].size = uploadSize;
+		qvkCmdCopyBuffer( command_buffer, vk.staging_buffer.handle, *buffer, 1, &copyRegion[0] );
+		end_command_buffer( command_buffer, __func__ );
+		uploadDone += uploadSize;
+	}
+}
+
+
 #ifdef USE_VBO
 void vk_release_vbo( void )
 {
@@ -2776,64 +2832,9 @@ void vk_release_vbo( void )
 
 qboolean vk_alloc_vbo( const byte *vbo_data, int vbo_size )
 {
-	VkMemoryRequirements vb_mem_reqs;
-	VkMemoryAllocateInfo alloc_info;
-	VkBufferCreateInfo desc;
-	VkDeviceSize vertex_buffer_offset;
-	VkDeviceSize allocationSize;
-	uint32_t memory_type_bits;
-	VkCommandBuffer command_buffer;
-	VkBufferCopy copyRegion[1];
-	VkDeviceSize uploadDone;
-
 	vk_release_vbo();
 
-	desc.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-	desc.pNext = NULL;
-	desc.flags = 0;
-	desc.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-	desc.queueFamilyIndexCount = 0;
-	desc.pQueueFamilyIndices = NULL;
-
-	// device-local buffer
-	desc.size = vbo_size;
-	desc.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
-	VK_CHECK( qvkCreateBuffer( vk.device, &desc, NULL, &vk.vbo.vertex_buffer ) );
-
-	// memory requirements
-	qvkGetBufferMemoryRequirements( vk.device, vk.vbo.vertex_buffer, &vb_mem_reqs );
-	vertex_buffer_offset = 0;
-	allocationSize = vertex_buffer_offset + vb_mem_reqs.size;
-	memory_type_bits = vb_mem_reqs.memoryTypeBits;
-
-	alloc_info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-	alloc_info.pNext = NULL;
-	alloc_info.allocationSize = allocationSize;
-	alloc_info.memoryTypeIndex = find_memory_type( memory_type_bits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT );
-	VK_CHECK( qvkAllocateMemory( vk.device, &alloc_info, NULL, &vk.vbo.buffer_memory ) );
-	qvkBindBufferMemory( vk.device, vk.vbo.vertex_buffer, vk.vbo.buffer_memory, vertex_buffer_offset );
-
-	// staging buffers
-
-#ifdef USE_UPLOAD_QUEUE
-	vk_flush_staging_buffer( qfalse );
-#endif
-	// utilize existing staging buffer
-	uploadDone = 0;
-	while ( uploadDone < vbo_size ) {
-		VkDeviceSize uploadSize = vk.staging_buffer.size;
-		if ( uploadDone + uploadSize > vbo_size ) {
-			uploadSize = vbo_size - uploadDone;
-		}
-		memcpy(vk.staging_buffer.ptr + 0, vbo_data + uploadDone, uploadSize);
-		command_buffer = begin_command_buffer();
-		copyRegion[0].srcOffset = 0;
-		copyRegion[0].dstOffset = uploadDone;
-		copyRegion[0].size = uploadSize;
-		qvkCmdCopyBuffer( command_buffer, vk.staging_buffer.handle, vk.vbo.vertex_buffer, 1, &copyRegion[0] );
-		end_command_buffer( command_buffer, __func__ );
-		uploadDone += uploadSize;
-	}
+	vk_create_static_buffer( vbo_data, vbo_size, &vk.vbo.vertex_buffer, &vk.vbo.buffer_memory );
 
 	SET_OBJECT_NAME( vk.vbo.vertex_buffer, "static VBO", VK_DEBUG_REPORT_OBJECT_TYPE_BUFFER_EXT );
 	SET_OBJECT_NAME( vk.vbo.buffer_memory, "static VBO memory", VK_DEBUG_REPORT_OBJECT_TYPE_DEVICE_MEMORY_EXT );
@@ -3051,6 +3052,10 @@ static void vk_create_shader_modules( void )
 	vk.modules.floor_grid_fs = SHADER_MODULE( floor_grid_frag_spv );
 	vk.modules.vscreen_capture_vs = SHADER_MODULE( vscreen_capture_vert_spv );
 	vk.modules.vscreen_capture_fs = SHADER_MODULE( vscreen_capture_frag_spv );
+	vk.modules.vscreen_model_vs = SHADER_MODULE( vscreen_model_vert_spv );
+	vk.modules.vscreen_model_fs = SHADER_MODULE( vscreen_model_frag_spv );
+	SET_OBJECT_NAME( vk.modules.vscreen_model_vs, "virtual screen model vertex module", VK_DEBUG_REPORT_OBJECT_TYPE_SHADER_MODULE_EXT );
+	SET_OBJECT_NAME( vk.modules.vscreen_model_fs, "virtual screen model fragment module", VK_DEBUG_REPORT_OBJECT_TYPE_SHADER_MODULE_EXT );
 	SET_OBJECT_NAME( vk.modules.vscreen_vs, "virtual screen vertex module", VK_DEBUG_REPORT_OBJECT_TYPE_SHADER_MODULE_EXT );
 	SET_OBJECT_NAME( vk.modules.vscreen_fs, "virtual screen fragment module", VK_DEBUG_REPORT_OBJECT_TYPE_SHADER_MODULE_EXT );
 	SET_OBJECT_NAME( vk.modules.vscreen_reflect_fs, "virtual screen reflection fragment module", VK_DEBUG_REPORT_OBJECT_TYPE_SHADER_MODULE_EXT );
@@ -4785,6 +4790,8 @@ void vk_shutdown( refShutdownCode_t code )
 	qvkDestroyShaderModule(vk.device, vk.modules.floor_grid_fs, NULL);
 	qvkDestroyShaderModule(vk.device, vk.modules.vscreen_capture_vs, NULL);
 	qvkDestroyShaderModule(vk.device, vk.modules.vscreen_capture_fs, NULL);
+	qvkDestroyShaderModule(vk.device, vk.modules.vscreen_model_vs, NULL);
+	qvkDestroyShaderModule(vk.device, vk.modules.vscreen_model_fs, NULL);
 
 	// Null when the density map feature is absent, which vkDestroyShaderModule allows
 	qvkDestroyShaderModule(vk.device, vk.modules.final_composite_fov_fs, NULL);
@@ -4835,6 +4842,15 @@ void vk_release_resources( void ) {
 		qvkFreeMemory(vk.device, vk_world.image_chunks[i].memory, NULL);
 
 	vk_clean_staging_buffer();
+
+	for ( i = 0; i < (int)ARRAY_LEN( tr.xrAssets ); i++ ) {
+		if ( tr.xrAssets[i].buffer )
+			qvkDestroyBuffer( vk.device, tr.xrAssets[i].buffer, NULL );
+		if ( tr.xrAssets[i].memory )
+			qvkFreeMemory( vk.device, tr.xrAssets[i].memory, NULL );
+	}
+	Com_Memset( tr.xrAssets, 0, sizeof( tr.xrAssets ) );
+	Com_Memset( tr.xrModels, 0, sizeof( tr.xrModels ) );
 
 	// vk_destroy_samplers();
 
@@ -11372,6 +11388,14 @@ static void vk_destroy_virtual_screen( void )
 		qvkDestroyPipeline( vk.device, xr->floorGridPipeline, NULL );
 		xr->floorGridPipeline = VK_NULL_HANDLE;
 	}
+	if ( xr->vscreenModelPipeline != VK_NULL_HANDLE ) {
+		qvkDestroyPipeline( vk.device, xr->vscreenModelPipeline, NULL );
+		xr->vscreenModelPipeline = VK_NULL_HANDLE;
+	}
+	if ( xr->vscreenPointerPipeline != VK_NULL_HANDLE ) {
+		qvkDestroyPipeline( vk.device, xr->vscreenPointerPipeline, NULL );
+		xr->vscreenPointerPipeline = VK_NULL_HANDLE;
+	}
 	for ( i = 0; i < MAX_SWAPCHAIN_IMAGES; i++ ) {
 		if ( xr->vscreenFramebuffers[i] != VK_NULL_HANDLE ) {
 			qvkDestroyFramebuffer( vk.device, xr->vscreenFramebuffers[i], NULL );
@@ -11414,6 +11438,18 @@ static void vk_destroy_virtual_screen( void )
 		qvkFreeMemory( vk.device, xr->vscreenMemory, NULL );
 		xr->vscreenMemory = VK_NULL_HANDLE;
 	}
+	if ( xr->vscreenDepthView != VK_NULL_HANDLE ) {
+		qvkDestroyImageView( vk.device, xr->vscreenDepthView, NULL );
+		xr->vscreenDepthView = VK_NULL_HANDLE;
+	}
+	if ( xr->vscreenDepthImage != VK_NULL_HANDLE ) {
+		qvkDestroyImage( vk.device, xr->vscreenDepthImage, NULL );
+		xr->vscreenDepthImage = VK_NULL_HANDLE;
+	}
+	if ( xr->vscreenDepthMemory != VK_NULL_HANDLE ) {
+		qvkFreeMemory( vk.device, xr->vscreenDepthMemory, NULL );
+		xr->vscreenDepthMemory = VK_NULL_HANDLE;
+	}
 	// The pool-owned sets stay allocated: vk_create_virtual_screen rewrites them, a pool reset nulls them
 }
 
@@ -11433,11 +11469,18 @@ static VkPipeline vk_create_virtual_screen_pipeline( VkShaderModule fs, qboolean
 	VkViewport viewport;
 	VkRect2D scissor;
 	VkPipelineViewportStateCreateInfo viewportState;
+	VkPipelineDepthStencilStateCreateInfo depthStencil;
 	VkGraphicsPipelineCreateInfo ci;
 	VkPipeline pipeline = VK_NULL_HANDLE;
 
 	set_shader_stage_desc( &stages[0], VK_SHADER_STAGE_VERTEX_BIT, vk.modules.vscreen_vs, "main" );
 	set_shader_stage_desc( &stages[1], VK_SHADER_STAGE_FRAGMENT_BIT, fs, "main" );
+
+	// The pass carries depth for the controllers; the screen, its reflection and the floor neither test nor write it
+	Com_Memset( &depthStencil, 0, sizeof( depthStencil ) );
+	depthStencil.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+	depthStencil.depthCompareOp = VK_COMPARE_OP_ALWAYS;
+	depthStencil.maxDepthBounds = 1.0f;
 
 	binding.binding = 0;
 	binding.stride = 5 * sizeof( float );
@@ -11520,6 +11563,7 @@ static VkPipeline vk_create_virtual_screen_pipeline( VkShaderModule fs, qboolean
 	ci.pViewportState = &viewportState;
 	ci.pRasterizationState = &raster;
 	ci.pMultisampleState = &multisample;
+	ci.pDepthStencilState = &depthStencil;
 	ci.pColorBlendState = &blendState;
 	ci.layout = vk.pipeline_layout;
 	ci.renderPass = vk.render_pass.virtualScreen;
@@ -11531,6 +11575,196 @@ static VkPipeline vk_create_virtual_screen_pipeline( VkShaderModule fs, qboolean
 	}
 	SET_OBJECT_NAME( pipeline, name, VK_DEBUG_REPORT_OBJECT_TYPE_PIPELINE_EXT );
 	return pipeline;
+}
+
+
+// Triangle lists of position, color and texture coordinate. Controller parts take the three from separate
+// streams (static positions and coordinates, colors made each frame), are opaque and write depth; the
+// pointers interleave them, blend and only test.
+static VkPipeline vk_create_virtual_screen_model_pipeline( qboolean pointer, const char *name )
+{
+	VkXrResources *xr = &vk.xr;
+	VkPipelineShaderStageCreateInfo stages[2];
+	VkVertexInputBindingDescription bindings[3];
+	VkVertexInputAttributeDescription attrs[3];
+	VkPipelineVertexInputStateCreateInfo vertexInput;
+	VkPipelineInputAssemblyStateCreateInfo inputAssembly;
+	VkPipelineRasterizationStateCreateInfo raster;
+	VkPipelineMultisampleStateCreateInfo multisample;
+	VkPipelineDepthStencilStateCreateInfo depthStencil;
+	VkPipelineColorBlendAttachmentState attachmentBlend;
+	VkPipelineColorBlendStateCreateInfo blendState;
+	VkViewport viewport;
+	VkRect2D scissor;
+	VkPipelineViewportStateCreateInfo viewportState;
+	VkGraphicsPipelineCreateInfo ci;
+	VkPipeline pipeline = VK_NULL_HANDLE;
+	int i;
+
+	set_shader_stage_desc( &stages[0], VK_SHADER_STAGE_VERTEX_BIT, vk.modules.vscreen_model_vs, "main" );
+	set_shader_stage_desc( &stages[1], VK_SHADER_STAGE_FRAGMENT_BIT, vk.modules.vscreen_model_fs, "main" );
+
+	for ( i = 0; i < 3; i++ ) {
+		bindings[i].binding = i;
+		bindings[i].inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+		attrs[i].location = i;
+		attrs[i].binding = pointer ? 0 : i;
+		attrs[i].offset = 0;
+	}
+	attrs[0].format = VK_FORMAT_R32G32B32_SFLOAT;
+	attrs[1].format = VK_FORMAT_R8G8B8A8_UNORM;
+	attrs[2].format = VK_FORMAT_R32G32_SFLOAT;
+	if ( pointer ) {
+		bindings[0].stride = 3 * sizeof( float ) + 4 + 2 * sizeof( float );
+		attrs[1].offset = 3 * sizeof( float );
+		attrs[2].offset = 3 * sizeof( float ) + 4;
+	} else {
+		// VR_ModelPack: positions carry a fourth float
+		bindings[0].stride = 4 * sizeof( float );
+		bindings[1].stride = 4;
+		bindings[2].stride = 2 * sizeof( float );
+	}
+
+	Com_Memset( &vertexInput, 0, sizeof( vertexInput ) );
+	vertexInput.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+	vertexInput.vertexBindingDescriptionCount = pointer ? 1 : 3;
+	vertexInput.pVertexBindingDescriptions = bindings;
+	vertexInput.vertexAttributeDescriptionCount = 3;
+	vertexInput.pVertexAttributeDescriptions = attrs;
+
+	Com_Memset( &inputAssembly, 0, sizeof( inputAssembly ) );
+	inputAssembly.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+	inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+
+	// Both sides of every triangle draw; the depth buffer orders them
+	Com_Memset( &raster, 0, sizeof( raster ) );
+	raster.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+	raster.polygonMode = VK_POLYGON_MODE_FILL;
+	raster.cullMode = VK_CULL_MODE_NONE;
+	raster.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+	raster.lineWidth = 1.0f;
+
+	Com_Memset( &multisample, 0, sizeof( multisample ) );
+	multisample.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+	multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+	multisample.minSampleShading = 1.0f;
+
+	// VR_VirtualScreen_GetDraw's projection puts the near plane at depth 0
+	Com_Memset( &depthStencil, 0, sizeof( depthStencil ) );
+	depthStencil.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+	depthStencil.depthTestEnable = VK_TRUE;
+	depthStencil.depthWriteEnable = pointer ? VK_FALSE : VK_TRUE;
+	depthStencil.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
+	depthStencil.maxDepthBounds = 1.0f;
+
+	// Alpha stays at the clear's 1: the projection layer blends by source alpha
+	Com_Memset( &attachmentBlend, 0, sizeof( attachmentBlend ) );
+	attachmentBlend.blendEnable = pointer ? VK_TRUE : VK_FALSE;
+	attachmentBlend.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+	attachmentBlend.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+	attachmentBlend.colorBlendOp = VK_BLEND_OP_ADD;
+	attachmentBlend.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+	attachmentBlend.dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
+	attachmentBlend.alphaBlendOp = VK_BLEND_OP_ADD;
+	attachmentBlend.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT;
+
+	Com_Memset( &blendState, 0, sizeof( blendState ) );
+	blendState.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+	blendState.attachmentCount = 1;
+	blendState.pAttachments = &attachmentBlend;
+
+	viewport.x = 0.0f;
+	viewport.y = 0.0f;
+	viewport.width = (float)xr->width;
+	viewport.height = (float)xr->height;
+	viewport.minDepth = 0.0f;
+	viewport.maxDepth = 1.0f;
+	scissor.offset.x = 0;
+	scissor.offset.y = 0;
+	scissor.extent.width = xr->width;
+	scissor.extent.height = xr->height;
+
+	Com_Memset( &viewportState, 0, sizeof( viewportState ) );
+	viewportState.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+	viewportState.viewportCount = 1;
+	viewportState.pViewports = &viewport;
+	viewportState.scissorCount = 1;
+	viewportState.pScissors = &scissor;
+
+	Com_Memset( &ci, 0, sizeof( ci ) );
+	ci.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+	ci.stageCount = 2;
+	ci.pStages = stages;
+	ci.pVertexInputState = &vertexInput;
+	ci.pInputAssemblyState = &inputAssembly;
+	ci.pViewportState = &viewportState;
+	ci.pRasterizationState = &raster;
+	ci.pMultisampleState = &multisample;
+	ci.pDepthStencilState = &depthStencil;
+	ci.pColorBlendState = &blendState;
+	ci.layout = vk.pipeline_layout;
+	ci.renderPass = vk.render_pass.virtualScreen;
+	ci.subpass = 0;
+	ci.basePipelineIndex = -1;
+
+	if ( qvkCreateGraphicsPipelines( vk.device, vk.pipelineCache, 1, &ci, NULL, &pipeline ) != VK_SUCCESS ) {
+		return VK_NULL_HANDLE;
+	}
+	SET_OBJECT_NAME( pipeline, name, VK_DEBUG_REPORT_OBJECT_TYPE_PIPELINE_EXT );
+	return pipeline;
+}
+
+
+// Both eyes' depth for the screen pass. Transient, so a tiler keeps it in tile memory and backs it with nothing.
+static void vk_create_virtual_screen_depth( void )
+{
+	VkXrResources *xr = &vk.xr;
+	VkImageCreateInfo imageCI;
+	VkMemoryRequirements memReqs;
+	VkMemoryAllocateInfo allocInfo;
+	VkImageViewCreateInfo viewCI;
+
+	Com_Memset( &imageCI, 0, sizeof( imageCI ) );
+	imageCI.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+	imageCI.imageType = VK_IMAGE_TYPE_2D;
+	imageCI.format = vk.depth_format;
+	imageCI.extent.width = xr->width;
+	imageCI.extent.height = xr->height;
+	imageCI.extent.depth = 1;
+	imageCI.mipLevels = 1;
+	imageCI.arrayLayers = 2;
+	imageCI.samples = VK_SAMPLE_COUNT_1_BIT;
+	imageCI.tiling = VK_IMAGE_TILING_OPTIMAL;
+	imageCI.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT;
+	imageCI.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+	imageCI.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+	VK_CHECK( qvkCreateImage( vk.device, &imageCI, NULL, &xr->vscreenDepthImage ) );
+	SET_OBJECT_NAME( xr->vscreenDepthImage, "virtual screen depth", VK_DEBUG_REPORT_OBJECT_TYPE_IMAGE_EXT );
+
+	qvkGetImageMemoryRequirements( vk.device, xr->vscreenDepthImage, &memReqs );
+	Com_Memset( &allocInfo, 0, sizeof( allocInfo ) );
+	allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+	allocInfo.allocationSize = memReqs.size;
+	allocInfo.memoryTypeIndex = find_memory_type2( memReqs.memoryTypeBits,
+		VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT, NULL );
+	if ( allocInfo.memoryTypeIndex == ~0U ) {
+		allocInfo.memoryTypeIndex = find_memory_type( memReqs.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT );
+	}
+	VK_CHECK( qvkAllocateMemory( vk.device, &allocInfo, NULL, &xr->vscreenDepthMemory ) );
+	VK_CHECK( qvkBindImageMemory( vk.device, xr->vscreenDepthImage, xr->vscreenDepthMemory, 0 ) );
+
+	Com_Memset( &viewCI, 0, sizeof( viewCI ) );
+	viewCI.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+	viewCI.image = xr->vscreenDepthImage;
+	viewCI.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+	viewCI.format = vk.depth_format;
+	viewCI.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+	if ( glConfig.stencilBits > 0 ) {
+		viewCI.subresourceRange.aspectMask |= VK_IMAGE_ASPECT_STENCIL_BIT;
+	}
+	viewCI.subresourceRange.levelCount = 1;
+	viewCI.subresourceRange.layerCount = 2;
+	VK_CHECK( qvkCreateImageView( vk.device, &viewCI, NULL, &xr->vscreenDepthView ) );
 }
 
 
@@ -11674,7 +11908,10 @@ static qboolean vk_create_virtual_screen( void )
 	VkImageViewCreateInfo viewCI;
 	VkSamplerCreateInfo samplerCI;
 	VkAttachmentDescription attachment;
+	VkAttachmentDescription screenAttachments[2];
+	VkImageView screenViews[2];
 	VkAttachmentReference colorRef;
+	VkAttachmentReference depthRef;
 	VkSubpassDescription subpass;
 	VkSubpassDependency deps[2];
 	VkRenderPassCreateInfo capturePassCI;
@@ -11842,18 +12079,38 @@ static qboolean vk_create_virtual_screen( void )
 	colorRef.attachment = 0;
 	colorRef.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
 
+	// Cleared each frame and thrown away: it only orders the controllers and their rays within the pass
+	vk_create_virtual_screen_depth();
+	screenAttachments[0] = attachment;
+	Com_Memset( &screenAttachments[1], 0, sizeof( screenAttachments[1] ) );
+	screenAttachments[1].format = vk.depth_format;
+	screenAttachments[1].samples = VK_SAMPLE_COUNT_1_BIT;
+	screenAttachments[1].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+	screenAttachments[1].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+	screenAttachments[1].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+	screenAttachments[1].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+	screenAttachments[1].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+	screenAttachments[1].finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+	depthRef.attachment = 1;
+	depthRef.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+
 	Com_Memset( &subpass, 0, sizeof( subpass ) );
 	subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
 	subpass.colorAttachmentCount = 1;
 	subpass.pColorAttachments = &colorRef;
+	subpass.pDepthStencilAttachment = &depthRef;
 
-	// Waits for the capture's reads of layer 0 and the mip blits' writes to the screen image
+	// Waits for the capture's reads of layer 0, the mip blits' writes to the screen image and the last
+	// frame's use of the depth image
 	deps[0].srcSubpass = VK_SUBPASS_EXTERNAL;
 	deps[0].dstSubpass = 0;
-	deps[0].srcStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
-	deps[0].dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-	deps[0].srcAccessMask = 0;
-	deps[0].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+	deps[0].srcStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT |
+		VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+	deps[0].dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+		VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+	deps[0].srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+	deps[0].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+		VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
 	deps[0].dependencyFlags = 0;
 	deps[1].srcSubpass = 0;
 	deps[1].dstSubpass = VK_SUBPASS_EXTERNAL;
@@ -11873,8 +12130,8 @@ static qboolean vk_create_virtual_screen( void )
 	Com_Memset( &passCI, 0, sizeof( passCI ) );
 	passCI.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
 	passCI.pNext = &multiview;
-	passCI.attachmentCount = 1;
-	passCI.pAttachments = &attachment;
+	passCI.attachmentCount = 2;
+	passCI.pAttachments = screenAttachments;
 	passCI.subpassCount = 1;
 	passCI.pSubpasses = &subpass;
 	passCI.dependencyCount = 2;
@@ -11885,9 +12142,11 @@ static qboolean vk_create_virtual_screen( void )
 	for ( i = 0; i < xr->colorInfo->imageCount && i < MAX_SWAPCHAIN_IMAGES; i++ ) {
 		Com_Memset( &fbCI, 0, sizeof( fbCI ) );
 		fbCI.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+		screenViews[0] = xr->gammaViews[i];
+		screenViews[1] = xr->vscreenDepthView;
 		fbCI.renderPass = vk.render_pass.virtualScreen;
-		fbCI.attachmentCount = 1;
-		fbCI.pAttachments = &xr->gammaViews[i];
+		fbCI.attachmentCount = 2;
+		fbCI.pAttachments = screenViews;
 		fbCI.width = xr->width;
 		fbCI.height = xr->height;
 		fbCI.layers = 1;
@@ -11899,8 +12158,11 @@ static qboolean vk_create_virtual_screen( void )
 	xr->vscreenReflectPipeline = vk_create_virtual_screen_pipeline( vk.modules.vscreen_reflect_fs, qtrue, "virtual screen reflection pipeline" );
 	xr->floorGridPipeline = vk_create_virtual_screen_pipeline( vk.modules.floor_grid_fs, qtrue, "floor grid pipeline" );
 	xr->vscreenCapturePipeline = vk_create_virtual_screen_capture_pipeline();
+	xr->vscreenModelPipeline = vk_create_virtual_screen_model_pipeline( qfalse, "virtual screen controller pipeline" );
+	xr->vscreenPointerPipeline = vk_create_virtual_screen_model_pipeline( qtrue, "virtual screen pointer pipeline" );
 	if ( xr->vscreenPipeline == VK_NULL_HANDLE || xr->vscreenReflectPipeline == VK_NULL_HANDLE ||
-		xr->floorGridPipeline == VK_NULL_HANDLE || xr->vscreenCapturePipeline == VK_NULL_HANDLE ) {
+		xr->floorGridPipeline == VK_NULL_HANDLE || xr->vscreenCapturePipeline == VK_NULL_HANDLE ||
+		xr->vscreenModelPipeline == VK_NULL_HANDLE || xr->vscreenPointerPipeline == VK_NULL_HANDLE ) {
 		vk_destroy_virtual_screen();
 		return qfalse;
 	}
@@ -12069,17 +12331,27 @@ static void vk_capture_virtual_screen( void )
 
 
 // Vertices go in the frame's ring: nothing to rebuild when the curvature slider moves
-static uint32_t vk_virtual_screen_vertices( const float *vertices, uint32_t floatCount )
+static uint32_t vk_virtual_screen_reserve( uint32_t size )
 {
-	const uint32_t size = floatCount * sizeof( float );
 	const uint32_t offset = PAD( vk.cmd->vertex_buffer_offset, 16 );
 
 	if ( offset + size > vk.geometry_buffer_size ) {
 		vk.geometry_buffer_size_new = log2pad( offset + size, 1 );
 		return ~0U;
 	}
-	Com_Memcpy( vk.cmd->vertex_buffer_ptr + offset, vertices, size );
 	vk.cmd->vertex_buffer_offset = offset + size;
+	return offset;
+}
+
+
+static uint32_t vk_virtual_screen_vertices( const float *vertices, uint32_t floatCount )
+{
+	const uint32_t size = floatCount * sizeof( float );
+	const uint32_t offset = vk_virtual_screen_reserve( size );
+
+	if ( offset != ~0U ) {
+		Com_Memcpy( vk.cmd->vertex_buffer_ptr + offset, vertices, size );
+	}
 	return offset;
 }
 
@@ -12120,6 +12392,347 @@ static void vk_draw_virtual_screen_mesh( VkPipeline pipeline, const float model[
 }
 
 
+#define VSCREEN_MODEL_IMAGES		16
+#define VSCREEN_MODEL_TEXTURE_MAX	2048
+#define VSCREEN_POOL_SEGMENTS	20
+#define VSCREEN_POOL_RINGS		3
+#define VSCREEN_POINTER_VERTICES	( 12 + ( 2 * VSCREEN_POOL_RINGS - 1 ) * VSCREEN_POOL_SEGMENTS * 3 )
+
+// One of an asset's base color textures; the white image when it won't decode. The decoded pixels stay with
+// the model, so a renderer restart only uploads them again; a width below zero marks a failure.
+static image_t *vk_virtual_screen_model_image( const vkXRModel_t *model, int asset, int index )
+{
+	vrModelImage_t *source = &model->model.images[index];
+	char name[MAX_QPATH];
+	image_t *image;
+
+	Com_sprintf( name, sizeof( name ), "*xrmodel%d_%d", asset, index );
+	if ( !source->pixels && !source->width ) {
+		byte *pic = NULL;
+		int width = 0, height = 0, i, count = 0;
+
+		source->width = -1;
+		// Decoding takes several times the pixels in zone and hunk memory, so the header's size is checked first
+		if ( VR_ModelImageSize( source, &width, &height ) && width > 0 && height > 0 &&
+			width <= VSCREEN_MODEL_TEXTURE_MAX && height <= VSCREEN_MODEL_TEXTURE_MAX ) {
+			if ( source->jpeg ) {
+				R_DecodeJPG( name, source->data, source->size, &pic, &width, &height );
+			} else {
+				R_DecodePNG( name, source->data, source->size, &pic, &width, &height );
+			}
+		}
+		if ( pic && width > 0 && height > 0 && width <= VSCREEN_MODEL_TEXTURE_MAX && height <= VSCREEN_MODEL_TEXTURE_MAX ) {
+			count = width * height;
+			source->pixels = VR_ControllerModel_Alloc( (size_t)count * 4 );
+		}
+		if ( source->pixels ) {
+			Com_Memcpy( source->pixels, pic, (size_t)count * 4 );
+			// glTF's opaque and masked materials ignore whatever the texture's alpha holds
+			for ( i = 0; i < count; i++ ) {
+				source->pixels[i * 4 + 3] = 255;
+			}
+			source->width = width;
+			source->height = height;
+		} else {
+			ri.Printf( PRINT_WARNING, "OpenXR controller model texture %d did not decode; drawing it untextured\n", index );
+		}
+		if ( pic ) {
+			ri.Free( pic );
+		}
+	}
+	if ( !source->pixels ) {
+		return tr.whiteImage;
+	}
+	image = R_CreateImage( name, NULL, source->pixels, source->width, source->height,
+		IMGFLAG_MIPMAP | IMGFLAG_NOLIGHTSCALE | IMGFLAG_NO_COMPRESSION );
+	return image ? image : tr.whiteImage;
+}
+
+
+// The textures and static geometry for one asset. Each material's color is already in its vertices.
+static void vk_virtual_screen_model_asset( const vkXRModel_t *model, int asset )
+{
+	const size_t size = VR_ModelPack( &model->model, NULL, NULL );
+	int i, m;
+
+	if ( size ) {
+		byte *packed;
+
+		// Hunk memory goes with the rest of tr at the next renderer restart
+		tr.xrAssets[asset].offsets = ri.Hunk_Alloc( model->model.primitiveCount * sizeof( unsigned ), h_low );
+		packed = ri.Hunk_AllocateTempMemory( (int)size );
+		VR_ModelPack( &model->model, packed, tr.xrAssets[asset].offsets );
+		vk_create_static_buffer( packed, size, &tr.xrAssets[asset].buffer, &tr.xrAssets[asset].memory );
+		ri.Hunk_FreeTempMemory( packed );
+		SET_OBJECT_NAME( tr.xrAssets[asset].buffer, "controller model geometry", VK_DEBUG_REPORT_OBJECT_TYPE_BUFFER_EXT );
+	}
+	Com_Memcpy( tr.xrAssets[asset].cacheId, model->cacheId, sizeof( tr.xrAssets[asset].cacheId ) );
+	tr.xrAssets[asset].packed = size;
+	for ( i = 0; i < VSCREEN_MODEL_IMAGES; i++ ) {
+		// Only a texture some material draws with is decoded
+		for ( m = 0; m < model->model.materialCount && model->model.materials[m].image != i; m++ )
+			;
+		tr.xrAssets[asset].images[i] = i < model->model.imageCount && m < model->model.materialCount ?
+			vk_virtual_screen_model_image( model, asset, i ) : NULL;
+	}
+	tr.xrAssets[asset].loaded = qtrue;
+}
+
+
+// Frontend, once a frame: makes sure whichever models are loaded have their drawing resources
+void vk_prepare_xr_models( void )
+{
+	int slot, asset;
+	qboolean busy;
+
+	if ( !tr.registered || vk.render_pass.virtualScreen == VK_NULL_HANDLE ) {
+		return;
+	}
+	// Fetching a model, decoding a texture and uploading one each stall the frame: one of them a frame
+	busy = VR_ControllerModels_Busy();
+	for ( slot = 0; slot < VK_XR_MODELS_MAX; slot++ ) {
+		const vkXRModel_t *model = VR_ControllerModel( slot );
+
+		if ( !model ) {
+			tr.xrModels[slot].serial = 0;
+			continue;
+		}
+		if ( tr.xrModels[slot].serial == model->serial ) {
+			continue;
+		}
+		// A controller that slept and woke brings the same asset back under a new model; the size is
+		// compared too, for a runtime that gives different files one ID
+		for ( asset = 0; asset < (int)ARRAY_LEN( tr.xrAssets ); asset++ ) {
+			if ( tr.xrAssets[asset].loaded &&
+				!memcmp( tr.xrAssets[asset].cacheId, model->cacheId, sizeof( model->cacheId ) ) &&
+				tr.xrAssets[asset].packed == VR_ModelPack( &model->model, NULL, NULL ) ) {
+				break;
+			}
+		}
+		if ( asset == (int)ARRAY_LEN( tr.xrAssets ) ) {
+			for ( asset = 0; asset < (int)ARRAY_LEN( tr.xrAssets ) && tr.xrAssets[asset].loaded; asset++ )
+				;
+			if ( asset == (int)ARRAY_LEN( tr.xrAssets ) ) {
+				ri.Printf( PRINT_WARNING, "OpenXR controller model not drawn: %d different models are already loaded\n", asset );
+				asset = -1;
+			} else if ( busy ) {
+				continue;
+			} else {
+				vk_virtual_screen_model_asset( model, asset );
+				busy = qtrue;
+			}
+		}
+		tr.xrModels[slot].serial = model->serial;
+		tr.xrModels[slot].asset = asset;
+	}
+}
+
+
+// Each part draws from the asset's static buffer under its node's matrix; only its headlight colors, four
+// bytes a vertex, are made each frame.
+static void vk_draw_virtual_screen_models( void )
+{
+	static float world[VR_MODEL_MAX_NODES * 16];
+	static unsigned char visible[VR_MODEL_MAX_NODES];
+	VkXrResources *xr = &vk.xr;
+	qboolean bound = qfalse;
+	float eye[3];
+	int slot, n, p;
+
+	VR_VirtualScreen_Head( eye );
+	for ( slot = 0; slot < VK_XR_MODELS_MAX; slot++ ) {
+		const vkXRModel_t *model = VR_ControllerModel( slot );
+		const vrModel_t *m;
+		int asset;
+
+		if ( !model || !model->drawable || tr.xrModels[slot].serial != model->serial || tr.xrModels[slot].asset < 0 ) {
+			continue;
+		}
+		asset = tr.xrModels[slot].asset;
+		m = &model->model;
+		if ( !tr.xrAssets[asset].buffer ) {
+			continue;
+		}
+		VR_ModelPose( m, &model->root, model->states, model->map, model->nodeCount, world, visible );
+		for ( n = 0; n < m->nodeCount; n++ ) {
+			const vrModelMesh_t *mesh;
+
+			if ( m->nodes[n].mesh < 0 || m->nodes[n].mesh >= m->meshCount || !visible[n] ) {
+				continue;
+			}
+			mesh = &m->meshes[m->nodes[n].mesh];
+			for ( p = mesh->firstPrimitive; p < mesh->firstPrimitive + mesh->primitiveCount; p++ ) {
+				const vrModelPrimitive_t *primitive = &m->primitives[p];
+				const int index = m->materials[primitive->material].image;
+				const image_t *image = index >= 0 && index < VSCREEN_MODEL_IMAGES && tr.xrAssets[asset].images[index] ?
+					tr.xrAssets[asset].images[index] : tr.whiteImage;
+				const VkDeviceSize start = tr.xrAssets[asset].offsets[p];
+				VkBuffer buffers[3];
+				VkDeviceSize offsets[3];
+				uint32_t colors;
+
+				// A primitive without a triangle has no indices to bind
+				if ( primitive->indexCount < 3 ) {
+					continue;
+				}
+				// A full ring ends the controllers here; the next frame resizes the ring and is dropped
+				colors = vk_virtual_screen_reserve( primitive->vertexCount * 4 );
+				if ( colors == ~0U ) {
+					return;
+				}
+				VR_ModelShade( m, p, world + n * 16, eye, vk.cmd->vertex_buffer_ptr + colors );
+				buffers[0] = buffers[2] = tr.xrAssets[asset].buffer;
+				buffers[1] = vk.cmd->vertex_buffer;
+				offsets[0] = start;
+				offsets[1] = colors;
+				offsets[2] = start + VR_MODEL_PACK_ST( primitive->vertexCount );
+				if ( !bound ) {
+					qvkCmdBindPipeline( vk.cmd->command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, xr->vscreenModelPipeline );
+					bound = qtrue;
+				}
+				qvkCmdPushConstants( vk.cmd->command_buffer, vk.pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT, 0, 64, world + n * 16 );
+				qvkCmdBindDescriptorSets( vk.cmd->command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+					vk.pipeline_layout, 1, 1, &image->descriptor, 0, NULL );
+				qvkCmdBindVertexBuffers( vk.cmd->command_buffer, 0, 3, buffers, offsets );
+				qvkCmdBindIndexBuffer( vk.cmd->command_buffer, tr.xrAssets[asset].buffer,
+					start + VR_MODEL_PACK_INDEX( primitive->vertexCount ), VK_INDEX_TYPE_UINT32 );
+				qvkCmdDrawIndexed( vk.cmd->command_buffer, primitive->indexCount, 1, 0, 0, 0 );
+			}
+		}
+	}
+}
+
+
+typedef struct {
+	float xyz[3];
+	byte rgba[4];
+	float st[2];
+} vscreenPointerVertex_t;
+
+static vscreenPointerVertex_t *vk_virtual_screen_pointer_vertex( vscreenPointerVertex_t *v, const float *xyz,
+	const byte *rgb, byte alpha )
+{
+	VectorCopy( xyz, v->xyz );
+	v->rgba[0] = rgb[0];
+	v->rgba[1] = rgb[1];
+	v->rgba[2] = rgb[2];
+	v->rgba[3] = alpha;
+	v->st[0] = v->st[1] = 0.0f;
+	return v + 1;
+}
+
+
+// Each hand's pointer: a strip along its ray turned toward the head and, while it is on the screen, its cursor as a
+// pool of light. Both depth-test against the controllers, so they draw after them.
+static void vk_draw_virtual_screen_pointers( void )
+{
+	static const float identity[16] = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1 };
+	// The pointer's red and the blue it takes on instead, each ring of the pool's radius as a share of the screen's
+	// height, and the pool's colors from its center out
+	static const byte rays[2][3] = { { 255, 48, 40 }, { 77, 128, 255 } };
+	static const float radius[VSCREEN_POOL_RINGS] = { 0.0035f, 0.008f, 0.017f };
+	static const byte pools[2][VSCREEN_POOL_RINGS + 1][4] = {
+		{ { 255, 190, 170, 255 }, { 255, 64, 52, 230 }, { 255, 48, 40, 110 }, { 255, 48, 40, 0 } },
+		{ { 170, 200, 255, 255 }, { 90, 140, 255, 230 }, { 77, 128, 255, 110 }, { 77, 128, 255, 0 } } };
+	static vscreenPointerVertex_t vertices[2 * VSCREEN_POINTER_VERTICES];
+	VkXrResources *xr = &vk.xr;
+	vscreenPointerVertex_t *v = vertices;
+	const float height = VR_VirtualScreen_Height();
+	VkDeviceSize vertexOffset;
+	uint32_t offset, size;
+	float eye[3];
+	int hand, i, ring;
+
+	VR_VirtualScreen_Head( eye );
+	for ( hand = 0; hand < 2; hand++ ) {
+		const vrScreenPointer_t *pointer = VR_VirtualScreen_Pointer( hand );
+		vec3_t along, toEye, side, knee, ringPoint[VSCREEN_POOL_RINGS][VSCREEN_POOL_SEGMENTS];
+		const byte *rgb, ( *color )[4];
+
+		if ( !pointer ) {
+			continue;
+		}
+		rgb = rays[pointer->blue ? 1 : 0];
+		color = pools[pointer->blue ? 1 : 0];
+		VectorSubtract( pointer->end, pointer->origin, along );
+		VectorSubtract( eye, pointer->origin, toEye );
+		CrossProduct( along, toEye, side );
+		if ( VectorNormalize( side ) >= 0.000001f ) {
+			// Two strips: most of the fade happens by the knee, a third of the way out, and a faint tail reaches the pool
+			vec3_t corner[6];
+
+			VectorMA( pointer->origin, 0.3f, along, knee );
+			for ( i = 0; i < 3; i++ ) {
+				corner[0][i] = pointer->origin[i] + side[i] * 0.001f;
+				corner[1][i] = pointer->origin[i] - side[i] * 0.001f;
+				corner[2][i] = knee[i] - side[i] * 0.0015f;
+				corner[3][i] = knee[i] + side[i] * 0.0015f;
+				corner[4][i] = pointer->end[i] - side[i] * 0.0025f;
+				corner[5][i] = pointer->end[i] + side[i] * 0.0025f;
+			}
+			v = vk_virtual_screen_pointer_vertex( v, corner[0], rgb, 220 );
+			v = vk_virtual_screen_pointer_vertex( v, corner[1], rgb, 220 );
+			v = vk_virtual_screen_pointer_vertex( v, corner[3], rgb, 60 );
+			v = vk_virtual_screen_pointer_vertex( v, corner[3], rgb, 60 );
+			v = vk_virtual_screen_pointer_vertex( v, corner[1], rgb, 220 );
+			v = vk_virtual_screen_pointer_vertex( v, corner[2], rgb, 60 );
+			v = vk_virtual_screen_pointer_vertex( v, corner[3], rgb, 60 );
+			v = vk_virtual_screen_pointer_vertex( v, corner[2], rgb, 60 );
+			v = vk_virtual_screen_pointer_vertex( v, corner[5], rgb, 20 );
+			v = vk_virtual_screen_pointer_vertex( v, corner[5], rgb, 20 );
+			v = vk_virtual_screen_pointer_vertex( v, corner[2], rgb, 60 );
+			v = vk_virtual_screen_pointer_vertex( v, corner[4], rgb, 20 );
+		}
+
+		if ( !pointer->pool ) {
+			continue;
+		}
+		// The pool lies in the screen's surface: across is the screen's own tangent there, up is the world's
+		for ( ring = 0; ring < VSCREEN_POOL_RINGS; ring++ ) {
+			const float r = radius[ring] * height;
+
+			for ( i = 0; i < VSCREEN_POOL_SEGMENTS; i++ ) {
+				const float angle = i * ( 2 * (float)M_PI / VSCREEN_POOL_SEGMENTS );
+
+				VectorMA( pointer->poolPoint, r * cosf( angle ), pointer->poolSide, ringPoint[ring][i] );
+				ringPoint[ring][i][1] += r * sinf( angle );
+			}
+		}
+		for ( i = 0; i < VSCREEN_POOL_SEGMENTS; i++ ) {
+			const int next = ( i + 1 ) % VSCREEN_POOL_SEGMENTS;
+
+			v = vk_virtual_screen_pointer_vertex( v, pointer->poolPoint, color[0], color[0][3] );
+			v = vk_virtual_screen_pointer_vertex( v, ringPoint[0][i], color[1], color[1][3] );
+			v = vk_virtual_screen_pointer_vertex( v, ringPoint[0][next], color[1], color[1][3] );
+			for ( ring = 1; ring < VSCREEN_POOL_RINGS; ring++ ) {
+				v = vk_virtual_screen_pointer_vertex( v, ringPoint[ring - 1][i], color[ring], color[ring][3] );
+				v = vk_virtual_screen_pointer_vertex( v, ringPoint[ring][i], color[ring + 1], color[ring + 1][3] );
+				v = vk_virtual_screen_pointer_vertex( v, ringPoint[ring - 1][next], color[ring], color[ring][3] );
+				v = vk_virtual_screen_pointer_vertex( v, ringPoint[ring - 1][next], color[ring], color[ring][3] );
+				v = vk_virtual_screen_pointer_vertex( v, ringPoint[ring][i], color[ring + 1], color[ring + 1][3] );
+				v = vk_virtual_screen_pointer_vertex( v, ringPoint[ring][next], color[ring + 1], color[ring + 1][3] );
+			}
+		}
+	}
+	if ( v == vertices ) {
+		return;
+	}
+	size = (uint32_t)( (byte *)v - (byte *)vertices );
+	offset = vk_virtual_screen_reserve( size );
+	if ( offset == ~0U ) {
+		return;
+	}
+	Com_Memcpy( vk.cmd->vertex_buffer_ptr + offset, vertices, size );
+	vertexOffset = offset;
+	qvkCmdBindPipeline( vk.cmd->command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, xr->vscreenPointerPipeline );
+	qvkCmdPushConstants( vk.cmd->command_buffer, vk.pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT, 0, 64, identity );
+	qvkCmdBindDescriptorSets( vk.cmd->command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+		vk.pipeline_layout, 1, 1, &tr.whiteImage->descriptor, 0, NULL );
+	qvkCmdBindVertexBuffers( vk.cmd->command_buffer, 0, 1, &vk.cmd->vertex_buffer, &vertexOffset );
+	qvkCmdDraw( vk.cmd->command_buffer, size / sizeof( vscreenPointerVertex_t ), 1, 0, 0 );
+}
+
+
 /*
  * vk_render_virtual_screen - on screen frames, redraw the finished frame as the virtual screen
  *
@@ -12139,7 +12752,7 @@ static void vk_render_virtual_screen( void )
 	float savedEyeProj[2][16];
 	uint32_t eyeProjOffset, floorOffset, screenOffset, reflectOffset, screenCount, reflectCount;
 	VkRenderPassBeginInfo begin;
-	VkClearValue clear;
+	VkClearValue clear[2];
 	qboolean ready;
 
 	if ( !VR_VirtualScreen_GetDraw( &draw ) ) {
@@ -12170,16 +12783,17 @@ static void vk_render_virtual_screen( void )
 		floorOffset = vk_virtual_screen_vertices( floorQuad, ARRAY_LEN( floorQuad ) );
 	}
 
-	Com_Memset( &clear, 0, sizeof( clear ) );
-	clear.color.float32[3] = 1.0f;
+	Com_Memset( clear, 0, sizeof( clear ) );
+	clear[0].color.float32[3] = 1.0f;
+	clear[1].depthStencil.depth = 1.0f;
 	Com_Memset( &begin, 0, sizeof( begin ) );
 	begin.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
 	begin.renderPass = vk.render_pass.virtualScreen;
 	begin.framebuffer = xr->vscreenFramebuffers[xr->colorIndex];
 	begin.renderArea.extent.width = xr->width;
 	begin.renderArea.extent.height = xr->height;
-	begin.clearValueCount = 1;
-	begin.pClearValues = &clear;
+	begin.clearValueCount = 2;
+	begin.pClearValues = clear;
 	qvkCmdBeginRenderPass( vk.cmd->command_buffer, &begin, VK_SUBPASS_CONTENTS_INLINE );
 
 	// A full ring clears to black and skips the draws; the next frame resizes the ring and is dropped
@@ -12192,6 +12806,9 @@ static void vk_render_virtual_screen( void )
 		vk_draw_virtual_screen_mesh( xr->vscreenReflectPipeline, draw.reflectModel, reflectOffset, reflectCount );
 		vk_draw_virtual_screen_mesh( xr->floorGridPipeline, draw.floorModel, floorOffset, 4 );
 		vk_draw_virtual_screen_mesh( xr->vscreenPipeline, draw.screenModel, screenOffset, screenCount );
+		// The controllers sit in front of the screen; each ray hides behind whatever part of them covers it
+		vk_draw_virtual_screen_models();
+		vk_draw_virtual_screen_pointers();
 	}
 
 	qvkCmdEndRenderPass( vk.cmd->command_buffer );

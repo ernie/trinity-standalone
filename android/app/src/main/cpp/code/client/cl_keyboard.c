@@ -592,8 +592,9 @@ void VKeyboard_Draw( void ) {
 		}
 	}
 
-	// Draw cursors on top of keyboard as colored dots
+	// Draw cursors on top of keyboard as colored dots, unless each hand's ray already shows where it points
 	// Blue = left physical hand, Red = right physical hand
+	if ( vr.pointerMode != VR_POINTER_DRAWN )
 	{
 		#define CURSOR_DOT_SIZE	6
 

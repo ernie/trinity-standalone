@@ -15,6 +15,7 @@
 #include "../vrcommon/common/xr_linear.h"
 #include "../vrcommon/vr_base.h"
 #include "../vrcommon/vr_clientinfo.h"
+#include "../vrcommon/vr_controller_models.h"
 #include "../vrcommon/vr_events.h"
 #include "../vrcommon/vr_gameplay.h"
 #include "../vrcommon/vr_input.h"
@@ -412,6 +413,8 @@ void VR_Renderer_BeginFrame(VR_Engine* engine, XrBool32 needsRecenter)
 	// [Input] poll actions, update controller state, issue action commands
 	IN_VRSyncActions(engine);
 	IN_VRUpdateControllers(engine, lastPredictedDisplayTime);
+	VR_ControllerModels_Update(engine->appState.CurrentSpace, lastPredictedDisplayTime,
+		engine->appState.Focused ? qtrue : qfalse);
 
 	// Update zoom level after input processing so weapon_zoomLevel
 	// matches weapon_zoomed (set during IN_VRUpdateControllers)

@@ -69,7 +69,7 @@ void VR_SharedSyncIn( vr_shared_t *dst, int structSize ) {
 	s->scoreboardCursorY = vr.scoreboardCursorY;
 	s->sp_intermission_active = vr.sp_intermission_active;
 	s->probeEchoBack = vr.probeEcho;
-	s->menuStickNavActive = vr.menuStickNavActive;
+	s->pointerMode = vr.pointerMode;
 
 	// cg block (full-struct sync-in: modules see other writers' latest values)
 	s->weapon_select = vr.weapon_select;

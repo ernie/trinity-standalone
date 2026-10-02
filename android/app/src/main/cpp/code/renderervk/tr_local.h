@@ -1345,6 +1345,22 @@ typedef struct {
 	// HUD buffer for HUD mode 1 (in-world sprite)
 	image_t					*hudImage;    // HUD buffer texture wrapper (isExternal=true)
 	shader_t				*hudShader;   // sprites/vr/hud shader
+
+	// The runtime's controller models beside the virtual screen: each asset's textures and static
+	// geometry, and which asset each of the runtime's models draws with
+	struct {
+		byte				cacheId[16];
+		qboolean			loaded;
+		size_t				packed;			// VR_ModelPack's size: a returning model has to match it as well as the ID
+		image_t				*images[16];	// by the model's image index; NULL draws untextured
+		VkBuffer			buffer;
+		VkDeviceMemory		memory;
+		unsigned			*offsets;
+	} xrAssets[8];
+	struct {
+		unsigned			serial;
+		int					asset;
+	} xrModels[8];
 #endif
 
 	qboolean				vertexLightingAllowed;

@@ -797,6 +797,29 @@ static qboolean IN_VRScreenCursor( int hand, float *x, float *y )
 	return VR_VirtualScreen_Hit( origin, dir, x, y );
 }
 
+/* Draws one hand's ray this frame, toward its cursor. qfalse when the hand has no aim or no screen is up. */
+qboolean IN_VRShowPointer( int hand, int cursorX, int cursorY, qboolean *onScreen )
+{
+	const XrVector3f ahead = { 0.0f, 0.0f, -1.0f };
+	XrVector3f direction;
+	float origin[3], dir[3];
+
+	*onScreen = qfalse;
+	if ( !aimPoseValid[hand] )
+	{
+		return qfalse;
+	}
+	XrQuaternionf_RotateVector3f( &direction, &aimPose[hand].orientation, &ahead );
+	origin[0] = aimPose[hand].position.x;
+	origin[1] = aimPose[hand].position.y;
+	origin[2] = aimPose[hand].position.z;
+	dir[0] = direction.x;
+	dir[1] = direction.y;
+	dir[2] = direction.z;
+	// the keyboard tells the hands apart by color: the left one blue, the right one red
+	return VR_VirtualScreen_ShowPointer( hand, origin, dir, cursorX, cursorY, hand == 0 && VKeyboard_IsActive(), onScreen );
+}
+
 /* One hand's pointer: its ray on the virtual screen (a miss holds the cursor), else its aim angles on the HUD plane. */
 static void IN_VRCursor( int hand, const vec3_t aim, int *x, int *y )
 {
@@ -877,7 +900,7 @@ static void IN_VRController( qboolean isRightController, XrPosef pose )
 			IN_VRCursor(1 - menuHand, menuWeapon ? vr.offhandaimangles : vr.weaponaimangles, &vr.offhandCursorX, &vr.offhandCursorY);
 
 			// UI_MOUSE_EVENT updates hover; stick navigation owns the selection while it runs
-			if ((Key_GetCatcher() & KEYCATCH_UI) && !vr.menuStickNavActive && !VKeyboard_IsActive() &&
+			if ((Key_GetCatcher() & KEYCATCH_UI) && vr.pointerMode != VR_POINTER_STICK && !VKeyboard_IsActive() &&
 				!vr.weapon_adjust && !vr.menuYawLocked)
 			{
 				CL_MouseEvent(0, 0, com_frameTime);

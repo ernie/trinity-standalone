@@ -44,6 +44,7 @@ cvar_t *vr_showConsoleMessages = NULL;
 cvar_t *vr_desktopMode = NULL;
 cvar_t *vr_virtualScreenMode = NULL;
 cvar_t *vr_screenCurvature = NULL;
+cvar_t *vr_controllerModels = NULL;
 cvar_t *vr_thumbstickDeadzone = NULL;
 cvar_t *vr_thumbstickFullDeflection = NULL;
 cvar_t *vr_triggerSensitivity = NULL;
@@ -102,6 +103,7 @@ void VR_InitCvars( void )
 	vr_desktopMode = Cvar_Get ("vr_desktopMode", "0", CVAR_ARCHIVE); // 0 - left eye, 1 - right eye, 2 - both eyes
 	vr_virtualScreenMode = Cvar_Get ("vr_virtualScreenMode", "0", CVAR_ARCHIVE); // 0 - fixed, 1 - follow
 	vr_screenCurvature = Cvar_Get ("vr_screenCurvature", "0.5", CVAR_ARCHIVE); // virtual screen curvature (0.0 = flat, 1.0 = max curve)
+	vr_controllerModels = Cvar_Get ("vr_controllerModels", "1", CVAR_ARCHIVE); // the pointer ray, its pool of light and the runtime's controller models on the virtual screen
 	vr_thumbstickDeadzone = Cvar_Get ("vr_thumbstickDeadzone", "0.15", CVAR_ARCHIVE);
 	vr_thumbstickFullDeflection = Cvar_Get ("vr_thumbstickFullDeflection", "0.85", CVAR_ARCHIVE);
 	vr_triggerSensitivity = Cvar_Get ("vr_triggerSensitivity", "0.25", CVAR_ARCHIVE);

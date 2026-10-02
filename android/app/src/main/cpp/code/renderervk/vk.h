@@ -334,6 +334,7 @@ void vk_foveation_keep_sharp_hud( float x, float y, float w, float h );
 void vk_foveation_hud_end( void );
 
 qboolean vk_alloc_vbo( const byte *vbo_data, int vbo_size );
+void vk_prepare_xr_models( void );
 void vk_update_mvp( const float *m );
 
 extern float vk_view_eyeproj[2][16];
@@ -518,6 +519,12 @@ typedef struct {
 	VkPipeline vscreenPipeline;
 	VkPipeline vscreenReflectPipeline;
 	VkPipeline floorGridPipeline;
+	// The pass's depth, which orders the controllers and their rays and is never stored
+	VkImage vscreenDepthImage;
+	VkDeviceMemory vscreenDepthMemory;
+	VkImageView vscreenDepthView;
+	VkPipeline vscreenModelPipeline;    // controller parts: opaque, writes depth
+	VkPipeline vscreenPointerPipeline;  // rays and their pools of light: blended, tests depth
 
 	// Initialization state
 	qboolean initialized;
@@ -734,6 +741,8 @@ typedef struct {
 		VkShaderModule floor_grid_fs;
 		VkShaderModule vscreen_capture_vs;
 		VkShaderModule vscreen_capture_fs;
+		VkShaderModule vscreen_model_vs;    // controllers and pointer rays beside the virtual screen
+		VkShaderModule vscreen_model_fs;
 
 		VkShaderModule fog_fs;  // multiview
 		VkShaderModule fog_vs;  // multiview

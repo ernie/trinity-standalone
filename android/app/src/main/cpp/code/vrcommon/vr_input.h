@@ -15,6 +15,7 @@ void VR_ProcessInputActions( void );
 void IN_VRUpdateHMD( XrView* views, uint32_t viewCount, XrFovf* fov );
 void IN_VRSyncActions( VR_Engine* engine );
 void IN_VRUpdateControllers( VR_Engine* engine, XrTime predictedDisplayTime );
+qboolean IN_VRShowPointer( int hand, int cursorX, int cursorY, qboolean *onScreen );
 
 void VR_HapticEvent(const char* event, int position, int flags, int intensity, float angle, float yHeight );
 

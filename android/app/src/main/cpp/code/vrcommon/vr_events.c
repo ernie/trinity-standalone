@@ -5,6 +5,7 @@
 
 #include "../client/client.h"
 #include "vr_macros.h"
+#include "vr_controller_models.h"
 #include "vr_gameplay.h"
 #include "vr_session.h"
 #include "vr_input.h"
@@ -63,6 +64,10 @@ XrBool32 VR_ProcessXrEvents(VR_App* app)
 					recenter = XR_TRUE;
 				}
 			} break;
+
+			case XR_TYPE_EVENT_DATA_INTERACTION_RENDER_MODELS_CHANGED_EXT:
+				VR_ControllerModels_Changed();
+				break;
 
 			case XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED: {
 				const XrEventDataSessionStateChanged* session_state_changed_event = (XrEventDataSessionStateChanged*)(baseEventHeader);

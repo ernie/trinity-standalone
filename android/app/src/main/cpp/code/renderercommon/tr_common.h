@@ -146,6 +146,9 @@ void R_LoadJPG( const char *name, byte **pic, int *width, int *height );
 void R_LoadPCX( const char *name, byte **pic, int *width, int *height );
 void R_LoadPNG( const char *name, byte **pic, int *width, int *height );
 void R_LoadTGA( const char *name, byte **pic, int *width, int *height );
+// The same loaders for a file already in memory; name only labels messages
+void R_DecodeJPG( const char *name, const byte *data, int size, byte **pic, int *width, int *height );
+void R_DecodePNG( const char *name, const byte *data, int size, byte **pic, int *width, int *height );
 
 /*
 ====================================================================

@@ -9,6 +9,7 @@ message(STATUS "Configuring VR sources")
 set(VR_COMMON_SOURCES
     ${SOURCE_DIR}/vrcommon/vr_base.c
     ${SOURCE_DIR}/vrcommon/vr_bind.c
+    ${SOURCE_DIR}/vrcommon/vr_controller_models.c
     ${SOURCE_DIR}/vrcommon/vr_cvars.c
     ${SOURCE_DIR}/vrcommon/vr_debug.c
     ${SOURCE_DIR}/vrcommon/vr_events.c
@@ -17,6 +18,7 @@ set(VR_COMMON_SOURCES
     ${SOURCE_DIR}/vrcommon/vr_input.c
     ${SOURCE_DIR}/vrcommon/vr_instance.c
     ${SOURCE_DIR}/vrcommon/vr_math.c
+    ${SOURCE_DIR}/vrcommon/vr_model.c
     ${SOURCE_DIR}/vrcommon/vr_render_loop.c
     ${SOURCE_DIR}/vrcommon/vr_router.c
     ${SOURCE_DIR}/vrcommon/vr_session.c
@@ -24,6 +26,7 @@ set(VR_COMMON_SOURCES
     ${SOURCE_DIR}/vrcommon/vr_spaces.c
     ${SOURCE_DIR}/vrcommon/vr_swapchains.c
     ${SOURCE_DIR}/vrcommon/vr_virtual_screen.c
+    ${SOURCE_DIR}/vrcommon/vk_xr_models.c
 )
 
 # Vulkan specific VR sources (vrvk/)

@@ -312,6 +312,7 @@ void RE_BeginFrame( stereoFrame_t stereoFrame ) {
 	backEnd.doneBloom = qfalse;
 	backEnd.doneFlares = qfalse;
 	backEnd.hudDeferred = qfalse;
+	vk_prepare_xr_models();
 #endif
 
 	backEnd.color2D.u32 = ~0U;

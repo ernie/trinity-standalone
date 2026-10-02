@@ -24,6 +24,7 @@ static vrScreenGeometry_t s_screen;
 static XrView s_views[2];
 static uint32_t s_viewCount;
 static qboolean s_reanchor;
+static vrScreenPointer_t s_pointers[2];
 
 
 static void VR_VirtualScreen_Place( qboolean visible, qboolean contextChanged )
@@ -58,6 +59,9 @@ void VR_VirtualScreen_Update( const XrView *views, uint32_t viewCount )
 {
 	// Read every frame: the edge is consumed on read and must track the state continuously
 	const qboolean contextChanged = VR_Gameplay_VirtualScreenContextChanged();
+
+	// The router names this frame's pointers after its input runs; a frame without input has none
+	s_pointers[0].active = s_pointers[1].active = qfalse;
 
 	if ( viewCount == 0 )
 	{
@@ -120,6 +124,81 @@ qboolean VR_VirtualScreen_GetDraw( vrScreenDraw_t *out )
 	out->floorModel[15] = 1.0f;
 
 	return qtrue;
+}
+
+
+qboolean VR_VirtualScreen_ShowPointer( int hand, const float origin[3], const float direction[3], int cursorX, int cursorY,
+	qboolean blue, qboolean *onScreen )
+{
+	vrScreenPointer_t *pointer = &s_pointers[hand];
+	const float u = cursorX / 640.0f, v = cursorY / 480.0f;
+	float uv[2], left[3], right[3], length;
+	int i;
+
+	*onScreen = qfalse;
+	if ( !s_screen.visible )
+	{
+		return qfalse;
+	}
+	*onScreen = VR_ScreenRay( &s_screen, origin, direction, uv ) ? qtrue : qfalse;
+	memcpy( pointer->origin, origin, sizeof( pointer->origin ) );
+	pointer->pool = qfalse;
+	pointer->blue = blue;
+	if ( *onScreen )
+	{
+		// The drawn ray ends on the cursor, which trails the aim by its smoothing
+		VR_ScreenPoint( &s_screen, u, v, pointer->poolPoint );
+		VR_ScreenPoint( &s_screen, u - 0.01f, v, left );
+		VR_ScreenPoint( &s_screen, u + 0.01f, v, right );
+		for ( i = 0; i < 3; i++ )
+		{
+			pointer->end[i] = pointer->poolPoint[i];
+			pointer->poolSide[i] = right[i] - left[i];
+		}
+		length = sqrtf( pointer->poolSide[0] * pointer->poolSide[0] + pointer->poolSide[1] * pointer->poolSide[1] +
+			pointer->poolSide[2] * pointer->poolSide[2] );
+		if ( length >= 0.000001f )
+		{
+			for ( i = 0; i < 3; i++ )
+			{
+				pointer->poolSide[i] /= length;
+			}
+			pointer->pool = qtrue;
+		}
+	}
+	else
+	{
+		const float reach = VR_ScreenReach( &s_screen, origin, direction );
+		for ( i = 0; i < 3; i++ )
+		{
+			pointer->end[i] = origin[i] + direction[i] * reach;
+		}
+	}
+	pointer->active = qtrue;
+	return qtrue;
+}
+
+
+const vrScreenPointer_t *VR_VirtualScreen_Pointer( int hand )
+{
+	return s_pointers[hand].active ? &s_pointers[hand] : NULL;
+}
+
+
+float VR_VirtualScreen_Height( void )
+{
+	return s_screen.height;
+}
+
+
+void VR_VirtualScreen_Head( float head[3] )
+{
+	const XrVector3f *left = &s_views[0].pose.position;
+	const XrVector3f *right = &s_views[s_viewCount > 1 ? 1 : 0].pose.position;
+
+	head[0] = ( left->x + right->x ) * 0.5f;
+	head[1] = ( left->y + right->y ) * 0.5f;
+	head[2] = ( left->z + right->z ) * 0.5f;
 }
 
 

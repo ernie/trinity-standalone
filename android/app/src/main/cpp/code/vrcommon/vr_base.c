@@ -8,6 +8,7 @@
 #include "vr_debug.h"
 
 #include "vr_bhaptics.h"
+#include "vr_controller_models.h"
 #include "vr_debug.h"
 #include "vr_input.h"
 #include "vr_instance.h"
@@ -34,6 +35,12 @@ static uint32_t numRequiredExtensions = 0;
 static qboolean frameControllersEnabled = qfalse;
 static qboolean picoControllersEnabled = qfalse;
 static qboolean swapchainCreateFlagsEnabled = qfalse;
+// XR_EXT_render_model and XR_EXT_interaction_render_model are both enabled
+static qboolean controllerModelsEnabled = qfalse;
+// Why the runtime turned down an instance with them, when it lists them
+static XrResult controllerModelsRefused = XR_SUCCESS;
+// What the instance was created for: 1.1, or 1.0 on a runtime without it
+static XrVersion instanceApiVersion = 0;
 
 // Instance extensions the runtime advertises, enumerated once per VR_Init
 static XrExtensionProperties* s_instanceExtensions = NULL;
@@ -210,10 +217,15 @@ void VR_Info_f( void )
 		Com_Printf("Runtime: %s %u.%u.%u\n", props.runtimeName, XR_VERSION_MAJOR(props.runtimeVersion),
 			XR_VERSION_MINOR(props.runtimeVersion), XR_VERSION_PATCH(props.runtimeVersion));
 	}
+	Com_Printf("OpenXR API: %u.%u\n", XR_VERSION_MAJOR(instanceApiVersion), XR_VERSION_MINOR(instanceApiVersion));
 	Com_Printf("Enabled extensions:\n");
 	for (uint32_t i = 0; i < numRequiredExtensions; i++)
 		Com_Printf("  %s\n", requiredExtensionNames[i]);
 	VR_PrintEyeInfo();
+	if (controllerModelsRefused)
+		Com_Printf("Controller models: refused by the runtime (%d)\n", (int)controllerModelsRefused);
+	else
+		VR_ControllerModels_Info();
 	VR_PrintInputInfo();
 }
 
@@ -257,6 +269,67 @@ const char* VR_FoveationCapsString(void)
 	}
 }
 
+// xrCreateInstance failures that no other request would get past
+static qboolean VR_InstanceUnavailable(XrResult result)
+{
+	return result == XR_ERROR_RUNTIME_UNAVAILABLE || result == XR_ERROR_LIMIT_REACHED ||
+		result == XR_ERROR_OUT_OF_MEMORY || result == XR_ERROR_INSTANCE_LOST;
+}
+
+// OpenXR 1.1 first (Meta hands a 1.0.0 app a legacy profile that ignores swapchain create chains), 1.0 if refused;
+// the render model extensions ride on the end, and a runtime that lists them yet refuses the instance gets a retry without them.
+static XrResult VR_CreateInstanceForModels(const char* appName, XrInstance* instance)
+{
+	const uint32_t without = numRequiredExtensions;
+	const qboolean wantModels = VR_HasInstanceExtension(XR_EXT_RENDER_MODEL_EXTENSION_NAME) &&
+		VR_HasInstanceExtension(XR_EXT_INTERACTION_RENDER_MODEL_EXTENSION_NAME) &&
+		without + 3 <= MAX_REQUIRED_EXTENSIONS;
+	const qboolean uuid = VR_HasInstanceExtension(XR_EXT_UUID_EXTENSION_NAME);
+	XrResult result = XR_ERROR_RUNTIME_FAILURE;
+	int attempt;
+
+	controllerModelsEnabled = qfalse;
+	controllerModelsRefused = XR_SUCCESS;
+	for (attempt = 0; attempt < 2; attempt++)
+	{
+		const XrVersion apiVersion = attempt ? XR_API_VERSION_1_0 : XR_API_VERSION_1_1;
+		XrResult refused = XR_SUCCESS;
+
+		numRequiredExtensions = without;
+		if (wantModels)
+		{
+			// Render models need OpenXR 1.1 or this extension
+			if (attempt && uuid)
+			{
+				requiredExtensionNames[numRequiredExtensions++] = XR_EXT_UUID_EXTENSION_NAME;
+			}
+			requiredExtensionNames[numRequiredExtensions++] = XR_EXT_RENDER_MODEL_EXTENSION_NAME;
+			requiredExtensionNames[numRequiredExtensions++] = XR_EXT_INTERACTION_RENDER_MODEL_EXTENSION_NAME;
+		}
+		result = VR_CreateInstance(appName, apiVersion, numRequiredExtensions, requiredExtensionNames, instance);
+		// A runtime may refuse the extensions with any code
+		if (XR_FAILED(result) && wantModels && result != XR_ERROR_API_VERSION_UNSUPPORTED &&
+			!VR_InstanceUnavailable(result))
+		{
+			refused = result;
+			numRequiredExtensions = without;
+			result = VR_CreateInstance(appName, apiVersion, numRequiredExtensions, requiredExtensionNames, instance);
+		}
+		if (XR_SUCCEEDED(result))
+		{
+			controllerModelsEnabled = wantModels && !refused;
+			controllerModelsRefused = refused;
+			instanceApiVersion = apiVersion;
+			break;
+		}
+		if (VR_InstanceUnavailable(result))
+		{
+			break;
+		}
+	}
+	return result;
+}
+
 // Part of init
 void VR_InitInstanceInput( VR_Engine* );
 
@@ -289,13 +362,18 @@ VR_Engine* VR_Init( void )
 	}
 
 	// Create the OpenXR instance.
-	// Meta's runtime reads the patch version as the app's SDK and gives 1.0.0 a
-	// legacy profile that ignores the XrSwapchainCreateInfo next chain (no density maps)
 	const char* appName = "Quake 3 Arena";
-	const XrVersion apiVersion = XR_API_VERSION_1_0;
 	XR_CHECK(
-		VR_CreateInstance(appName, apiVersion, numRequiredExtensions, requiredExtensionNames, &vr_engine.appState.Instance), 
+		VR_CreateInstanceForModels(appName, &vr_engine.appState.Instance),
 		"Failed to create OpenXR instance");
+	{
+		char line[128];
+		Com_sprintf(line, sizeof(line), "instance: OpenXR %u.%u, controller models %s (%d)",
+			XR_VERSION_MAJOR(instanceApiVersion), XR_VERSION_MINOR(instanceApiVersion),
+			controllerModelsEnabled ? "enabled" : controllerModelsRefused ? "refused" : "not offered",
+			(int)controllerModelsRefused);
+		VR_LogLine(line);
+	}
 
 	XrInstanceProperties instanceInfo;
 	instanceInfo.type = XR_TYPE_INSTANCE_PROPERTIES;
@@ -404,6 +482,7 @@ void VR_EnterVR( VR_Engine* engine )
 	XR_CHECK(
 		VR_CreateSession(engine->appState.Instance, engine->appState.SystemId, &engine->appState.Session),
 		"Failed to create XR session");
+	VR_ControllerModels_Init(engine->appState.Instance, engine->appState.Session, controllerModelsEnabled);
 
 	// Create a space to the first path
 	XrReferenceSpaceCreateInfo spaceCreateInfo = {};
@@ -422,6 +501,8 @@ void VR_LeaveVR( VR_Engine* engine )
 	if (engine->appState.Session) 
 	{
 		fprintf(stderr, "[OpenXR] Destroying XR session and reference spaces\n");
+
+		VR_ControllerModels_Shutdown();
 
 		XR_CHECK(
 			xrDestroySpace(engine->appState.HeadSpace),

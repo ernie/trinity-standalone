@@ -527,3 +527,15 @@ void RE_SaveJPG(const char * filename, int quality, int image_width, int image_h
 
   ri.Hunk_FreeTempMemory(out);
 }
+
+/* The JPEG loader for an image already in memory. name only labels messages. */
+void R_DecodeJPG(const char *name, const byte *data, int size, byte **pic, int *width, int *height)
+{
+	int channels = 0;
+
+	*pic = stbi_load_from_memory(data, size, width, height, &channels, 4);
+	if (!*pic)
+	{
+		ri.Printf(PRINT_WARNING, "%s: not a JPEG the decoder reads\n", name);
+	}
+}

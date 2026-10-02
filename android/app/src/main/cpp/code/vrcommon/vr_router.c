@@ -4,6 +4,7 @@
 #include "../client/cl_vr_bind.h"
 #include "vr_clientinfo.h"
 #include "vr_haptics.h"
+#include "vr_input.h"
 #include "vr_virtual_screen.h"
 
 extern vr_clientinfo_t vr;
@@ -20,6 +21,7 @@ extern cvar_t *vr_thumbstickFullDeflection;
 extern cvar_t *vr_analogWalk;
 extern cvar_t *vr_sendRollToServer;
 extern cvar_t *vr_sensitivity;
+extern cvar_t *vr_controllerModels;
 
 /* The latest controller sample and when it arrived; the command builder trusts it for 250 ms. */
 static struct {
@@ -116,6 +118,9 @@ static void VR_Router_KeyUp_f( void ) {
 		CL_KeyEvent( target, qfalse, com_frameTime );
 }
 
+/* Whether each hand's drawn ray met the virtual screen, as of the last frame it was drawn. */
+static qboolean pointerOnScreen[2];
+
 static void VR_Router_Click( qboolean down ) {
 	const int key = VR_Router_SourceKey(), slot = key >= 0 ? key : 0;
 	const int menuHand = vr.menuLeftHanded ? 0 : 1;
@@ -130,6 +135,8 @@ static void VR_Router_Click( qboolean down ) {
 		return;
 	}
 	if ( VKeyboard_IsActive() && hand != menuHand ) {
+		if ( vr.pointerMode == VR_POINTER_DRAWN && !pointerOnScreen[hand] )
+			return;
 		vr.vkbOffhandTriggerDown = qtrue;
 		VKeyboard_HandleOffhandKey( qtrue );
 		VR_Vibrate( 200, hand + 1, 0.8f );
@@ -146,10 +153,18 @@ static void VR_Router_Click( qboolean down ) {
 		vr.menuLeftHanded = hand == 0;
 		if ( Key_GetCatcher() & KEYCATCH_UI )
 			CL_MouseEvent( 0, 0, com_frameTime );
+		/* nothing showed where that hand pointed, ray or cursor, so this press only takes the pointer over */
+		if ( vr.pointerMode != VR_POINTER_STICK ) {
+			VR_Vibrate( 200, hand + 1, 0.8f );
+			return;
+		}
 	}
-	if ( !vr.menuCursorActive && !vr.menuStickNavActive )
+	/* a ray that is off the screen clicks nothing */
+	if ( vr.pointerMode == VR_POINTER_DRAWN && !pointerOnScreen[hand] )
 		return;
-	clickKey[slot] = vr.menuStickNavActive && !VKeyboard_IsActive() ? K_ENTER : K_MOUSE1;
+	if ( !vr.menuCursorActive && vr.pointerMode != VR_POINTER_STICK )
+		return;
+	clickKey[slot] = vr.pointerMode == VR_POINTER_STICK && !VKeyboard_IsActive() ? K_ENTER : K_MOUSE1;
 	CL_KeyEvent( clickKey[slot], qtrue, com_frameTime );
 	VR_Vibrate( 200, (vr.menuLeftHanded ? 0 : 1) + 1, 0.8f );
 }
@@ -181,11 +196,11 @@ static void VR_Router_Nav( qboolean down ) {
 		target = K_RIGHTARROW;
 	else
 		return;
-	if ( !vr.menuStickNavActive ) {
+	if ( vr.pointerMode != VR_POINTER_STICK ) {
 		navAnchorX = vr.menuCursorX;
 		navAnchorY = vr.menuCursorY;
 	}
-	vr.menuStickNavActive = qtrue;
+	vr.pointerMode = VR_POINTER_STICK;
 	navKey[slot] = target;
 	CL_KeyEvent( target, qtrue, com_frameTime );
 }
@@ -290,7 +305,8 @@ void VR_Router_Reset( void ) {
 	weaponSelectHeld = stabiliseHeld = 0;
 	vr.weapon_select = vr.weapon_select_using_thumbstick = vr.weapon_select_autoclose = qfalse;
 	vr.weapon_stabilised = vr.walking = vr.vkbOffhandTriggerDown = qfalse;
-	vr.vote_holding = vr.menuStickNavActive = 0;
+	vr.vote_holding = 0;
+	vr.pointerMode = VR_POINTER_CURSOR;
 	vr.thumbstick_location[0][0] = vr.thumbstick_location[0][1] = 0;
 	vr.thumbstick_location[1][0] = vr.thumbstick_location[1][1] = 0;
 }
@@ -403,17 +419,31 @@ void VR_Router_Frame( const clXRHandInput_t hands[2] ) {
 							 VR_UpdateHolds( &holds, keysNow, &stack, CL_VRBind_Lookup, NULL, com_frameTime, events,
 											 ARRAY_LEN( events ) ),
 							 qfalse );
-	if ( vr.menuStickNavActive ) {
+	if ( vr.pointerMode == VR_POINTER_STICK ) {
 		qboolean held = qfalse;
 		for ( i = 0; i < VRK_COUNT; i++ )
 			held |= navKey[i] != 0;
 		if ( !menu )
-			vr.menuStickNavActive = qfalse;
+			vr.pointerMode = VR_POINTER_CURSOR;
 		else if ( !held ) {
 			int dx = vr.menuCursorX - navAnchorX, dy = vr.menuCursorY - navAnchorY;
 			if ( dx * dx + dy * dy > 3600 )
-				vr.menuStickNavActive = qfalse;
+				vr.pointerMode = VR_POINTER_CURSOR;
 		}
+	}
+	/* Outside stick navigation the mode says who draws the cursor: this frame's ray and pool of light, or the
+	 * module, as it always does with vr_controllerModels off. The off hand points too while the keyboard is up,
+	 * since its trigger types. */
+	if ( vr.pointerMode != VR_POINTER_STICK ) {
+		const int menuHand = vr.menuLeftHanded ? 0 : 1;
+		qboolean drawn = qfalse;
+		if ( vr_controllerModels->integer && VR_Router_PointerLayer() && vr.virtual_screen && vr.menuCursorActive &&
+			 !vr.weapon_adjust && !vr.menuYawLocked ) {
+			drawn = IN_VRShowPointer( menuHand, vr.menuCursorX, vr.menuCursorY, &pointerOnScreen[menuHand] );
+			if ( VKeyboard_IsActive() )
+				IN_VRShowPointer( 1 - menuHand, vr.offhandCursorX, vr.offhandCursorY, &pointerOnScreen[1 - menuHand] );
+		}
+		vr.pointerMode = drawn ? VR_POINTER_DRAWN : VR_POINTER_CURSOR;
 	}
 	priorWheel = vr.weapon_select;
 	wheel = weaponSelectHeld > 0 && !clc.demoplaying && !(cl.snap.ps.pm_flags & PMF_FOLLOW);
