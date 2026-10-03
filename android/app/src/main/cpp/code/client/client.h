@@ -694,6 +694,7 @@ qboolean	VKeyboard_IsActive( void );
 void		VKeyboard_Draw( void );
 qboolean	VKeyboard_HandleKey( int key );
 void		VKeyboard_HandleOffhandKey( qboolean down );
+void		VKeyboard_RendererStarted( void );
 
 //
 // cl_scrn.c

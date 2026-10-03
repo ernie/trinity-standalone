@@ -121,6 +121,11 @@ static void VR_Router_KeyUp_f( void ) {
 /* Whether each hand's drawn ray met the virtual screen, as of the last frame it was drawn. */
 static qboolean pointerOnScreen[2];
 
+/* With the pointer drawn, a ray off the screen has no pool of light, so its resting cursor means nothing. */
+qboolean VR_Router_PointerOnScreen( int hand ) {
+	return vr.pointerMode != VR_POINTER_DRAWN || pointerOnScreen[hand];
+}
+
 static void VR_Router_Click( qboolean down ) {
 	const int key = VR_Router_SourceKey(), slot = key >= 0 ? key : 0;
 	const int menuHand = vr.menuLeftHanded ? 0 : 1;

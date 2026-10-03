@@ -14,6 +14,8 @@ void VR_Router_Frame( const clXRHandInput_t hands[2] );
 const clXRHandInput_t *VR_Router_Hands( void );
 /* A menu, text entry or scoreboard owns the pointer. */
 qboolean VR_Router_PointerLayer( void );
+/* Whether the hand's hover means anything: false while the drawn pointer is off the screen. */
+qboolean VR_Router_PointerOnScreen( int hand );
 /* No movement or smooth turn reaches the game while this holds. */
 qboolean VR_Router_ModalLayer( void );
 /* The VR usercmd: role-stick movement, bound key state, weapon angles and the head pose (the engine's builder). */

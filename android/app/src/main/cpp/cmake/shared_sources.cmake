@@ -102,6 +102,7 @@ set(CLIENT_SOURCES
     ${SOURCE_DIR}/client/cl_console.c
     ${SOURCE_DIR}/client/cl_input.c
     ${SOURCE_DIR}/client/cl_keyboard.c
+    ${SOURCE_DIR}/client/cl_vkb_layout.c
     ${SOURCE_DIR}/client/cl_keys.c
     ${SOURCE_DIR}/client/cl_vr_bind.c
     ${SOURCE_DIR}/client/cl_main.c
