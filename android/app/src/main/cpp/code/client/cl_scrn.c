@@ -22,6 +22,7 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 // cl_scrn.c -- master for refresh, status bar, console, chat, notify, etc
 
 #include "client.h"
+#include "../vrcommon/vr_loading_budget.h"
 #include "../vrcommon/vr_clientinfo.h"
 #include "../vrcommon/vr_renderer.h"
 #include "../vrcommon/vr_base.h"
@@ -962,17 +963,18 @@ This is called every frame, and can also be called explicitly to flush
 text to the screen.
 ==================
 */
-void SCR_UpdateScreen( void ) {
-	static int	recursive;
+static int scr_recursive;	// depth inside SCR_UpdateScreen; the loading pump never opens a frame inside one
+static int scr_lastUpdate;	// Sys_Milliseconds at the last completed update
 
+void SCR_UpdateScreen( void ) {
 	if ( !scr_initialized ) {
 		return;				// not initialized yet
 	}
 
-	if ( ++recursive > 2 ) {
+	if ( ++scr_recursive > 2 ) {
 		Com_Error( ERR_FATAL, "SCR_UpdateScreen: recursively called" );
 	}
-	recursive = 1;
+	scr_recursive = 1;
 
 	// If there is no VM, there are also no rendering commands issued. Stop the renderer in
 	// that case.
@@ -1002,8 +1004,30 @@ void SCR_UpdateScreen( void ) {
 		// During loading states (CA_LOADING/CA_PRIMED), SCR_UpdateScreen is called repeatedly
 		// from within CG_INIT (before Com_Frame returns). We need to submit VR frames during
 		// this time so the loading screen is visible in the headset.
-		VR_Renderer_SubmitLoadingFrame(VR_GetEngine());
+		VR_Renderer_SubmitLoadingFrame(VR_GetEngine(), qfalse);
 	}
 
-	recursive = 0;
+	scr_recursive = 0;
+	scr_lastUpdate = Sys_Milliseconds();
+}
+
+/* The renderer and the loaders call this from a load's long steps. redraw says the caller sits where a redrawn
+ * loading screen may register shaders (no shader mid-parse); otherwise only a tracked frame may go out. */
+#define SCR_LOADING_PUMP_MS 100
+static vrLoadingBudget_t scr_loadingBudget;
+
+void CL_LoadingPump( qboolean redraw ) {
+	int start;
+	if ( scr_recursive || clc.state < CA_CONNECTING || clc.state > CA_PRIMED )
+		return;
+	if ( redraw && ( clc.state == CA_LOADING || clc.state == CA_PRIMED ) && Sys_Milliseconds() - scr_lastUpdate >= SCR_LOADING_PUMP_MS ) {
+		SCR_UpdateScreen();
+		return;
+	}
+	// a tracked frame that blocked on the GPU buys the loader the same time back before the next one
+	start = Sys_Milliseconds();
+	if ( VR_LoadingBudgetHeld( &scr_loadingBudget, start ) )
+		return;
+	if ( VR_Renderer_TrackedLoadingFrame( VR_GetEngine() ) )
+		VR_LoadingBudgetSpent( &scr_loadingBudget, start, Sys_Milliseconds() );
 }

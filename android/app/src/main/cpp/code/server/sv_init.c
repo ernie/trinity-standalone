@@ -475,10 +475,8 @@ void SV_SpawnServer( char *server, qboolean killBots ) {
 	// get a new checksum feed and restart the file system
 	sv.checksumFeed = ( ((unsigned int)rand() << 16) ^ (unsigned int)rand() ) ^ Com_Milliseconds();
 	FS_Restart( sv.checksumFeed );
-	CL_LoadingPump();
 
 	CM_LoadMap( va("maps/%s.bsp", server), qfalse, &checksum );
-	CL_LoadingPump();
 
 	// set serverinfo visible name
 	Cvar_Set( "mapname", server );
@@ -501,7 +499,6 @@ void SV_SpawnServer( char *server, qboolean killBots ) {
 
 	// load and spawn all other entities
 	SV_InitGameProgs();
-	CL_LoadingPump();
 
 	// don't allow a map_restart if game is modified
 	sv_gametype->modified = qfalse;
@@ -520,7 +517,6 @@ void SV_SpawnServer( char *server, qboolean killBots ) {
 		SV_BotFrame (sv.time);
 		sv.time += 100;
 		svs.time += 100;
-		CL_LoadingPump();
 	}
 
 	// create a baseline for more efficient communications

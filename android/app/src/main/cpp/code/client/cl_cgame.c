@@ -24,13 +24,12 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 #include "client.h"
 #include "cl_trinity_rconset.h"
 #include "../qcommon/vm_vr.h"
-
 #include "../botlib/botlib.h"
 #include "../vrcommon/vr_base.h"
 #include "../vrcommon/vr_clientinfo.h"
 #include "../vrcommon/vr_input.h"
 #include "cl_vr_bind.h"
-#include "../vrcommon/vr_renderer.h"
+
 
 #ifdef USE_MUMBLE
 #include "libmumblelink.h"
@@ -1012,9 +1011,6 @@ void CL_InitCGame( void ) {
 	// after VM_Create, so a fallback cgame's pak takes the connection's one notice
 	SCR_VRUiFallbackNotice();
 	clc.state = CA_LOADING;
-
-	// remote loads block in CG_INIT too; a local load began this in CL_MapLoading
-	VR_Renderer_MapLoadBegin( VR_GetEngine() );
 
 	// vid_restart tears down and re-inits the VR state with the derived mode
 	// flags zeroed, and no input frame runs before cgame draws its loading

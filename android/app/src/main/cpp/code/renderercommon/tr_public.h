@@ -114,6 +114,8 @@ typedef struct {
 	// {tanLeft, tanRight, tanUp, tanDown}, which is what turns a texel into an eccentricity
 	void (*SetFoveation)( int level, qboolean eyeTracked, const float centers[2][2], const float fovTan[2][4] );
 	void	(*BeginXRFrame)( uint32_t colorIndex, uint32_t depthIndex );  // Begin XR frame with swapchain indices (Vulkan)
+	void	(*SetRepeatScreen)( qboolean on );  // the frame recomposes the last captured screen instead of capturing
+	qboolean (*RepeatScreenReady)( void );  // a repeat-screen frame may begin: renderer up, screen captured, no frame recording
 	void	(*ClearVRFramebuffer)( int width, int height, qboolean isThirdPersonSpectator );
 	void	(*WaitForRenderComplete)( void );  // Wait for GPU to finish current frame (Vulkan needs explicit sync)
 

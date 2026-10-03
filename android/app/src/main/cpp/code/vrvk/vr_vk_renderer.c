@@ -31,7 +31,6 @@
 #include "vr_vk.h"
 #include "vr_vk_debug.h"
 #include "vr_vk_foveation.h"
-#include "vr_vk_loading.h"
 #include "vr_vk_swapchains.h"
 
 extern vr_clientinfo_t vr;
@@ -45,6 +44,8 @@ const float hudScale = M_PI * 15.0f / 180.0f;
 XrBool32 stageSupported = XR_FALSE;
 XrTime lastPredictedDisplayTime = 0;
 qboolean frameStarted = qfalse;
+static int lastDisplayPeriodMs = 16; // the runtime's predicted frame interval
+static int lastEndMs; // Sys_Milliseconds() at the last frame end
 qboolean needRecenter = qtrue;
 
 // Per-frame data held between BeginFrame and EndFrame
@@ -286,7 +287,6 @@ void VR_InitRenderer(VR_Engine* engine)
 
 void VR_DestroyRenderer(VR_Engine* engine)
 {
-	VR_Loading_Shutdown();
 	VR_VK_DestroySwapchains(&engine->appState.Renderer.Swapchains);
 
 	// Destroy VIEW reference space
@@ -369,7 +369,12 @@ void VR_Renderer_BeginFrame(VR_Engine* engine, XrBool32 needsRecenter)
 
 	frameStarted = qtrue;
 
-	lastPredictedDisplayTime = VR_WaitFrame(engine->appState.Session).predictedDisplayTime;
+	{
+		const XrFrameState frameState = VR_WaitFrame(engine->appState.Session);
+		lastPredictedDisplayTime = frameState.predictedDisplayTime;
+		if (frameState.predictedDisplayPeriod > 0)
+			lastDisplayPeriodMs = (int)(frameState.predictedDisplayPeriod / 1000000);
+	}
 
 	if (needsRecenter)
 	{
@@ -523,14 +528,6 @@ void VR_Renderer_ReleaseImages(VR_SwapchainInfos* swapchains)
 
 void VR_Renderer_EndFrame(VR_Engine* engine)
 {
-	// A load is over once the main thread submits gameplay (or menu) frames again
-	if (VR_Loading_Active() && (clc.state == CA_ACTIVE || clc.state == CA_CINEMATIC ||
-		clc.state == CA_DISCONNECTED || clc.state == CA_UNINITIALIZED ||
-		!VR_Gameplay_ShouldRenderInVirtualScreen()))
-	{
-		VR_Loading_Stop();
-	}
-
 	// If frame was already finished (e.g., by VR_Renderer_FinishFrame during vid_restart),
 	// don't try to end it again
 	if (!frameStarted) {
@@ -566,7 +563,7 @@ void VR_Renderer_EndFrame(VR_Engine* engine)
 		engine->appState.CurrentSpace,
 		engine->appState.ViewSpace,
 		lastPredictedDisplayTime);
-	VR_Loading_NoteMainFrame();
+	lastEndMs = Sys_Milliseconds();
 
 	frameStarted = qfalse;
 }
@@ -574,8 +571,6 @@ void VR_Renderer_EndFrame(VR_Engine* engine)
 
 void VR_Renderer_FinishFrame(VR_Engine* engine)
 {
-	VR_Loading_Stop();
-
 	// If no frame is in progress, nothing to do
 	if (!frameStarted) {
 		return;
@@ -767,18 +762,6 @@ XrDesktopViewConfiguration VR_GetDesktopViewConfiguration(void)
 }
 
 
-void VR_Renderer_MapLoadBegin(VR_Engine* engine)
-{
-	VR_Loading_Begin(engine);
-}
-
-
-void VR_Renderer_LoadingPump(VR_Engine* engine)
-{
-	VR_Loading_Pump(engine);
-}
-
-
 void VR_Renderer_BeginRender(VR_Engine* engine)
 {
 	VR_SwapchainInfos* swapchains = engine ? engine->appState.Renderer.Swapchains : NULL;
@@ -798,11 +781,32 @@ void VR_Renderer_BeginRender(VR_Engine* engine)
 }
 
 
-qboolean VR_Renderer_SubmitLoadingFrame(VR_Engine* engine)
+/* Between redraws, and through the local server's spawn: the surroundings alone, tracked, around the screen as
+ * it was, paced by the display. Nothing from the modules draws, so a shader may be mid-parse in the caller. */
+qboolean VR_Renderer_TrackedLoadingFrame(VR_Engine* engine)
 {
-	// Only submit frames during loading states, plus the connect screen a local map load draws
-	if (clc.state != CA_LOADING && clc.state != CA_PRIMED &&
-		!(VR_Loading_Active() && clc.state >= CA_CONNECTING && clc.state <= CA_PRIMED))
+	VR_SwapchainInfos* swapchains = engine ? engine->appState.Renderer.Swapchains : NULL;
+
+	if (!swapchains || !frameStarted || swapchains->color.acquired || !VR_Gameplay_ShouldRenderInVirtualScreen() ||
+		!re.RepeatScreenReady || !re.RepeatScreenReady() ||
+		clc.state < CA_CONNECTING || clc.state > CA_PRIMED || Sys_Milliseconds() - lastEndMs < lastDisplayPeriodMs)
+	{
+		return qfalse;
+	}
+
+	VR_Renderer_BeginRender(engine);
+	re.SetRepeatScreen(qtrue);
+	re.BeginFrame(STEREO_CENTER);
+	re.EndFrame(NULL, NULL);
+	re.SetRepeatScreen(qfalse);
+	return VR_Renderer_SubmitLoadingFrame(engine, qtrue);
+}
+
+
+qboolean VR_Renderer_SubmitLoadingFrame(VR_Engine* engine, qboolean tracked)
+{
+	// Only submit frames during loading states; a tracked frame also covers the local server's spawn
+	if (tracked ? (clc.state < CA_CONNECTING || clc.state > CA_PRIMED) : (clc.state != CA_LOADING && clc.state != CA_PRIMED))
 	{
 		return qfalse;
 	}

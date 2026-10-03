@@ -12797,7 +12797,8 @@ static void vk_render_virtual_screen( void )
 	eyeProjOffset = reflectOffset = screenOffset = floorOffset = ~0U;
 	reflectCount = screenCount = 0;
 	if ( ready ) {
-		vk_capture_virtual_screen();
+		if ( !vk.repeatScreen )
+			vk_capture_virtual_screen(); // a tracked loading frame shows the screen as last captured
 
 		// This frame's eyes through the standard set 0 binding 1 slot, leaving the view's pair untouched
 		Com_Memcpy( savedEyeProj, vk_view_eyeproj, sizeof( savedEyeProj ) );

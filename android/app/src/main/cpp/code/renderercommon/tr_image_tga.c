@@ -22,6 +22,8 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 
 #include "tr_common.h"
 
+void CL_LoadingPump( qboolean redraw );
+
 /*
 ========================================================================
 
@@ -147,6 +149,8 @@ void R_LoadTGA ( const char *name, byte **pic, int *width, int *height)
 		for(row=rows-1; row>=0; row--) 
 		{
 			pixbuf = targa_rgba + row*columns*4;
+			if ( ( row & 63 ) == 0 )
+				CL_LoadingPump( qfalse );
 			for(column=0; column<columns; column++) 
 			{
 				unsigned char red,green,blue,alphabyte;
@@ -194,6 +198,8 @@ void R_LoadTGA ( const char *name, byte **pic, int *width, int *height)
 
 		for(row=rows-1; row>=0; row--) {
 			pixbuf = targa_rgba + row*columns*4;
+			if ( ( row & 63 ) == 0 )
+				CL_LoadingPump( qfalse );
 			for(column=0; column<columns; ) {
 				if(buf_p + 1 > end)
 					ri.Error (ERR_DROP, "LoadTGA: file truncated (%s)", name);

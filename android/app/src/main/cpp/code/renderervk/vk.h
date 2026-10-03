@@ -861,6 +861,7 @@ typedef struct {
 
 	renderPass_t renderPassIndex;
 	qboolean inRenderPass;		// true when actually inside a render pass
+	qboolean repeatScreen;		// this frame recomposes the last captured screen: no capture
 
 	// HUD brackets record into vk.cmd->hud_command_buffer, submitted ahead of the frame's, so an open scene pass is never resumed
 	qboolean inHudCommandBuffer;

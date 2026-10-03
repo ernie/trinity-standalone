@@ -2139,6 +2139,16 @@ void RE_WaitForRenderComplete( void ) {
 	vk.cmd->waitForFence = qfalse;
 }
 
+/* A tracked loading frame draws nothing new: its composition shows the screen as last captured. */
+void RE_SetRepeatScreen( qboolean on ) {
+	vk.repeatScreen = on;
+}
+
+/* Not during the renderer's own (re)initialization, which the map load runs shader lookups inside of. */
+qboolean RE_RepeatScreenReady( void ) {
+	return tr.registered && vk.xr.initialized && vk.xr.vscreenImage != VK_NULL_HANDLE && !vk.recordingCommands;
+}
+
 void RE_BeginXRFrame( uint32_t colorIndex, uint32_t depthIndex ) {
 	// Begin frame: sets up command buffer, transitions images, begins render pass
 	// This is called from VR layer after acquiring XR swapchain images
@@ -2254,6 +2264,8 @@ refexport_t *GetRefAPI ( int apiVersion, refimport_t *rimp ) {
 	re.InitXRResources = RE_InitXRResources;
 	re.SetFoveation = RE_SetFoveation;
 	re.BeginXRFrame = RE_BeginXRFrame;
+	re.SetRepeatScreen = RE_SetRepeatScreen;
+	re.RepeatScreenReady = RE_RepeatScreenReady;
 	re.ClearVRFramebuffer = RE_ClearVRFramebuffer;
 	re.WaitForRenderComplete = RE_WaitForRenderComplete;
 

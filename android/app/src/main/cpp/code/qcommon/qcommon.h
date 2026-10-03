@@ -1059,8 +1059,8 @@ void CL_PacketEvent( netadr_t from, msg_t *msg );
 
 void CL_ConsolePrint( char *text );
 
-void CL_LoadingPump( void );
-// keep the VR headset fed from inside a map load's long steps
+// between a load's steps; redraw says a redrawn loading screen may register shaders from the caller
+void CL_LoadingPump( qboolean redraw );
 
 void CL_MapLoading( void );
 // do a screen update before starting to load a map

@@ -375,7 +375,7 @@ sfxHandle_t	S_Base_RegisterSound( const char *name, qboolean compressed ) {
 	sfx->soundCompressed = compressed;
 
   S_memoryLoad(sfx);
-	CL_LoadingPump();
+	CL_LoadingPump( qtrue ); // no shader parses here: a redrawn loading screen is fine
 
 	if ( sfx->defaultSound ) {
 		Com_Printf( S_COLOR_YELLOW "WARNING: could not find %s - using default\n", sfx->soundName );

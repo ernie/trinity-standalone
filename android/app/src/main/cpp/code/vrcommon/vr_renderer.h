@@ -18,15 +18,13 @@ void VR_ProcessFrame( VR_Engine* engine );
 // VR_ProcessFrame to proceed
 void VR_Renderer_RestoreState( VR_Engine* engine );
 
-// A map load is starting: keep the headset fed until gameplay frames resume
-void VR_Renderer_MapLoadBegin(VR_Engine* engine);
-// From inside a load's long steps, on the main thread: submit a frame if due
-void VR_Renderer_LoadingPump(VR_Engine* engine);
 // About to draw: acquire this frame's images and begin the renderer's XR frame
 void VR_Renderer_BeginRender(VR_Engine* engine);
 
 // Submit VR frame during loading if needed (returns qtrue if a frame was submitted)
-qboolean VR_Renderer_SubmitLoadingFrame(VR_Engine* engine);
+qboolean VR_Renderer_SubmitLoadingFrame(VR_Engine* engine, qboolean tracked);
+// A display-paced frame that recomposes the last screen under the current head and hands, when one is due
+qboolean VR_Renderer_TrackedLoadingFrame(VR_Engine* engine);
 
 // Finish any in-progress XR frame during shutdown so swapchains can be safely destroyed.
 // This releases swapchain images and calls xrEndFrame. Called from vid_restart.

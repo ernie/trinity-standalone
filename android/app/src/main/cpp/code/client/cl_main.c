@@ -33,7 +33,6 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 
 #include "../vrcommon/vr_base.h"
 #include "../vrcommon/vr_cvars.h"
-#include "../vrcommon/vr_renderer.h"
 
 #include <SDL.h>
 
@@ -990,17 +989,6 @@ void CL_FlushMemory(void)
 
 /*
 =====================
-CL_LoadingPump
-
-Keeps the headset fed from inside a map load's long steps
-=====================
-*/
-void CL_LoadingPump( void ) {
-	VR_Renderer_LoadingPump( VR_GetEngine() );
-}
-
-/*
-=====================
 CL_MapLoading
 
 A local server is starting to load a map, so update the
@@ -1021,9 +1009,6 @@ void CL_MapLoading( void ) {
 
 	Con_Close();
 	Key_SetCatcher( 0 );
-
-	// the connect screen drawn below stays up until cgame's loading screen
-	VR_Renderer_MapLoadBegin( VR_GetEngine() );
 
 	// if we are already connected to the local host, stay connected
 	if ( clc.state >= CA_CONNECTED && !Q_stricmp( clc.servername, "localhost" ) ) {
