@@ -19,7 +19,7 @@ if(FULL_BUILD)
     # Include project identity (name, version, etc.)
     include(identity)
 
-    project(${PROJECT_NAME} VERSION ${PROJECT_VERSION} LANGUAGES C)
+    project(${PROJECT_NAME} VERSION ${PROJECT_VERSION} LANGUAGES C CXX)
 
     #############################################################################
     # Build Options
@@ -58,6 +58,8 @@ if(FULL_BUILD)
 
     set(CMAKE_C_STANDARD 99)
     set(CMAKE_C_STANDARD_REQUIRED ON)
+    set(CMAKE_CXX_STANDARD 17)
+    set(CMAKE_CXX_STANDARD_REQUIRED ON)
     set(ENGINE_BINARY "ioquake3_vulkan")
 
     # Source directory
@@ -136,6 +138,12 @@ if(FULL_BUILD)
         # Add Vulkan renderer sources
         list(APPEND ENGINE_SOURCES ${RENDERER_VK_BINARY_SOURCES})
         list(APPEND CLIENT_DEFINITIONS USE_VULKAN)
+        # The model parser keeps KTX2 images because the transcoder below can read them; only the formats it
+        # needs for RGBA output of Meta's UASTC files stay compiled in
+        list(APPEND CLIENT_DEFINITIONS VR_MODEL_KTX2=1 BASISD_SUPPORT_KTX2=1 BASISD_SUPPORT_KTX2_ZSTD=1
+            BASISD_SUPPORT_UASTC=1 BASISD_SUPPORT_DXT1=0 BASISD_SUPPORT_DXT5A=0 BASISD_SUPPORT_BC7_MODE5=0
+            BASISD_SUPPORT_PVRTC1=0 BASISD_SUPPORT_ETC2_EAC_A8=0 BASISD_SUPPORT_ASTC=0 BASISD_SUPPORT_ATC=0
+            BASISD_SUPPORT_FXT1=0 BASISD_SUPPORT_PVRTC2=0 BASISD_SUPPORT_ETC2_EAC_RG11=0)
 
         #############################################################################
         # Engine library

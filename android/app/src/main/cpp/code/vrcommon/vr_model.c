@@ -71,12 +71,30 @@ static int VRM_PrimitiveTriangles( const cgltf_primitive *primitive ) {
 static const cgltf_image *VRM_BaseImage( const cgltf_material *material ) {
 	const cgltf_texture *texture =
 		material && material->has_pbr_metallic_roughness ? material->pbr_metallic_roughness.base_color_texture.texture : NULL;
-	return texture ? texture->image : NULL;
+	if ( !texture )
+		return NULL;
+	/* a KHR_texture_basisu texture carries its image in the extension, not in source */
+	return texture->image ? texture->image : texture->basisu_image;
 }
 
 /* The encoded bytes of an image held in a buffer view or a base64 data URI; 0 when it is neither PNG nor JPEG. */
-static size_t VRM_ImageBytes( const cgltf_image *image, const cgltf_options *options, unsigned char *out, int *jpeg ) {
+#ifndef VR_MODEL_KTX2
+#define VR_MODEL_KTX2 0
+#endif
+
+static int VRM_ImageFormat( const unsigned char *source, size_t size ) {
 	static const unsigned char png[4] = {0x89, 'P', 'N', 'G'};
+	static const unsigned char ktx2[12] = {0xAB, 'K', 'T', 'X', ' ', '2', '0', 0xBB, '\r', '\n', 0x1A, '\n'};
+	if ( size >= 4 && !memcmp( source, png, 4 ) )
+		return VR_MODEL_IMAGE_PNG;
+	if ( size >= 2 && source[0] == 0xFF && source[1] == 0xD8 )
+		return VR_MODEL_IMAGE_JPEG;
+	if ( VR_MODEL_KTX2 && size >= 48 && !memcmp( source, ktx2, 12 ) )
+		return VR_MODEL_IMAGE_KTX2;
+	return -1;
+}
+
+static size_t VRM_ImageBytes( const cgltf_image *image, const cgltf_options *options, unsigned char *out, int *format ) {
 	const unsigned char *source = NULL;
 	void *decoded = NULL;
 	size_t size = 0;
@@ -95,11 +113,10 @@ static size_t VRM_ImageBytes( const cgltf_image *image, const cgltf_options *opt
 			return 0;
 		source = decoded;
 	}
-	if ( size < 4 || size > 0x7fffffff ||
-		 ( memcmp( source, png, 4 ) && !( source[0] == 0xFF && source[1] == 0xD8 ) ) )
+	if ( size < 4 || size > 0x7fffffff || VRM_ImageFormat( source, size ) < 0 )
 		size = 0;
 	else {
-		*jpeg = source[0] == 0xFF;
+		*format = VRM_ImageFormat( source, size );
 		if ( out )
 			memcpy( out, source, size );
 	}
@@ -132,6 +149,58 @@ static void VRM_DeriveNormals( vrModelPrimitive_t *p ) {
 			out[2] += n[2];
 		}
 	}
+}
+
+/* The node's transform as a pose: its TRS without the scale, or the same taken back out of its matrix. */
+static void VRM_RestPose( const cgltf_node *node, vrModelPose_t *pose ) {
+	float m[16], len[3], t;
+	int i, k;
+	if ( !node->has_matrix ) {
+		memcpy( pose->position, node->translation, sizeof( pose->position ) );
+		memcpy( pose->orientation, node->rotation, sizeof( pose->orientation ) );
+		return;
+	}
+	memcpy( m, node->matrix, sizeof( m ) );
+	for ( k = 0; k < 3; k++ ) {
+		pose->position[k] = m[12 + k];
+		len[k] = sqrtf( m[k * 4] * m[k * 4] + m[k * 4 + 1] * m[k * 4 + 1] + m[k * 4 + 2] * m[k * 4 + 2] );
+		for ( i = 0; i < 3 && len[k] > 0; i++ )
+			m[k * 4 + i] /= len[k];
+	}
+	/* a mirrored basis flips one axis back so the quaternion below is a rotation */
+	if ( m[0] * ( m[5] * m[10] - m[6] * m[9] ) - m[4] * ( m[1] * m[10] - m[2] * m[9] ) + m[8] * ( m[1] * m[6] - m[2] * m[5] ) < 0 )
+		for ( i = 0; i < 3; i++ )
+			m[8 + i] = -m[8 + i];
+	t = m[0] + m[5] + m[10];
+	if ( t > 0 ) {
+		const float r = sqrtf( 1 + t ), w = 0.5f / r;
+		pose->orientation[0] = ( m[6] - m[9] ) * w;
+		pose->orientation[1] = ( m[8] - m[2] ) * w;
+		pose->orientation[2] = ( m[1] - m[4] ) * w;
+		pose->orientation[3] = 0.5f * r;
+	} else {
+		const int a = m[0] >= m[5] && m[0] >= m[10] ? 0 : m[5] >= m[10] ? 1 : 2, b = ( a + 1 ) % 3, c = ( a + 2 ) % 3;
+		const float r = sqrtf( 1 + m[a * 5] - m[b * 5] - m[c * 5] ), w = 0.5f / r;
+		pose->orientation[a] = 0.5f * r;
+		pose->orientation[b] = ( m[a * 4 + b] + m[b * 4 + a] ) * w;
+		pose->orientation[c] = ( m[a * 4 + c] + m[c * 4 + a] ) * w;
+		pose->orientation[3] = ( m[b * 4 + c] - m[c * 4 + b] ) * w;
+	}
+}
+
+/* The first animation's channel of one path for a node, when it holds the keys the path needs; NULL otherwise. */
+static const cgltf_accessor *VRM_Channel( const cgltf_data *data, const cgltf_node *node, cgltf_animation_path_type path ) {
+	const cgltf_animation *animation = data->animations_count ? &data->animations[0] : NULL;
+	const cgltf_type type = path == cgltf_animation_path_type_rotation ? cgltf_type_vec4 : cgltf_type_vec3;
+	cgltf_size i;
+	for ( i = 0; animation && i < animation->channels_count; i++ ) {
+		const cgltf_animation_channel *channel = &animation->channels[i];
+		const cgltf_accessor *output = channel->sampler ? channel->sampler->output : NULL;
+		if ( channel->target_node == node && channel->target_path == path && output && output->type == type &&
+			 output->count > 0 && output->count <= 0x10000 )
+			return output;
+	}
+	return NULL;
 }
 
 /* Builds the model into the arena. Returns 0 when the asset is over a limit or, while filling, inconsistent. */
@@ -184,16 +253,60 @@ static int VRM_Build( const cgltf_data *data, const cgltf_options *options, int 
 	model->materials = VRM_Take( arena, ( data->materials_count + 1 ) * sizeof( vrModelMaterial_t ) );
 	model->images = VRM_Take( arena, data->images_count * sizeof( vrModelImage_t ) );
 	model->imageCount = 0;
+	model->skinCount = (int)data->skins_count;
+	model->skins = VRM_Take( arena, data->skins_count * sizeof( vrModelSkin_t ) );
 
-	for ( head = 0; head < nodes && fill; head++ ) {
+	for ( head = 0; head < nodes; head++ ) {
 		const cgltf_node *source = queue[head];
-		vrModelNode_t *node = &model->nodes[head];
+		const cgltf_accessor *positions = VRM_Channel( data, source, cgltf_animation_path_type_translation );
+		const cgltf_accessor *orientations = VRM_Channel( data, source, cgltf_animation_path_type_rotation );
+		vrModelNode_t local, *node = fill ? &model->nodes[head] : &local;
 		memset( node, 0, sizeof( *node ) );
+		node->positionKeys = positions ? (int)positions->count : 0;
+		node->orientationKeys = orientations ? (int)orientations->count : 0;
+		node->positions = VRM_Take( arena, (size_t)node->positionKeys * 3 * sizeof( float ) );
+		node->orientations = VRM_Take( arena, (size_t)node->orientationKeys * 4 * sizeof( float ) );
+		if ( !fill )
+			continue;
 		node->parent = source->parent ? nodeIndex[source->parent - data->nodes] : -1;
 		node->mesh = source->mesh ? (int)( source->mesh - data->meshes ) : -1;
+		node->skin = source->skin ? (int)( source->skin - data->skins ) : -1;
 		cgltf_node_transform_local( source, node->local );
+		VRM_RestPose( source, &node->rest );
 		if ( source->name )
 			strncpy( node->name, source->name, VR_MODEL_NAME_SIZE - 1 );
+		if ( ( positions && cgltf_accessor_unpack_floats( positions, node->positions, (cgltf_size)node->positionKeys * 3 ) !=
+								(cgltf_size)node->positionKeys * 3 ) ||
+			 ( orientations && cgltf_accessor_unpack_floats( orientations, node->orientations,
+															  (cgltf_size)node->orientationKeys * 4 ) != (cgltf_size)node->orientationKeys * 4 ) )
+			return 0;
+	}
+
+	/* Every joint has to be a node of the scene; a skin without bind matrices binds at the identity. */
+	for ( i = 0; i < data->skins_count; i++ ) {
+		const cgltf_skin *source = &data->skins[i];
+		vrModelSkin_t local, *skin = fill ? &model->skins[i] : &local;
+		int k;
+		if ( !source->joints_count || source->joints_count > VR_MODEL_MAX_JOINTS )
+			return 0;
+		if ( source->inverse_bind_matrices && ( source->inverse_bind_matrices->type != cgltf_type_mat4 ||
+												source->inverse_bind_matrices->count < source->joints_count ) )
+			return 0;
+		skin->jointCount = (int)source->joints_count;
+		skin->joints = VRM_Take( arena, source->joints_count * sizeof( int ) );
+		skin->inverseBind = VRM_Take( arena, source->joints_count * 16 * sizeof( float ) );
+		if ( !fill )
+			continue;
+		for ( k = 0; k < skin->jointCount; k++ ) {
+			skin->joints[k] = nodeIndex[source->joints[k] - data->nodes];
+			if ( skin->joints[k] < 0 )
+				return 0;
+			if ( !source->inverse_bind_matrices ) {
+				memset( skin->inverseBind + k * 16, 0, 16 * sizeof( float ) );
+				skin->inverseBind[k * 16] = skin->inverseBind[k * 16 + 5] = skin->inverseBind[k * 16 + 10] = skin->inverseBind[k * 16 + 15] = 1;
+			} else if ( !cgltf_accessor_read_float( source->inverse_bind_matrices, (cgltf_size)k, skin->inverseBind + k * 16, 16 ) )
+				return 0;
+		}
 	}
 
 	primitives = 0;
@@ -204,13 +317,20 @@ static int VRM_Build( const cgltf_data *data, const cgltf_options *options, int 
 		}
 		for ( j = 0; j < data->meshes[i].primitives_count; j++ ) {
 			const cgltf_primitive *source = &data->meshes[i].primitives[j];
-			const cgltf_accessor *position, *normal, *texCoord;
+			const cgltf_accessor *position, *normal, *texCoord, *joints, *weights;
 			vrModelPrimitive_t local, *p = fill ? &model->primitives[primitives] : &local;
 			int k;
 			if ( !VRM_Drawable( source ) )
 				continue;
 			position = VRM_Attribute( source, cgltf_attribute_type_position, 0 );
 			normal = VRM_Attribute( source, cgltf_attribute_type_normal, 0 );
+			joints = VRM_Attribute( source, cgltf_attribute_type_joints, 0 );
+			weights = VRM_Attribute( source, cgltf_attribute_type_weights, 0 );
+			/* skinning takes both, four a vertex */
+			if ( !joints || !weights || joints->type != cgltf_type_vec4 || weights->type != cgltf_type_vec4 ||
+				 joints->count != position->count || weights->count != position->count ||
+				 ( joints->component_type != cgltf_component_type_r_8u && joints->component_type != cgltf_component_type_r_16u ) )
+				joints = weights = NULL;
 			texCoord = VRM_Attribute( source, cgltf_attribute_type_texcoord,
 									  source->material && source->material->has_pbr_metallic_roughness
 										  ? source->material->pbr_metallic_roughness.base_color_texture.texcoord
@@ -229,9 +349,22 @@ static int VRM_Build( const cgltf_data *data, const cgltf_options *options, int 
 			p->normals = VRM_Take( arena, (size_t)p->vertexCount * 3 * sizeof( float ) );
 			p->texCoords = VRM_Take( arena, (size_t)p->vertexCount * 2 * sizeof( float ) );
 			p->indices = VRM_Take( arena, (size_t)p->indexCount * sizeof( unsigned ) );
+			p->joints = joints ? VRM_Take( arena, (size_t)p->vertexCount * 4 * sizeof( unsigned short ) ) : NULL;
+			p->weights = weights ? VRM_Take( arena, (size_t)p->vertexCount * 4 * sizeof( float ) ) : NULL;
 			primitives++;
 			if ( !fill )
 				continue;
+			for ( k = 0; joints && k < p->vertexCount; k++ ) {
+				cgltf_uint j[4];
+				int c;
+				if ( !cgltf_accessor_read_uint( joints, (cgltf_size)k, j, 4 ) )
+					return 0;
+				for ( c = 0; c < 4; c++ )
+					p->joints[k * 4 + c] = (unsigned short)( j[c] > 0xffff ? 0xffff : j[c] );
+			}
+			if ( weights && cgltf_accessor_unpack_floats( weights, p->weights, (cgltf_size)p->vertexCount * 4 ) !=
+								(cgltf_size)p->vertexCount * 4 )
+				return 0;
 			model->meshes[i].primitiveCount++;
 			if ( cgltf_accessor_unpack_floats( position, p->positions, (cgltf_size)p->vertexCount * 3 ) !=
 				 (cgltf_size)p->vertexCount * 3 )
@@ -255,6 +388,19 @@ static int VRM_Build( const cgltf_data *data, const cgltf_options *options, int 
 	}
 	model->triangleCount = triangles;
 
+	/* a skinned part's joints have to be in the skin of the node that draws it */
+	for ( head = 0; head < nodes && fill; head++ ) {
+		const vrModelNode_t *node = &model->nodes[head];
+		const vrModelMesh_t *mesh = node->mesh >= 0 ? &model->meshes[node->mesh] : NULL;
+		int p, k;
+		if ( !mesh || node->skin < 0 )
+			continue;
+		for ( p = mesh->firstPrimitive; p < mesh->firstPrimitive + mesh->primitiveCount; p++ )
+			for ( k = 0; model->primitives[p].joints && k < model->primitives[p].vertexCount * 4; k++ )
+				if ( model->primitives[p].joints[k] >= model->skins[node->skin].jointCount )
+					return 0;
+	}
+
 	/* only an image some base color uses is kept, once however many materials share it */
 	for ( i = 0; i < data->images_count; i++ )
 		imageIndex[i] = -1;
@@ -263,7 +409,7 @@ static int VRM_Build( const cgltf_data *data, const cgltf_options *options, int 
 		const cgltf_material *source = i < data->materials_count ? &data->materials[i] : NULL;
 		const cgltf_image *image = VRM_BaseImage( source );
 		vrModelMaterial_t local, *m = fill ? &model->materials[i] : &local;
-		int k, jpeg = 0;
+		int k, format = 0;
 		for ( k = 0; k < 4; k++ )
 			m->color[k] = source && source->has_pbr_metallic_roughness ? source->pbr_metallic_roughness.base_color_factor[k] : 1;
 		m->doubleSided = source && source->double_sided;
@@ -279,22 +425,26 @@ static int VRM_Build( const cgltf_data *data, const cgltf_options *options, int 
 				unsigned char *bytes;
 				/* the sizing pass measures; the fill pass has to find the same bytes */
 				if ( !fill )
-					imageSize[g] = VRM_ImageBytes( image, options, NULL, &jpeg );
+					imageSize[g] = VRM_ImageBytes( image, options, NULL, &format );
 				bytes = VRM_Take( arena, imageSize[g] );
 				imageIndex[g] = imageSize[g] ? model->imageCount++ : -2;
 				if ( fill && imageSize[g] ) {
 					vrModelImage_t *out = &model->images[imageIndex[g]];
-					if ( VRM_ImageBytes( image, options, bytes, &jpeg ) != imageSize[g] )
+					if ( VRM_ImageBytes( image, options, bytes, &format ) != imageSize[g] )
 						return 0;
 					out->data = bytes;
 					out->size = (int)imageSize[g];
-					out->jpeg = jpeg;
+					out->format = format;
 					out->pixels = NULL;
 					out->width = out->height = 0;
 				}
 			}
 			if ( imageIndex[g] >= 0 )
 				m->image = imageIndex[g];
+			else
+				/* an undecodable texture gets a matte mid-gray rather than the material's white base */
+				for ( k = 0; k < 3; k++ )
+					m->color[k] *= 0.62f;
 		}
 	}
 	return !arena->overflow;
@@ -383,7 +533,15 @@ int VR_ModelImageSize( const vrModelImage_t *image, int *width, int *height ) {
 	int at = 2;
 	if ( !d )
 		return 0;
-	if ( !image->jpeg ) {
+	if ( image->format == VR_MODEL_IMAGE_KTX2 ) {
+		/* the identifier, then vkFormat, typeSize, pixelWidth, pixelHeight, little-endian */
+		if ( image->size < 48 )
+			return 0;
+		*width = (int)( (unsigned)d[20] | d[21] << 8 | d[22] << 16 | (unsigned)d[23] << 24 );
+		*height = (int)( (unsigned)d[24] | d[25] << 8 | d[26] << 16 | (unsigned)d[27] << 24 );
+		return 1;
+	}
+	if ( image->format == VR_MODEL_IMAGE_PNG ) {
 		/* the signature, then the header chunk: length, "IHDR", width, height */
 		if ( image->size < 24 || memcmp( d, "\x89PNG\r\n\x1a\n", 8 ) || memcmp( d + 12, "IHDR", 4 ) )
 			return 0;
@@ -412,6 +570,21 @@ int VR_ModelImageSize( const vrModelImage_t *image, int *width, int *height ) {
 		at += 2 + ( d[at + 2] << 8 | d[at + 3] );
 	}
 	return 0;
+}
+
+int VR_ModelKeyframe( const vrModel_t *model, int node, int index, vrModelPose_t *pose ) {
+	const vrModelNode_t *n;
+	if ( node < 0 || node >= model->nodeCount )
+		return 0;
+	n = &model->nodes[node];
+	if ( index < 0 || ( index >= n->positionKeys && index >= n->orientationKeys ) )
+		return 0;
+	*pose = n->rest;
+	if ( index < n->positionKeys )
+		memcpy( pose->position, n->positions + index * 3, sizeof( pose->position ) );
+	if ( index < n->orientationKeys )
+		memcpy( pose->orientation, n->orientations + index * 4, sizeof( pose->orientation ) );
+	return 1;
 }
 
 void VR_ModelBindNodes( const vrModel_t *model, const char ( *names )[VR_MODEL_NAME_SIZE], int count, int *map ) {
@@ -505,6 +678,23 @@ size_t VR_ModelPack( const vrModel_t *model, void *out, unsigned *offsets ) {
 	return size;
 }
 
+/* lit is the material's color in bytes; toEye NULL means no eye to light from, so the ambient floor. */
+static void VRM_Light( const vrModelMaterial_t *material, const float lit[3], const float *n, const float *toEye,
+					   unsigned char *rgba ) {
+	const float nn = n[0] * n[0] + n[1] * n[1] + n[2] * n[2];
+	const float vv = toEye ? toEye[0] * toEye[0] + toEye[1] * toEye[1] + toEye[2] * toEye[2] : 0;
+	float facing = nn > 0 && vv > 0 ? ( n[0] * toEye[0] + n[1] * toEye[1] + n[2] * toEye[2] ) / sqrtf( nn * vv ) : 0, light;
+	int k;
+	if ( facing < 0 )
+		facing = material->doubleSided ? -facing : 0;
+	light = VR_MODEL_AMBIENT + ( 1 - VR_MODEL_AMBIENT ) * facing;
+	for ( k = 0; k < 3; k++ ) {
+		const float c = lit[k] * light + 0.5f;
+		rgba[k] = (unsigned char)( c > 255 ? 255 : c );
+	}
+	rgba[3] = 255;
+}
+
 void VR_ModelShade( const vrModel_t *model, int primitive, const float world[16], const float eye[3],
 					unsigned char *rgba ) {
 	const vrModelPrimitive_t *p = &model->primitives[primitive];
@@ -514,9 +704,10 @@ void VR_ModelShade( const vrModel_t *model, int primitive, const float world[16]
 	const float c0 = m[5] * m[10] - m[6] * m[9], c1 = m[6] * m[8] - m[4] * m[10], c2 = m[4] * m[9] - m[5] * m[8];
 	const float det = m[0] * c0 + m[1] * c1 + m[2] * c2;
 	const float d[3] = {eye[0] - m[12], eye[1] - m[13], eye[2] - m[14]};
+	const int invertible = det > 1e-12f || det < -1e-12f;
 	float local[3] = {0, 0, 0}, lit[3];
 	int i, k;
-	if ( det > 1e-12f || det < -1e-12f ) {
+	if ( invertible ) {
 		const float r = 1 / det;
 		local[0] = r * ( c0 * d[0] + c1 * d[1] + c2 * d[2] );
 		local[1] = r * ( ( m[2] * m[9] - m[1] * m[10] ) * d[0] + ( m[0] * m[10] - m[2] * m[8] ) * d[1] +
@@ -527,17 +718,88 @@ void VR_ModelShade( const vrModel_t *model, int primitive, const float world[16]
 	for ( k = 0; k < 3; k++ )
 		lit[k] = material->color[k] * 255;
 	for ( i = 0; i < p->vertexCount; i++, rgba += 4 ) {
-		const float *n = p->normals + i * 3, *q = p->positions + i * 3;
+		const float *q = p->positions + i * 3;
 		const float v[3] = {local[0] - q[0], local[1] - q[1], local[2] - q[2]};
-		const float nn = n[0] * n[0] + n[1] * n[1] + n[2] * n[2], vv = v[0] * v[0] + v[1] * v[1] + v[2] * v[2];
-		float facing = nn > 0 && vv > 0 && det != 0 ? ( n[0] * v[0] + n[1] * v[1] + n[2] * v[2] ) / sqrtf( nn * vv ) : 0, light;
-		if ( facing < 0 )
-			facing = material->doubleSided ? -facing : 0;
-		light = VR_MODEL_AMBIENT + ( 1 - VR_MODEL_AMBIENT ) * facing;
-		for ( k = 0; k < 3; k++ ) {
-			const float c = lit[k] * light + 0.5f;
-			rgba[k] = (unsigned char)( c > 255 ? 255 : c );
+		VRM_Light( material, lit, p->normals + i * 3, invertible ? v : NULL, rgba );
+	}
+}
+
+/* Each joint's world matrix after its inverse bind; returns the joint count, 0 without such a skin. */
+static int VRM_SkinMatrices( const vrModel_t *model, int skin, const float *world, float *matrices ) {
+	const vrModelSkin_t *s;
+	int j;
+	if ( skin < 0 || skin >= model->skinCount )
+		return 0;
+	s = &model->skins[skin];
+	for ( j = 0; j < s->jointCount; j++ )
+		VRM_Multiply( world + s->joints[j] * 16, s->inverseBind + j * 16, matrices + j * 16 );
+	return s->jointCount;
+}
+
+/* One vertex under its weighted joint matrices: position with w 1, and its normal made unit again. */
+static void VRM_SkinVertex( const vrModelPrimitive_t *p, const float *matrices, int jointCount, int i, float position[4],
+							float normal[3] ) {
+	const float *v = p->positions + i * 3, *n = p->normals + i * 3;
+	float m[16], len;
+	int k, c;
+	memset( m, 0, sizeof( m ) );
+	for ( k = 0; k < 4; k++ ) {
+		const float w = p->weights[i * 4 + k];
+		const int j = p->joints[i * 4 + k];
+		if ( w != 0 && j < jointCount )
+			for ( c = 0; c < 16; c++ )
+				m[c] += w * matrices[j * 16 + c];
+	}
+	for ( c = 0; c < 3; c++ ) {
+		position[c] = m[c] * v[0] + m[4 + c] * v[1] + m[8 + c] * v[2] + m[12 + c];
+		normal[c] = m[c] * n[0] + m[4 + c] * n[1] + m[8 + c] * n[2];
+	}
+	position[3] = 1;
+	len = sqrtf( normal[0] * normal[0] + normal[1] * normal[1] + normal[2] * normal[2] );
+	for ( c = 0; c < 3 && len > 0; c++ )
+		normal[c] /= len;
+}
+
+void VR_ModelSkin( const vrModel_t *model, int primitive, int skin, const float *world, float *positions, float *normals ) {
+	const vrModelPrimitive_t *p = &model->primitives[primitive];
+	float matrices[VR_MODEL_MAX_JOINTS * 16], position[4], normal[3];
+	const int joints = p->joints ? VRM_SkinMatrices( model, skin, world, matrices ) : 0;
+	int i;
+	for ( i = 0; i < p->vertexCount; i++ ) {
+		if ( joints )
+			VRM_SkinVertex( p, matrices, joints, i, position, normal );
+		else {
+			memcpy( position, p->positions + i * 3, 3 * sizeof( float ) );
+			position[3] = 1;
+			memcpy( normal, p->normals + i * 3, sizeof( normal ) );
 		}
-		rgba[3] = 255;
+		if ( positions )
+			memcpy( positions + i * 4, position, sizeof( position ) );
+		if ( normals )
+			memcpy( normals + i * 3, normal, sizeof( normal ) );
+	}
+}
+
+void VR_ModelSkinShade( const vrModel_t *model, int primitive, int skin, const float *world, const float eye[3],
+						float *positions, unsigned char *rgba ) {
+	const vrModelPrimitive_t *p = &model->primitives[primitive];
+	const vrModelMaterial_t *material = &model->materials[p->material];
+	float matrices[VR_MODEL_MAX_JOINTS * 16], normal[3], lit[3];
+	const int joints = p->joints ? VRM_SkinMatrices( model, skin, world, matrices ) : 0;
+	int i, k;
+	for ( k = 0; k < 3; k++ )
+		lit[k] = material->color[k] * 255;
+	for ( i = 0; i < p->vertexCount; i++, positions += 4, rgba += 4 ) {
+		float toEye[3];
+		if ( joints )
+			VRM_SkinVertex( p, matrices, joints, i, positions, normal );
+		else {
+			memcpy( positions, p->positions + i * 3, 3 * sizeof( float ) );
+			positions[3] = 1;
+			memcpy( normal, p->normals + i * 3, sizeof( normal ) );
+		}
+		for ( k = 0; k < 3; k++ )
+			toEye[k] = eye[k] - positions[k];
+		VRM_Light( material, lit, normal, toEye, rgba );
 	}
 }

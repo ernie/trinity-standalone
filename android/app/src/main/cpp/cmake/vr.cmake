@@ -18,7 +18,11 @@ set(VR_COMMON_SOURCES
     ${SOURCE_DIR}/vrcommon/vr_input.c
     ${SOURCE_DIR}/vrcommon/vr_instance.c
     ${SOURCE_DIR}/vrcommon/vr_math.c
+    ${SOURCE_DIR}/vrcommon/vr_meta_pose.c
     ${SOURCE_DIR}/vrcommon/vr_model.c
+    # KTX2 (Basis Universal) textures for Meta's controller models: the one C++ translation unit and its wrapper
+    ${SOURCE_DIR}/vrcommon/vr_ktx2.cpp
+    ${SOURCE_DIR}/thirdparty/basisu/transcoder/basisu_transcoder.cpp
     ${SOURCE_DIR}/vrcommon/vr_render_loop.c
     ${SOURCE_DIR}/vrcommon/vr_router.c
     ${SOURCE_DIR}/vrcommon/vr_session.c

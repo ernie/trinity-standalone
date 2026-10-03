@@ -34,6 +34,7 @@ Compiled into the engine binary:
   libvorbis                                  BSD-3-Clause
   Opus                                       BSD-3-Clause
   opusfile                                   BSD-3-Clause
+  Basis Universal transcoder                 Apache-2.0
 
 OpenAL Soft is licensed under the GNU Library General Public License, version 2,
 and is distributed here as a separate shared library, loaded at runtime and not
@@ -51,13 +52,14 @@ Apache License 2.0
 ================================================================================
 
 Applies to the Vulkan validation layer, SPIRV-Tools linked into it, the OpenXR
-loader, Mbed TLS linked into libcurl.so, and the Apache-licensed portion of
-SPIRV-Headers.
+loader, Mbed TLS linked into libcurl.so, the Basis Universal transcoder compiled
+into the engine, and the Apache-licensed portion of SPIRV-Headers.
 
 https://github.com/KhronosGroup/Vulkan-ValidationLayers
 https://github.com/KhronosGroup/SPIRV-Tools
 https://github.com/KhronosGroup/OpenXR-SDK
 https://github.com/Mbed-TLS/mbedtls
+https://github.com/BinomialLLC/basis_universal
 
 
                                  Apache License

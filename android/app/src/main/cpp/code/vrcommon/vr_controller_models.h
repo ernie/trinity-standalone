@@ -5,8 +5,8 @@
 #include "vr_types.h"
 #include "vk_xr_models.h"
 
-// enabled: the instance carries both render model extensions
-void VR_ControllerModels_Init( XrInstance instance, XrSession session, qboolean enabled );
+// enabled: the instance carries both EXT render model extensions; meta: it carries XR_FB_render_model instead
+void VR_ControllerModels_Init( XrInstance instance, XrSession session, qboolean enabled, qboolean meta );
 // Before the session is destroyed
 void VR_ControllerModels_Shutdown( void );
 // XrEventDataInteractionRenderModelsChangedEXT arrived

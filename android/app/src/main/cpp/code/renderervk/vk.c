@@ -8,6 +8,7 @@
 #include "../vrcommon/vr_gameplay.h"  // For VR_ShouldDisableStereo
 #include "../vrcommon/vr_virtual_screen.h"
 #include "../vrcommon/vr_controller_models.h"
+#include "../vrcommon/vr_ktx2.h"
 
 // VR client state accessible from renderer
 extern vr_clientinfo_t vr;
@@ -12398,6 +12399,17 @@ static void vk_draw_virtual_screen_mesh( VkPipeline pipeline, const float model[
 #define VSCREEN_POOL_RINGS		3
 #define VSCREEN_POINTER_VERTICES	( 12 + ( 2 * VSCREEN_POOL_RINGS - 1 ) * VSCREEN_POOL_SEGMENTS * 3 )
 
+// The transcoder takes a size_t allocator; the renderer's takes an int
+static void *vk_ktx2_alloc( size_t size )
+{
+	return size <= 0x7fffffff ? ri.Malloc( (int)size ) : NULL;
+}
+
+static void vk_ktx2_free( void *memory )
+{
+	ri.Free( memory );
+}
+
 // One of an asset's base color textures; the white image when it won't decode. The decoded pixels stay with
 // the model, so a renderer restart only uploads them again; a width below zero marks a failure.
 static image_t *vk_virtual_screen_model_image( const vkXRModel_t *model, int asset, int index )
@@ -12415,10 +12427,12 @@ static image_t *vk_virtual_screen_model_image( const vkXRModel_t *model, int ass
 		// Decoding takes several times the pixels in zone and hunk memory, so the header's size is checked first
 		if ( VR_ModelImageSize( source, &width, &height ) && width > 0 && height > 0 &&
 			width <= VSCREEN_MODEL_TEXTURE_MAX && height <= VSCREEN_MODEL_TEXTURE_MAX ) {
-			if ( source->jpeg ) {
+			if ( source->format == VR_MODEL_IMAGE_JPEG ) {
 				R_DecodeJPG( name, source->data, source->size, &pic, &width, &height );
-			} else {
+			} else if ( source->format == VR_MODEL_IMAGE_PNG ) {
 				R_DecodePNG( name, source->data, source->size, &pic, &width, &height );
+			} else if ( source->format == VR_MODEL_IMAGE_KTX2 ) {
+				VR_KTX2Decode( source->data, source->size, &pic, &width, &height, vk_ktx2_alloc, vk_ktx2_free );
 			}
 		}
 		if ( pic && width > 0 && height > 0 && width <= VSCREEN_MODEL_TEXTURE_MAX && height <= VSCREEN_MODEL_TEXTURE_MAX ) {
@@ -12529,11 +12543,13 @@ void vk_prepare_xr_models( void )
 
 
 // Each part draws from the asset's static buffer under its node's matrix; only its headlight colors, four
-// bytes a vertex, are made each frame.
+// bytes a vertex, are made each frame. A skinned part's joints move it piecewise, so its positions are posed
+// on the CPU into the frame's ring as well and it draws under the identity.
 static void vk_draw_virtual_screen_models( void )
 {
 	static float world[VR_MODEL_MAX_NODES * 16];
 	static unsigned char visible[VR_MODEL_MAX_NODES];
+	static const float identity[16] = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1 };
 	VkXrResources *xr = &vk.xr;
 	qboolean bound = qfalse;
 	float eye[3];
@@ -12567,9 +12583,10 @@ static void vk_draw_virtual_screen_models( void )
 				const image_t *image = index >= 0 && index < VSCREEN_MODEL_IMAGES && tr.xrAssets[asset].images[index] ?
 					tr.xrAssets[asset].images[index] : tr.whiteImage;
 				const VkDeviceSize start = tr.xrAssets[asset].offsets[p];
+				const qboolean skinned = m->nodes[n].skin >= 0 && primitive->joints != NULL;
 				VkBuffer buffers[3];
 				VkDeviceSize offsets[3];
-				uint32_t colors;
+				uint32_t colors, positions = 0;
 
 				// A primitive without a triangle has no indices to bind
 				if ( primitive->indexCount < 3 ) {
@@ -12577,20 +12594,30 @@ static void vk_draw_virtual_screen_models( void )
 				}
 				// A full ring ends the controllers here; the next frame resizes the ring and is dropped
 				colors = vk_virtual_screen_reserve( primitive->vertexCount * 4 );
-				if ( colors == ~0U ) {
+				if ( skinned && colors != ~0U ) {
+					positions = vk_virtual_screen_reserve( primitive->vertexCount * 4 * sizeof( float ) );
+				}
+				if ( colors == ~0U || positions == ~0U ) {
 					return;
 				}
-				VR_ModelShade( m, p, world + n * 16, eye, vk.cmd->vertex_buffer_ptr + colors );
-				buffers[0] = buffers[2] = tr.xrAssets[asset].buffer;
+				if ( skinned ) {
+					VR_ModelSkinShade( m, p, m->nodes[n].skin, world, eye, (float *)( vk.cmd->vertex_buffer_ptr + positions ),
+						vk.cmd->vertex_buffer_ptr + colors );
+				} else {
+					VR_ModelShade( m, p, world + n * 16, eye, vk.cmd->vertex_buffer_ptr + colors );
+				}
+				buffers[0] = skinned ? vk.cmd->vertex_buffer : tr.xrAssets[asset].buffer;
 				buffers[1] = vk.cmd->vertex_buffer;
-				offsets[0] = start;
+				buffers[2] = tr.xrAssets[asset].buffer;
+				offsets[0] = skinned ? positions : start;
 				offsets[1] = colors;
 				offsets[2] = start + VR_MODEL_PACK_ST( primitive->vertexCount );
 				if ( !bound ) {
 					qvkCmdBindPipeline( vk.cmd->command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, xr->vscreenModelPipeline );
 					bound = qtrue;
 				}
-				qvkCmdPushConstants( vk.cmd->command_buffer, vk.pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT, 0, 64, world + n * 16 );
+				qvkCmdPushConstants( vk.cmd->command_buffer, vk.pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT, 0, 64,
+					skinned ? identity : world + n * 16 );
 				qvkCmdBindDescriptorSets( vk.cmd->command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
 					vk.pipeline_layout, 1, 1, &image->descriptor, 0, NULL );
 				qvkCmdBindVertexBuffers( vk.cmd->command_buffer, 0, 3, buffers, offsets );

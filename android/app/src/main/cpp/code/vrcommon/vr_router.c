@@ -345,6 +345,10 @@ void VR_Router_Init( void ) {
 	vr.menuCursorY = vr.offhandCursorY = 240;
 }
 
+const clXRHandInput_t *VR_Router_Hands( void ) {
+	return input.valid ? input.hands : NULL;
+}
+
 qboolean VR_Router_PointerLayer( void ) {
 	return VR_StackHas( &stack, VRC_MENU ) || VR_StackHas( &stack, VRC_SCOREBOARD );
 }

@@ -37,6 +37,8 @@ static qboolean picoControllersEnabled = qfalse;
 static qboolean swapchainCreateFlagsEnabled = qfalse;
 // XR_EXT_render_model and XR_EXT_interaction_render_model are both enabled
 static qboolean controllerModelsEnabled = qfalse;
+// XR_FB_render_model is enabled: Meta's own controller models, for a runtime without the EXT pair
+static qboolean metaModelsEnabled = qfalse;
 // Why the runtime turned down an instance with them, when it lists them
 static XrResult controllerModelsRefused = XR_SUCCESS;
 // What the instance was created for: 1.1, or 1.0 on a runtime without it
@@ -175,6 +177,7 @@ static void VR_BuildExtensionList(void)
 	frameControllersEnabled = VR_AddOptionalExtension("XR_VALVE_frame_controller_interaction");
 	// Without it the PICO runtime treats the PICO profiles as unsupported and emulates Touch, as the engine avoids.
 	picoControllersEnabled = VR_AddOptionalExtension("XR_BD_controller_interaction");
+	metaModelsEnabled = VR_AddOptionalExtension(XR_FB_RENDER_MODEL_EXTENSION_NAME);
 
 	VR_BuildFoveationExtensions(&vr_engine.foveation);
 
@@ -482,7 +485,8 @@ void VR_EnterVR( VR_Engine* engine )
 	XR_CHECK(
 		VR_CreateSession(engine->appState.Instance, engine->appState.SystemId, &engine->appState.Session),
 		"Failed to create XR session");
-	VR_ControllerModels_Init(engine->appState.Instance, engine->appState.Session, controllerModelsEnabled);
+	VR_ControllerModels_Init(engine->appState.Instance, engine->appState.Session, controllerModelsEnabled,
+		metaModelsEnabled && !controllerModelsEnabled);
 
 	// Create a space to the first path
 	XrReferenceSpaceCreateInfo spaceCreateInfo = {};

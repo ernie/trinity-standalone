@@ -6,8 +6,10 @@
 	<uses-feature android:name="android.hardware.vr.headtracking" android:version="1" android:required="true" />
 	<uses-feature android:glEsVersion="0x00030001" />
 	<uses-feature android:name="oculus.software.eye_tracking" android:required="false" />
+	<uses-feature android:name="com.oculus.feature.RENDER_MODEL" android:required="false" />
 
 	<uses-permission android:name="horizonos.permission.EYE_TRACKING" />
+	<uses-permission android:name="com.oculus.permission.RENDER_MODEL" />
 	<uses-permission android:name="com.picovr.permission.EYE_TRACKING" />
 
 	<uses-permission android:name="android.permission.INTERNET" />
