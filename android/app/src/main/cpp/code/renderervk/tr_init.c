@@ -2161,6 +2161,10 @@ qboolean RE_InitXRResources( void ) {
 	return vk_init_xr_resources();
 }
 
+void RE_ReleaseXRResources( void ) {
+	vk_release_xr_resources();
+}
+
 static void RE_SetFoveation( int level, qboolean eyeTracked, const float centers[2][2], const float fovTan[2][4] ) {
 	vk_set_foveation( level, eyeTracked, centers, fovTan );
 }
@@ -2262,6 +2266,7 @@ refexport_t *GetRefAPI ( int apiVersion, refimport_t *rimp ) {
 	re.SceneComplete = RE_SceneComplete;
 	re.SetVRHeadsetParms = RE_SetVRHeadsetParms;
 	re.InitXRResources = RE_InitXRResources;
+	re.ReleaseXRResources = RE_ReleaseXRResources;
 	re.SetFoveation = RE_SetFoveation;
 	re.BeginXRFrame = RE_BeginXRFrame;
 	re.SetRepeatScreen = RE_SetRepeatScreen;

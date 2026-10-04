@@ -110,6 +110,7 @@ typedef struct {
 
 	// VR framebuffer operations: called from vrcommon, implemented by each renderer
 	qboolean (*InitXRResources)( void );  // Initialize XR resources after swapchains created (Vulkan)
+	void (*ReleaseXRResources)( void );  // Drops everything built on the swapchain images, before the VR layer replaces them
 	// Authored density map. Centers are per-eye ndc; fovTan is each eye's frustum as
 	// {tanLeft, tanRight, tanUp, tanDown}, which is what turns a texel into an eccentricity
 	void (*SetFoveation)( int level, qboolean eyeTracked, const float centers[2][2], const float fovTan[2][4] );

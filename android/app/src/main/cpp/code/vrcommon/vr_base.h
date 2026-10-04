@@ -22,6 +22,9 @@ VR_Bool VR_HasPicoControllers( void );
 // Whether XR_META_vulkan_swapchain_create_info was enabled, so swapchain images can take extra Vulkan create flags.
 VR_Bool VR_HasSwapchainCreateFlags( void );
 
+// Whether XR_KHR_vulkan_swapchain_format_list was enabled, so a mutable swapchain can name its view formats.
+VR_Bool VR_HasSwapchainFormatList( void );
+
 void VR_Info_f( void );
 
 #endif

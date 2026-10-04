@@ -493,6 +493,8 @@ static void vk_set_object_name( uint64_t obj, const char *objName, VkDebugReport
 
 // Forward declarations: defined later in file
 static VkFormat vk_get_unorm_format( VkFormat format );
+static qboolean vk_xr_srgb_target( void );
+static VkFormat vk_xr_gamma_format( VkFormat format );
 static VkSampler vk_find_sampler( const Vk_Sampler_Def *def );
 static void vk_cmd_end_render_pass( void );
 
@@ -541,7 +543,7 @@ static void vk_create_fov_split_render_passes( void )
 	VkDevice device = vk.device;
 	const qboolean useBloom = ( r_bloom && r_bloom->integer );
 	const qboolean foveated = vk.xr.foveationActive;
-	const VkFormat swapchainFormat = vk_get_unorm_format( vk.color_format );
+	const VkFormat swapchainFormat = vk_xr_gamma_format( vk.color_format );
 	VkRenderPassMultiviewCreateInfo multiviewInfo;
 	VkRenderPassFragmentDensityMapCreateInfoEXT fdmInfo;
 	uint32_t viewMasks[3] = { 0b11, 0b11, 0b11 };
@@ -803,6 +805,11 @@ static void vk_create_fov_split_render_passes( void )
  */
 static void vk_destroy_subpass_transient_images( void )
 {
+	if ( vk.transient.scene_unorm_view != VK_NULL_HANDLE ) {
+		qvkDestroyImageView( vk.device, vk.transient.scene_unorm_view, NULL );
+		vk.transient.scene_unorm_view = VK_NULL_HANDLE;
+	}
+
 	// Non-MSAA scene color
 	if ( vk.transient.scene_image != VK_NULL_HANDLE ) {
 		qvkDestroyImageView( vk.device, vk.transient.scene_view, NULL );
@@ -856,6 +863,39 @@ static void vk_destroy_subpass_transient_images( void )
 }
 
 
+// The stored scene takes a UNORM view when the swapchain is plain: the virtual screen pass can then blend into it the
+// way it blends into a mutable swapchain. Naming both view formats keeps the image compressed.
+static void vk_stored_scene_mutable( VkImageCreateInfo *imageInfo, VkImageFormatListCreateInfo *formatList, VkFormat viewFormats[2] )
+{
+	if ( !vk_xr_srgb_target() ) {
+		return;
+	}
+	imageInfo->flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+	if ( vk.imageFormatList ) {
+		viewFormats[0] = imageInfo->format;
+		viewFormats[1] = vk_get_unorm_format( imageInfo->format );
+		Com_Memset( formatList, 0, sizeof( *formatList ) );
+		formatList->sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO;
+		formatList->viewFormatCount = 2;
+		formatList->pViewFormats = viewFormats;
+		imageInfo->pNext = formatList;
+	}
+}
+
+
+static void vk_stored_scene_unorm_view( VkImageCreateInfo *imageInfo, VkImageViewCreateInfo *viewInfo )
+{
+	if ( vk_xr_srgb_target() ) {
+		viewInfo->format = vk_get_unorm_format( imageInfo->format );
+		VK_CHECK( qvkCreateImageView( vk.device, viewInfo, NULL, &vk.transient.scene_unorm_view ) );
+		SET_OBJECT_NAME( vk.transient.scene_unorm_view, "stored scene UNORM view", VK_DEBUG_REPORT_OBJECT_TYPE_IMAGE_VIEW_EXT );
+		viewInfo->format = imageInfo->format;
+	}
+	imageInfo->pNext = NULL;
+	imageInfo->flags &= ~VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+}
+
+
 /*
  * Create transient images for subpass optimization.
  * These images stay in tile memory and never hit DRAM.
@@ -867,6 +907,8 @@ static void vk_create_subpass_transient_images( void )
 {
 	VkImageCreateInfo imageInfo;
 	VkImageViewCreateInfo viewInfo;
+	VkImageFormatListCreateInfo formatList;
+	VkFormat viewFormats[2];
 	VkMemoryRequirements memReqs;
 	VkMemoryAllocateInfo allocInfo;
 	uint32_t memoryType;
@@ -941,6 +983,7 @@ static void vk_create_subpass_transient_images( void )
 		if ( vk.fboActive ) {
 			imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
 			imageInfo.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+			vk_stored_scene_mutable( &imageInfo, &formatList, viewFormats );
 			VK_CHECK( qvkCreateImage( vk.device, &imageInfo, NULL, &vk.transient.resolve_image ) );
 
 			qvkGetImageMemoryRequirements( vk.device, vk.transient.resolve_image, &memReqs );
@@ -953,6 +996,7 @@ static void vk_create_subpass_transient_images( void )
 			viewInfo.image = vk.transient.resolve_image;
 			VK_CHECK( qvkCreateImageView( vk.device, &viewInfo, NULL, &vk.transient.resolve_view ) );
 			SET_OBJECT_NAME( vk.transient.resolve_image, "stored scene resolve target", VK_DEBUG_REPORT_OBJECT_TYPE_IMAGE_EXT );
+			vk_stored_scene_unorm_view( &imageInfo, &viewInfo );
 		}
 
 		// [3] MSAA depth - TRANSIENT
@@ -990,6 +1034,7 @@ static void vk_create_subpass_transient_images( void )
 			imageInfo.format = vk.color_format;
 			imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
 			imageInfo.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+			vk_stored_scene_mutable( &imageInfo, &formatList, viewFormats );
 			VK_CHECK( qvkCreateImage( vk.device, &imageInfo, NULL, &vk.transient.scene_image ) );
 
 			qvkGetImageMemoryRequirements( vk.device, vk.transient.scene_image, &memReqs );
@@ -1004,6 +1049,7 @@ static void vk_create_subpass_transient_images( void )
 			viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
 			VK_CHECK( qvkCreateImageView( vk.device, &viewInfo, NULL, &vk.transient.scene_view ) );
 			SET_OBJECT_NAME( vk.transient.scene_image, "stored scene color", VK_DEBUG_REPORT_OBJECT_TYPE_IMAGE_EXT );
+			vk_stored_scene_unorm_view( &imageInfo, &viewInfo );
 		}
 
 		// [2] Depth - TRANSIENT
@@ -1815,6 +1861,25 @@ static VkFormat vk_get_unorm_format( VkFormat format )
 		case VK_FORMAT_A8B8G8R8_SRGB_PACK32:  return VK_FORMAT_A8B8G8R8_UNORM_PACK32;
 		default: return format;  // Already UNORM or other format
 	}
+}
+
+
+// An sRGB swapchain without the mutable bit has no UNORM twin: its views encode, so writers hand the hardware linear values
+static qboolean vk_xr_srgb_target( void )
+{
+	const VkFormat format = vk.xr.colorInfo ? vk.xr.colorInfo->format : VK_FORMAT_UNDEFINED;
+
+	return ( vk.xr.colorInfo && vk_get_unorm_format( format ) != format &&
+		!( vk.xr.colorInfo->usage & XR_SWAPCHAIN_USAGE_MUTABLE_FORMAT_BIT ) ) ? qtrue : qfalse;
+}
+
+
+// The format every pass that attaches the eye swapchain's gamma views declares
+static VkFormat vk_xr_gamma_format( VkFormat format )
+{
+	if ( vk_xr_srgb_target() )
+		return vk.xr.colorInfo->format;
+	return vk_get_unorm_format( format );
 }
 
 
@@ -3055,6 +3120,7 @@ static void vk_create_shader_modules( void )
 	vk.modules.vscreen_capture_fs = SHADER_MODULE( vscreen_capture_frag_spv );
 	vk.modules.vscreen_model_vs = SHADER_MODULE( vscreen_model_vert_spv );
 	vk.modules.vscreen_model_fs = SHADER_MODULE( vscreen_model_frag_spv );
+	vk.modules.vscreen_present_fs = SHADER_MODULE( vscreen_present_frag_spv );
 	SET_OBJECT_NAME( vk.modules.vscreen_model_vs, "virtual screen model vertex module", VK_DEBUG_REPORT_OBJECT_TYPE_SHADER_MODULE_EXT );
 	SET_OBJECT_NAME( vk.modules.vscreen_model_fs, "virtual screen model fragment module", VK_DEBUG_REPORT_OBJECT_TYPE_SHADER_MODULE_EXT );
 	SET_OBJECT_NAME( vk.modules.vscreen_vs, "virtual screen vertex module", VK_DEBUG_REPORT_OBJECT_TYPE_SHADER_MODULE_EXT );
@@ -4793,6 +4859,7 @@ void vk_shutdown( refShutdownCode_t code )
 	qvkDestroyShaderModule(vk.device, vk.modules.vscreen_capture_fs, NULL);
 	qvkDestroyShaderModule(vk.device, vk.modules.vscreen_model_vs, NULL);
 	qvkDestroyShaderModule(vk.device, vk.modules.vscreen_model_fs, NULL);
+	qvkDestroyShaderModule(vk.device, vk.modules.vscreen_present_fs, NULL);
 
 	// Null when the density map feature is absent, which vkDestroyShaderModule allows
 	qvkDestroyShaderModule(vk.device, vk.modules.final_composite_fov_fs, NULL);
@@ -5300,7 +5367,7 @@ void vk_create_post_process_pipelines( void )
 	VkGraphicsPipelineCreateInfo create_info;
 	VkViewport viewport;
 	VkRect2D scissor;
-	VkSpecializationMapEntry spec_entries[11];
+	VkSpecializationMapEntry spec_entries[12];
 	VkSpecializationInfo frag_spec_info;
 	uint32_t i, width, height;
 
@@ -5316,6 +5383,7 @@ void vk_create_post_process_pipelines( void )
 		int depth_r;
 		int depth_g;
 		int depth_b;
+		int srgb_target;
 	} frag_spec_data;
 
 	// Note: This is called during vk_init_xr_resources() before vk.xr.initialized is set
@@ -5394,6 +5462,7 @@ void vk_create_post_process_pipelines( void )
 	frag_spec_data.bloom_threshold_mode = r_bloom_threshold_mode->integer;
 	frag_spec_data.bloom_modulate = r_bloom_modulate->integer;
 	frag_spec_data.dither = r_dither->integer;
+	frag_spec_data.srgb_target = vk_xr_srgb_target() ? 1 : 0;
 
 	// Get color depth from XR swapchain format
 	if ( vk.xr.colorInfo && !vk_surface_format_color_depth( vk.xr.colorInfo->format,
@@ -5445,7 +5514,11 @@ void vk_create_post_process_pipelines( void )
 	spec_entries[10].offset = offsetof( struct FragSpecData, depth_b );
 	spec_entries[10].size = sizeof( frag_spec_data.depth_b );
 
-	frag_spec_info.mapEntryCount = 11;
+	spec_entries[11].constantID = 11;
+	spec_entries[11].offset = offsetof( struct FragSpecData, srgb_target );
+	spec_entries[11].size = sizeof( frag_spec_data.srgb_target );
+
+	frag_spec_info.mapEntryCount = 12;
 	frag_spec_info.pMapEntries = spec_entries;
 	frag_spec_info.dataSize = sizeof( frag_spec_data );
 	frag_spec_info.pData = &frag_spec_data;
@@ -10103,12 +10176,10 @@ qboolean vk_create_xr_image_views( void )
 
 		VK_CHECK( qvkCreateImageView( vk.device, &viewInfo, NULL, &xr->colorViews[i] ) );
 
-		// Create UNORM view for gamma pass (no automatic sRGB conversion)
-		// The gamma shader outputs sRGB-encoded values directly, so we need to
-		// bypass Vulkan's automatic linear-to-sRGB conversion on write
+		// UNORM twin of a mutable image; the image's own format when it is plain
 		{
 			VkImageViewCreateInfo gammaViewInfo = viewInfo;
-			gammaViewInfo.format = vk_get_unorm_format( xr->colorInfo->format );
+			gammaViewInfo.format = vk_xr_gamma_format( xr->colorInfo->format );
 			VK_CHECK( qvkCreateImageView( vk.device, &gammaViewInfo, NULL, &xr->gammaViews[i] ) );
 		}
 	}
@@ -11273,7 +11344,7 @@ static qboolean vk_recreate_xr_render_pass( VkFormat colorFormat, VkFormat depth
 
 	if ( vk.fboActive ) {
 		VkSubpassDependency gammaDep;
-		VkFormat gammaFormat = vk_get_unorm_format( colorFormat );
+		VkFormat gammaFormat = vk_xr_gamma_format( colorFormat );
 
 		// gamma has only color attachment (no depth): outputs to XR swapchain
 		// Uses UNORM format because gamma shader outputs sRGB values directly
@@ -11338,9 +11409,9 @@ static qboolean vk_recreate_xr_render_pass( VkFormat colorFormat, VkFormat depth
 	// which are created in vk_create_subpass_framebuffers() called from vk_init_xr_resources()
 
 	if ( vk.fboActive ) {
-		VkFormat gammaFormat = vk_get_unorm_format( colorFormat );
-		ri.Printf( PRINT_ALL, "Recreated XR render passes: FBO mode (color=0x%x, depth=0x%x), gamma outputs to UNORM (0x%x)\n",
-			vk.color_format, vk.depth_format, gammaFormat );
+		VkFormat gammaFormat = vk_xr_gamma_format( colorFormat );
+		ri.Printf( PRINT_ALL, "Recreated XR render passes: FBO mode (color=0x%x, depth=0x%x), gamma outputs to %s (0x%x)\n",
+			vk.color_format, vk.depth_format, gammaFormat == colorFormat ? "sRGB" : "UNORM", gammaFormat );
 	} else {
 		VkFormat unormFormat = vk_get_unorm_format( colorFormat );
 		ri.Printf( PRINT_ALL, "Recreated XR render passes: Direct mode (color=0x%x UNORM, depth=0x%x)\n",
@@ -11406,6 +11477,20 @@ static void vk_destroy_virtual_screen( void )
 	if ( vk.render_pass.virtualScreen != VK_NULL_HANDLE ) {
 		qvkDestroyRenderPass( vk.device, vk.render_pass.virtualScreen, NULL );
 		vk.render_pass.virtualScreen = VK_NULL_HANDLE;
+	}
+	if ( xr->vscreenPresentPipeline != VK_NULL_HANDLE ) {
+		qvkDestroyPipeline( vk.device, xr->vscreenPresentPipeline, NULL );
+		xr->vscreenPresentPipeline = VK_NULL_HANDLE;
+	}
+	for ( i = 0; i < MAX_SWAPCHAIN_IMAGES; i++ ) {
+		if ( xr->vscreenPresentFramebuffers[i] != VK_NULL_HANDLE ) {
+			qvkDestroyFramebuffer( vk.device, xr->vscreenPresentFramebuffers[i], NULL );
+			xr->vscreenPresentFramebuffers[i] = VK_NULL_HANDLE;
+		}
+	}
+	if ( vk.render_pass.virtualScreenPresent != VK_NULL_HANDLE ) {
+		qvkDestroyRenderPass( vk.device, vk.render_pass.virtualScreenPresent, NULL );
+		vk.render_pass.virtualScreenPresent = VK_NULL_HANDLE;
 	}
 	if ( xr->vscreenCaptureFramebuffer != VK_NULL_HANDLE ) {
 		qvkDestroyFramebuffer( vk.device, xr->vscreenCaptureFramebuffer, NULL );
@@ -11873,6 +11958,96 @@ static VkPipeline vk_create_virtual_screen_capture_pipeline( void )
 }
 
 
+// Copies the stored scene into the plain sRGB swapchain: one triangle, texel fetches through matching sRGB views
+static VkPipeline vk_create_virtual_screen_present_pipeline( void )
+{
+	VkXrResources *xr = &vk.xr;
+	VkPipelineShaderStageCreateInfo stages[2];
+	VkPipelineVertexInputStateCreateInfo vertexInput;
+	VkPipelineInputAssemblyStateCreateInfo inputAssembly;
+	VkPipelineRasterizationStateCreateInfo raster;
+	VkPipelineMultisampleStateCreateInfo multisample;
+	VkPipelineColorBlendAttachmentState attachmentBlend;
+	VkPipelineColorBlendStateCreateInfo blendState;
+	VkViewport viewport;
+	VkRect2D scissor;
+	VkPipelineViewportStateCreateInfo viewportState;
+	VkGraphicsPipelineCreateInfo ci;
+	VkPipeline pipeline = VK_NULL_HANDLE;
+
+	set_shader_stage_desc( &stages[0], VK_SHADER_STAGE_VERTEX_BIT, vk.modules.vscreen_capture_vs, "main" );
+	set_shader_stage_desc( &stages[1], VK_SHADER_STAGE_FRAGMENT_BIT, vk.modules.vscreen_present_fs, "main" );
+
+	Com_Memset( &vertexInput, 0, sizeof( vertexInput ) );
+	vertexInput.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+
+	Com_Memset( &inputAssembly, 0, sizeof( inputAssembly ) );
+	inputAssembly.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+	inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+
+	Com_Memset( &raster, 0, sizeof( raster ) );
+	raster.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+	raster.polygonMode = VK_POLYGON_MODE_FILL;
+	raster.cullMode = VK_CULL_MODE_NONE;
+	raster.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+	raster.lineWidth = 1.0f;
+
+	Com_Memset( &multisample, 0, sizeof( multisample ) );
+	multisample.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+	multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+	multisample.minSampleShading = 1.0f;
+
+	Com_Memset( &attachmentBlend, 0, sizeof( attachmentBlend ) );
+	attachmentBlend.blendEnable = VK_FALSE;
+	attachmentBlend.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+		VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+
+	Com_Memset( &blendState, 0, sizeof( blendState ) );
+	blendState.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+	blendState.attachmentCount = 1;
+	blendState.pAttachments = &attachmentBlend;
+
+	viewport.x = 0.0f;
+	viewport.y = 0.0f;
+	viewport.width = (float)xr->width;
+	viewport.height = (float)xr->height;
+	viewport.minDepth = 0.0f;
+	viewport.maxDepth = 1.0f;
+	scissor.offset.x = 0;
+	scissor.offset.y = 0;
+	scissor.extent.width = xr->width;
+	scissor.extent.height = xr->height;
+
+	Com_Memset( &viewportState, 0, sizeof( viewportState ) );
+	viewportState.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+	viewportState.viewportCount = 1;
+	viewportState.pViewports = &viewport;
+	viewportState.scissorCount = 1;
+	viewportState.pScissors = &scissor;
+
+	Com_Memset( &ci, 0, sizeof( ci ) );
+	ci.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+	ci.stageCount = 2;
+	ci.pStages = stages;
+	ci.pVertexInputState = &vertexInput;
+	ci.pInputAssemblyState = &inputAssembly;
+	ci.pViewportState = &viewportState;
+	ci.pRasterizationState = &raster;
+	ci.pMultisampleState = &multisample;
+	ci.pColorBlendState = &blendState;
+	ci.layout = vk.pipeline_layout_post_process;
+	ci.renderPass = vk.render_pass.virtualScreenPresent;
+	ci.subpass = 0;
+	ci.basePipelineIndex = -1;
+
+	if ( qvkCreateGraphicsPipelines( vk.device, vk.pipelineCache, 1, &ci, NULL, &pipeline ) != VK_SUCCESS ) {
+		return VK_NULL_HANDLE;
+	}
+	SET_OBJECT_NAME( pipeline, "virtual screen present pipeline", VK_DEBUG_REPORT_OBJECT_TYPE_PIPELINE_EXT );
+	return pipeline;
+}
+
+
 static void vk_write_virtual_screen_set( VkDescriptorSet set, VkSampler sampler, VkImageView view )
 {
 	VkDescriptorImageInfo imageInfo;
@@ -11924,6 +12099,13 @@ static qboolean vk_create_virtual_screen( void )
 
 	vk_destroy_virtual_screen();
 
+	// The pass blends in encoded space, which a plain sRGB swapchain's views cannot do (the Quest, see VR_VK_ColorSwapchainMutable)
+	xr->vscreenSceneCopy = vk_xr_srgb_target();
+	if ( xr->vscreenSceneCopy && vk.transient.scene_unorm_view == VK_NULL_HANDLE ) {
+		ri.Printf( PRINT_WARNING, "Virtual screen: the stored scene has no UNORM view to blend in\n" );
+		return qfalse;
+	}
+
 	VR_ScreenCaptureRect( xr->width, xr->height, xr->width, xr->height, 0.0f, 0.0f, rect );
 	xr->vscreenX = rect[0];
 	xr->vscreenY = rect[1];
@@ -11934,7 +12116,7 @@ static qboolean vk_create_virtual_screen( void )
 	qvkGetPhysicalDeviceFormatProperties( vk.physical_device, format, &formatProps );
 	xr->vscreenMips = ( formatProps.optimalTilingFeatures & blitFeatures ) == blitFeatures ? VSCREEN_MIP_LEVELS : 1;
 
-	// The swapchain's own format, so the capture's UNORM texel copy is byte-exact
+	// The swapchain's own format, so the capture is a byte-exact copy through matching views
 	Com_Memset( &imageCI, 0, sizeof( imageCI ) );
 	imageCI.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
 	imageCI.flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
@@ -11984,7 +12166,9 @@ static qboolean vk_create_virtual_screen( void )
 	VK_CHECK( qvkCreateImageView( vk.device, &viewCI, NULL, &xr->vscreenView ) );
 	SET_OBJECT_NAME( xr->vscreenView, "virtual screen view", VK_DEBUG_REPORT_OBJECT_TYPE_IMAGE_VIEW_EXT );
 
+	// The capture's source view and this attachment match, UNORM pair or sRGB pair, so the stored bytes are the source's
 	viewCI.subresourceRange.levelCount = 1;
+	viewCI.format = vk_xr_gamma_format( format );
 	VK_CHECK( qvkCreateImageView( vk.device, &viewCI, NULL, &xr->vscreenMip0View ) );
 	SET_OBJECT_NAME( xr->vscreenMip0View, "virtual screen mip 0 view", VK_DEBUG_REPORT_OBJECT_TYPE_IMAGE_VIEW_EXT );
 
@@ -12011,7 +12195,7 @@ static qboolean vk_create_virtual_screen( void )
 
 	// Capture: every texel of mip 0 is written, and TRANSFER_SRC feeds the first mip blit
 	Com_Memset( &attachment, 0, sizeof( attachment ) );
-	attachment.format = vk_get_unorm_format( format );
+	attachment.format = vk_xr_gamma_format( format );
 	attachment.samples = VK_SAMPLE_COUNT_1_BIT;
 	attachment.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
 	attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
@@ -12066,8 +12250,9 @@ static qboolean vk_create_virtual_screen( void )
 	VK_CHECK( qvkCreateFramebuffer( vk.device, &fbCI, NULL, &xr->vscreenCaptureFramebuffer ) );
 	SET_OBJECT_NAME( xr->vscreenCaptureFramebuffer, "virtual screen capture framebuffer", VK_DEBUG_REPORT_OBJECT_TYPE_FRAMEBUFFER_EXT );
 
+	// The target: the swapchain through its UNORM views, or the stored scene's UNORM view that the present pass copies
 	Com_Memset( &attachment, 0, sizeof( attachment ) );
-	attachment.format = vk_get_unorm_format( format );
+	attachment.format = xr->vscreenSceneCopy ? vk_get_unorm_format( vk.color_format ) : vk_get_unorm_format( format );
 	attachment.samples = VK_SAMPLE_COUNT_1_BIT;
 	attachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
 	attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
@@ -12075,7 +12260,7 @@ static qboolean vk_create_virtual_screen( void )
 	attachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
 	// The capture left layer 0 in SHADER_READ; the pass redraws everything
 	attachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-	attachment.finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+	attachment.finalLayout = xr->vscreenSceneCopy ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
 
 	colorRef.attachment = 0;
 	colorRef.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
@@ -12113,12 +12298,13 @@ static qboolean vk_create_virtual_screen( void )
 	deps[0].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
 		VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
 	deps[0].dependencyFlags = 0;
+	// The present pass samples the stored scene; otherwise the compositor takes the swapchain as it is
 	deps[1].srcSubpass = 0;
 	deps[1].dstSubpass = VK_SUBPASS_EXTERNAL;
 	deps[1].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-	deps[1].dstStageMask = VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT;
+	deps[1].dstStageMask = xr->vscreenSceneCopy ? VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT : VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT;
 	deps[1].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-	deps[1].dstAccessMask = 0;
+	deps[1].dstAccessMask = xr->vscreenSceneCopy ? VK_ACCESS_SHADER_READ_BIT : 0;
 	deps[1].dependencyFlags = 0;
 
 	Com_Memset( &multiview, 0, sizeof( multiview ) );
@@ -12143,7 +12329,7 @@ static qboolean vk_create_virtual_screen( void )
 	for ( i = 0; i < xr->colorInfo->imageCount && i < MAX_SWAPCHAIN_IMAGES; i++ ) {
 		Com_Memset( &fbCI, 0, sizeof( fbCI ) );
 		fbCI.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
-		screenViews[0] = xr->gammaViews[i];
+		screenViews[0] = xr->vscreenSceneCopy ? vk.transient.scene_unorm_view : xr->gammaViews[i];
 		screenViews[1] = xr->vscreenDepthView;
 		fbCI.renderPass = vk.render_pass.virtualScreen;
 		fbCI.attachmentCount = 2;
@@ -12155,6 +12341,68 @@ static qboolean vk_create_virtual_screen( void )
 		SET_OBJECT_NAME( xr->vscreenFramebuffers[i], va( "virtual screen framebuffer %d", i ), VK_DEBUG_REPORT_OBJECT_TYPE_FRAMEBUFFER_EXT );
 	}
 
+	if ( xr->vscreenSceneCopy ) {
+		// Present: the stored scene into the swapchain, after the capture's reads of the previous contents
+		Com_Memset( &attachment, 0, sizeof( attachment ) );
+		attachment.format = vk_xr_gamma_format( format );
+		attachment.samples = VK_SAMPLE_COUNT_1_BIT;
+		attachment.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+		attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+		attachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+		attachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+		attachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+		attachment.finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+
+		colorRef.attachment = 0;
+		colorRef.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+
+		Com_Memset( &subpass, 0, sizeof( subpass ) );
+		subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+		subpass.colorAttachmentCount = 1;
+		subpass.pColorAttachments = &colorRef;
+
+		deps[0].srcSubpass = VK_SUBPASS_EXTERNAL;
+		deps[0].dstSubpass = 0;
+		deps[0].srcStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+		deps[0].dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+		deps[0].srcAccessMask = 0;
+		deps[0].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+		deps[0].dependencyFlags = 0;
+		deps[1].srcSubpass = 0;
+		deps[1].dstSubpass = VK_SUBPASS_EXTERNAL;
+		deps[1].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+		deps[1].dstStageMask = VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT;
+		deps[1].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+		deps[1].dstAccessMask = 0;
+		deps[1].dependencyFlags = 0;
+
+		Com_Memset( &passCI, 0, sizeof( passCI ) );
+		passCI.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+		passCI.pNext = &multiview;
+		passCI.attachmentCount = 1;
+		passCI.pAttachments = &attachment;
+		passCI.subpassCount = 1;
+		passCI.pSubpasses = &subpass;
+		passCI.dependencyCount = 2;
+		passCI.pDependencies = deps;
+		VK_CHECK( qvkCreateRenderPass( vk.device, &passCI, NULL, &vk.render_pass.virtualScreenPresent ) );
+		SET_OBJECT_NAME( vk.render_pass.virtualScreenPresent, "render pass - virtual screen present", VK_DEBUG_REPORT_OBJECT_TYPE_RENDER_PASS_EXT );
+
+		for ( i = 0; i < xr->colorInfo->imageCount && i < MAX_SWAPCHAIN_IMAGES; i++ ) {
+			Com_Memset( &fbCI, 0, sizeof( fbCI ) );
+			fbCI.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+			fbCI.renderPass = vk.render_pass.virtualScreenPresent;
+			fbCI.attachmentCount = 1;
+			fbCI.pAttachments = &xr->gammaViews[i];
+			fbCI.width = xr->width;
+			fbCI.height = xr->height;
+			fbCI.layers = 1;
+			VK_CHECK( qvkCreateFramebuffer( vk.device, &fbCI, NULL, &xr->vscreenPresentFramebuffers[i] ) );
+			SET_OBJECT_NAME( xr->vscreenPresentFramebuffers[i], va( "virtual screen present framebuffer %d", i ), VK_DEBUG_REPORT_OBJECT_TYPE_FRAMEBUFFER_EXT );
+		}
+		xr->vscreenPresentPipeline = vk_create_virtual_screen_present_pipeline();
+	}
+
 	xr->vscreenPipeline = vk_create_virtual_screen_pipeline( vk.modules.vscreen_fs, qfalse, "virtual screen pipeline" );
 	xr->vscreenReflectPipeline = vk_create_virtual_screen_pipeline( vk.modules.vscreen_reflect_fs, qtrue, "virtual screen reflection pipeline" );
 	xr->floorGridPipeline = vk_create_virtual_screen_pipeline( vk.modules.floor_grid_fs, qtrue, "floor grid pipeline" );
@@ -12163,7 +12411,8 @@ static qboolean vk_create_virtual_screen( void )
 	xr->vscreenPointerPipeline = vk_create_virtual_screen_model_pipeline( qtrue, "virtual screen pointer pipeline" );
 	if ( xr->vscreenPipeline == VK_NULL_HANDLE || xr->vscreenReflectPipeline == VK_NULL_HANDLE ||
 		xr->floorGridPipeline == VK_NULL_HANDLE || xr->vscreenCapturePipeline == VK_NULL_HANDLE ||
-		xr->vscreenModelPipeline == VK_NULL_HANDLE || xr->vscreenPointerPipeline == VK_NULL_HANDLE ) {
+		xr->vscreenModelPipeline == VK_NULL_HANDLE || xr->vscreenPointerPipeline == VK_NULL_HANDLE ||
+		( xr->vscreenSceneCopy && xr->vscreenPresentPipeline == VK_NULL_HANDLE ) ) {
 		vk_destroy_virtual_screen();
 		return qfalse;
 	}
@@ -12178,8 +12427,9 @@ static qboolean vk_create_virtual_screen( void )
 		}
 	}
 
-	ri.Printf( PRINT_ALL, "Virtual screen: %ux%u crop, %u mips%s\n", xr->vscreenWidth, xr->vscreenHeight, xr->vscreenMips,
-		vk.imageFormatList ? ", view formats listed" : "" );
+	ri.Printf( PRINT_ALL, "Virtual screen: %ux%u crop, %u mips%s%s\n", xr->vscreenWidth, xr->vscreenHeight, xr->vscreenMips,
+		vk.imageFormatList ? ", view formats listed" : "",
+		xr->vscreenSceneCopy ? ", drawn in the stored scene and copied over" : "" );
 	return qtrue;
 }
 
@@ -12840,6 +13090,22 @@ static void vk_render_virtual_screen( void )
 	}
 
 	qvkCmdEndRenderPass( vk.cmd->command_buffer );
+
+	// The environment was drawn in the stored scene; it reaches the swapchain through matching sRGB views
+	if ( xr->vscreenSceneCopy ) {
+		Com_Memset( &begin, 0, sizeof( begin ) );
+		begin.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+		begin.renderPass = vk.render_pass.virtualScreenPresent;
+		begin.framebuffer = xr->vscreenPresentFramebuffers[xr->colorIndex];
+		begin.renderArea.extent.width = xr->width;
+		begin.renderArea.extent.height = xr->height;
+		qvkCmdBeginRenderPass( vk.cmd->command_buffer, &begin, VK_SUBPASS_CONTENTS_INLINE );
+		qvkCmdBindPipeline( vk.cmd->command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, xr->vscreenPresentPipeline );
+		qvkCmdBindDescriptorSets( vk.cmd->command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+			vk.pipeline_layout_post_process, 0, 1, &vk.transient.scene_descriptor, 0, NULL );
+		qvkCmdDraw( vk.cmd->command_buffer, 3, 1, 0, 0 );
+		qvkCmdEndRenderPass( vk.cmd->command_buffer );
+	}
 	vk.cmd->last_pipeline = VK_NULL_HANDLE;
 }
 
@@ -12851,26 +13117,9 @@ static void vk_render_virtual_screen( void )
  */
 qboolean vk_init_xr_resources( void )
 {
-	// If already initialized, destroy existing resources first to allow reinit
-	// This handles the RE_Shutdown(0) + R_Init soft restart case where XR resources
-	// need to be recreated to match the reset renderer state.
 	if ( vk.xr.initialized ) {
 		ri.Printf( PRINT_ALL, "vk_init_xr_resources: Reinitializing XR resources\n" );
-
-		// Wait for GPU to finish before destroying resources
-		if ( vk.device != VK_NULL_HANDLE ) {
-			qvkDeviceWaitIdle( vk.device );
-		}
-
-		// Destroy existing XR Vulkan resources (but preserve swapchain info pointers
-		// since they point to VR layer data that remains valid across soft shutdown)
-		vk_destroy_virtual_screen();
-		vk_destroy_post_process_pipelines();
-		vk_destroy_gamma_framebuffers();
-		vk_destroy_xr_framebuffers();
-		vk_destroy_xr_image_views();
-
-		vk.xr.initialized = qfalse;
+		vk_release_xr_resources();
 	}
 
 	// Pull swapchain info from VR layer
@@ -12906,6 +13155,12 @@ qboolean vk_init_xr_resources( void )
 	// Point vk.xr to the static info
 	vk.xr.colorInfo = &s_colorSwapchainInfo;
 	vk.xr.depthInfo = &s_depthSwapchainInfo;
+
+	// Direct mode draws through UNORM views, which a plain swapchain cannot give; the VR layer replaces it next frame
+	if ( !vk.fboActive && vk_xr_srgb_target() ) {
+		ri.Printf( PRINT_ALL, "XR swapchain is plain sRGB: waiting for a mutable one for direct mode\n" );
+		return qfalse;
+	}
 
 	// Set XR render dimensions from color swapchain
 	vk.xr.width = xrInfo->colorWidth;
@@ -13025,6 +13280,27 @@ qboolean vk_init_xr_resources( void )
 	ri.Printf( PRINT_ALL, "XR resources initialized successfully\n" );
 
 	return qtrue;
+}
+
+// Drops what was built on the swapchain images once the GPU is done with them; the next init rebuilds it, so a soft
+// restart or a swapchain replacement goes through here while the renderer's own buffers stay
+void vk_release_xr_resources( void )
+{
+	if ( !vk.xr.initialized ) {
+		return;
+	}
+
+	if ( vk.device != VK_NULL_HANDLE ) {
+		qvkDeviceWaitIdle( vk.device );
+	}
+
+	vk_destroy_virtual_screen();
+	vk_destroy_post_process_pipelines();
+	vk_destroy_gamma_framebuffers();
+	vk_destroy_xr_framebuffers();
+	vk_destroy_xr_image_views();
+
+	vk.xr.initialized = qfalse;
 }
 
 /*

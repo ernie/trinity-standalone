@@ -18,6 +18,14 @@ layout(constant_id = 7) const int ditherMode = 0; // 0 - disabled, 1 - ordered
 layout(constant_id = 8) const int depth_r = 255;
 layout(constant_id = 9) const int depth_g = 255;
 layout(constant_id = 10) const int depth_b = 255;
+// 1: the target view encodes sRGB itself, so the display-encoded result goes out decoded to linear
+layout(constant_id = 11) const int srgbTarget = 0;
+
+vec3 srgbToLinear(vec3 c) {
+	c = clamp(c, 0.0, 1.0);
+	return mix(c / 12.92, pow((c + 0.055) / 1.055, vec3(2.4)), step(vec3(0.04045), c));
+}
+
 const vec3 lumCoeff = { 0.2126, 0.7152, 0.0722 };
 
 
@@ -78,6 +86,10 @@ void main() {
 	// Optional dithering (from gamma.frag)
 	if ( ditherMode == 1 ) {
 		out_color.rgb = dither(out_color.rgb);
+	}
+
+	if ( srgbTarget == 1 ) {
+		out_color.rgb = srgbToLinear(out_color.rgb);
 	}
 
 }

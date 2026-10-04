@@ -1242,6 +1242,9 @@ void VKimp_Init(glconfig_t *config)
 		ri.Printf( PRINT_ALL, "SDL using driver \"%s\"\n", SDL_GetCurrentVideoDriver() );
 	}
 
+	// r_fbo is latched, so this restart is where the swapchain can stop fitting its mode
+	VR_VK_Swapchains_CheckMode();
+
 	// Get VR resolution for glConfig
 	VR_GetResolution(VR_GetEngine(), &glConfig.vidWidth, &glConfig.vidHeight);
 	glConfig.windowAspect = (float)glConfig.vidWidth / (float)glConfig.vidHeight;

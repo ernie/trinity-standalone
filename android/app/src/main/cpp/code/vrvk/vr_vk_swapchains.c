@@ -11,6 +11,8 @@
 #include "vr_vk_foveation.h"
 
 #include "../vrcommon/vr_base.h"
+#include "../client/client.h"
+#include "../qcommon/qcommon.h"
 #include "../vrcommon/vr_macros.h"
 #include "../vrcommon/vr_swapchains.h"
 
@@ -40,6 +42,18 @@ static VkFormat vk_get_unorm_format(VkFormat srgbFormat)
 	}
 }
 
+/*
+ * Mutable (UNORM views) unless r_fbo is on and the runtime lacks XR_KHR_vulkan_swapchain_format_list: an Adreno
+ * keeps a mutable image compressed only when told its view formats, the Quest runtime does not offer the extension,
+ * and its uncompressed eye buffers cost about a third of the frame. A plain sRGB swapchain takes the renderer's
+ * sRGB route (vk_xr_srgb_target); direct mode needs the UNORM views, so it stays mutable, and
+ * VR_VK_Swapchains_CheckMode replaces a swapchain that stops fitting r_fbo at the next restart.
+ */
+static XrBool32 VR_VK_ColorSwapchainMutable(void)
+{
+	return (!Cvar_VariableIntegerValue("r_fbo") || VR_HasSwapchainFormatList()) ? XR_TRUE : XR_FALSE;
+}
+
 static void VR_VK_CreateSwapchain(
 	XrSession session,
 	XrBool32 isColor,
@@ -50,14 +64,11 @@ static void VR_VK_CreateSwapchain(
 	uint32_t arraySize,
 	VR_VK_SwapchainInfo* info)
 {
-	// TRANSFER_SRC for virtual screen blit, TRANSFER_DST for runtime compatibility
+	// TRANSFER_SRC serves screenshots, TRANSFER_DST runtime compatibility
 	XrSwapchainUsageFlags usage = isColor
 		? (XR_SWAPCHAIN_USAGE_SAMPLED_BIT | XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_TRANSFER_SRC_BIT | XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT)
 		: (XR_SWAPCHAIN_USAGE_SAMPLED_BIT | XR_SWAPCHAIN_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT);
 
-	// Add mutable format flag for color swapchains that need UNORM views
-	// This maps to VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT, allowing us to create
-	// UNORM image views for the gamma pass (to avoid automatic sRGB conversion)
 	if (mutableFormat) {
 		usage |= XR_SWAPCHAIN_USAGE_MUTABLE_FORMAT_BIT;
 	}
@@ -71,10 +82,8 @@ static void VR_VK_CreateSwapchain(
 		usage &= ~(XR_SWAPCHAIN_USAGE_TRANSFER_SRC_BIT | XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT);
 	}
 
-	// For color swapchains with mutable format, use the format list extension
-	// This tells the runtime which formats we'll use for image views, helping it
-	// avoid adding unnecessary usage flags like VK_IMAGE_USAGE_STORAGE_BIT
-	if (isColor && mutableFormat) {
+	// Names both view formats so the driver can keep the mutable image compressed
+	if (isColor && mutableFormat && VR_HasSwapchainFormatList()) {
 		VkFormat viewFormats[2] = {
 			format,                        // sRGB for normal rendering
 			vk_get_unorm_format(format)    // UNORM for gamma pass (bypass sRGB conversion)
@@ -107,7 +116,6 @@ static void VR_VK_CreateSwapchain(
 		VR_VK_Foveation_ApplyToSwapchain(VR_GetEngine(), info->swapchain);
 	}
 
-	// Get VkImage handles from OpenXR
 	result = VR_Vulkan_GetSwapchainImages(info->swapchain, &info->images, &info->imageCount,
 		foveated ? &info->foveationImages : NULL,
 		foveated ? &info->foveationWidth : NULL,
@@ -153,7 +161,6 @@ static void VR_VK_DestroySwapchain(VR_VK_SwapchainInfo* info)
 	info->foveationHeight = 0;
 	info->imageCount = 0;
 
-	// Destroy the XR swapchain
 	if (info->swapchain != XR_NULL_HANDLE) {
 		XR_CHECK(
 			xrDestroySwapchain(info->swapchain),
@@ -214,11 +221,10 @@ VR_SwapchainInfos* VR_VK_CreateSwapchains(XrInstance instance, XrSystemId system
 	swapchains->viewCount = viewCount;
 
 	// Create color swapchain (multiview - 2 layers for stereo)
-	// Use mutable format to allow UNORM views for gamma pass (avoids sRGB auto-conversion)
 	VR_VK_CreateSwapchain(
 		session,
 		XR_TRUE,  // isColor
-		XR_TRUE,  // mutableFormat - needed for gamma pass UNORM views
+		VR_VK_ColorSwapchainMutable(),
 		colorFormat,
 		supersampledWidth,
 		supersampledHeight,
@@ -333,13 +339,7 @@ const VR_VK_SwapchainInfo* VR_VK_GetDepthSwapchain(const VR_SwapchainInfos* swap
 	return swapchains ? &swapchains->depth : NULL;
 }
 
-//
-// Deferred swapchain recreation
-//
-// When vid_restart is called during an active XR frame, destroying swapchains
-// immediately can cause crashes. Instead, we set a flag and handle it at the
-// start of the next frame, before xrBeginFrame is called.
-//
+// Swapchains are replaced only at the start of a frame, before xrBeginFrame, once something has asked for it
 
 static qboolean g_SwapchainRecreateRequested = qfalse;
 
@@ -348,34 +348,51 @@ void VR_VK_Swapchains_RequestRecreate(void)
 	g_SwapchainRecreateRequested = qtrue;
 }
 
+void VR_VK_Swapchains_CheckMode(void)
+{
+	const VR_Engine* engine = VR_GetEngine();
+	const VR_SwapchainInfos* swapchains = engine ? engine->appState.Renderer.Swapchains : NULL;
+
+	// A vid_restart keeps the swapchains, so one built for the other r_fbo mode is replaced next frame
+	if (swapchains &&
+		((swapchains->color.usage & XR_SWAPCHAIN_USAGE_MUTABLE_FORMAT_BIT) != 0) != (VR_VK_ColorSwapchainMutable() != XR_FALSE)) {
+		g_SwapchainRecreateRequested = qtrue;
+	}
+}
+
 qboolean VR_VK_Swapchains_HandlePendingRecreate(VR_Engine* engine)
 {
+	static qboolean createFailed;
 	if (!g_SwapchainRecreateRequested) {
 		return qfalse;
 	}
 
 	if (!engine || engine->appState.Session == XR_NULL_HANDLE) {
-		ALOGE("VR_VK_Swapchains_HandlePendingRecreate: No valid session");
-		return qfalse;
+		return qfalse; // the request waits for a session
 	}
 
-	// Destroy existing swapchains (this will release any acquired images first)
+	// Submitted frames may still draw into the images, and the renderer's views of them must go first
+	if (re.ReleaseXRResources) {
+		re.ReleaseXRResources();
+	}
+
 	if (engine->appState.Renderer.Swapchains) {
 		VR_VK_DestroySwapchains(&engine->appState.Renderer.Swapchains);
 	}
 
-	// Create new swapchains at the current supersampling resolution
 	engine->appState.Renderer.Swapchains = VR_VK_CreateSwapchains(
 		engine->appState.Instance,
 		engine->appState.SystemId,
 		engine->appState.Session);
 
 	if (!engine->appState.Renderer.Swapchains) {
-		ALOGE("VR_VK_Swapchains_HandlePendingRecreate: Failed to create swapchains");
-		g_SwapchainRecreateRequested = qfalse;
+		if (!createFailed)
+			ALOGE("VR_VK_Swapchains_HandlePendingRecreate: Failed to create swapchains; retrying each frame");
+		createFailed = qtrue;
 		return qfalse;
 	}
 
+	createFailed = qfalse;
 	g_SwapchainRecreateRequested = qfalse;
 	return qtrue;
 }

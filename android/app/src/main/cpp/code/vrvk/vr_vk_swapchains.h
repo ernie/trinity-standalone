@@ -48,6 +48,8 @@ const VR_VK_SwapchainInfo* VR_VK_GetDepthSwapchain(const VR_SwapchainInfos* swap
 // Call RequestRecreate during vid_restart to defer recreation to a safe point.
 // Call HandlePendingRecreate at the start of each frame before xrBeginFrame.
 void VR_VK_Swapchains_RequestRecreate(void);
+// Called at each renderer restart: requests a recreate when the color swapchain no longer fits the r_fbo mode
+void VR_VK_Swapchains_CheckMode(void);
 qboolean VR_VK_Swapchains_HandlePendingRecreate(VR_Engine* engine);
 
 #endif // __VR_VK_SWAPCHAINS

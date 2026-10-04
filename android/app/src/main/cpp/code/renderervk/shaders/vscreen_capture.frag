@@ -9,6 +9,6 @@ layout(constant_id = 1) const int OFFSET_Y = 0;
 layout(location = 0) out vec4 out_color;
 
 void main() {
-	// Exact texel copy: both the source and the attachment are UNORM views of the same format
+	// Exact texel copy: the source and the attachment are views of one format, UNORM pair or sRGB pair
 	out_color = vec4( texelFetch( src, ivec3( ivec2( gl_FragCoord.xy ) + ivec2( OFFSET_X, OFFSET_Y ), 0 ), 0 ).rgb, 1.0 );
 }

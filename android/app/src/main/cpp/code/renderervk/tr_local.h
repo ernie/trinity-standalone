@@ -2162,6 +2162,7 @@ void RE_SetVRHeadsetParms( const float projectionMatrix[16],
 void RE_ClearVRFramebuffer( int width, int height, qboolean isThirdPersonSpectator );
 void RE_WaitForRenderComplete( void );
 qboolean RE_InitXRResources( void );
+void RE_ReleaseXRResources( void );
 void RE_BeginXRFrame( uint32_t colorIndex, uint32_t depthIndex );
 
 #ifndef USE_VULKAN

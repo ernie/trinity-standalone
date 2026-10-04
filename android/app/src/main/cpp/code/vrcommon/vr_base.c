@@ -35,6 +35,7 @@ static uint32_t numRequiredExtensions = 0;
 static qboolean frameControllersEnabled = qfalse;
 static qboolean picoControllersEnabled = qfalse;
 static qboolean swapchainCreateFlagsEnabled = qfalse;
+static qboolean swapchainFormatListEnabled = qfalse;
 // XR_EXT_render_model and XR_EXT_interaction_render_model are both enabled
 static qboolean controllerModelsEnabled = qfalse;
 // XR_FB_render_model is enabled: Meta's own controller models, for a runtime without the EXT pair
@@ -153,15 +154,8 @@ static void VR_BuildExtensionList(void)
 	VR_AddOptionalExtension(XR_EXT_PERFORMANCE_SETTINGS_EXTENSION_NAME);
 	VR_AddOptionalExtension(XR_KHR_ANDROID_THREAD_SETTINGS_EXTENSION_NAME);
 #endif
-	// XR_KHR_vulkan_swapchain_format_list lets the runtime know which view formats
-	// we'll use for the swapchain images, so it can skip unnecessary usage flags
-	// (e.g. STORAGE_BIT). Only enable if the runtime advertises it: it is chained
-	// into swapchain creation in vr_vk.c and must not be referenced otherwise.
-	if (numRequiredExtensions < MAX_REQUIRED_EXTENSIONS &&
-		VR_HasInstanceExtension("XR_KHR_vulkan_swapchain_format_list"))
-	{
-		requiredExtensionNames[numRequiredExtensions++] = "XR_KHR_vulkan_swapchain_format_list";
-	}
+	// Names the view formats of a mutable swapchain so the driver can keep the image compressed
+	swapchainFormatListEnabled = VR_AddOptionalExtension("XR_KHR_vulkan_swapchain_format_list");
 	// Color-accurate wide gamut on Quest panels that support it (e.g. Quest Pro QD-OLED);
 	// keeps the runtime from treating our sRGB/Rec709 content as P3 and oversaturating.
 	qboolean haveColorSpace = (numRequiredExtensions < MAX_REQUIRED_EXTENSIONS &&
@@ -198,6 +192,11 @@ VR_Bool VR_HasPicoControllers(void)
 VR_Bool VR_HasSwapchainCreateFlags(void)
 {
 	return swapchainCreateFlagsEnabled ? VR_TRUE : VR_FALSE;
+}
+
+VR_Bool VR_HasSwapchainFormatList(void)
+{
+	return swapchainFormatListEnabled ? VR_TRUE : VR_FALSE;
 }
 
 static void VR_PrintEyeInfo( void )

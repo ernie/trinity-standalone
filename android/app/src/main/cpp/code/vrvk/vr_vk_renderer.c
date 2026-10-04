@@ -300,11 +300,10 @@ void VR_DestroyRenderer(VR_Engine* engine)
 
 void VR_ProcessFrame(VR_Engine* engine)
 {
-	// Handle deferred swapchain recreation from vid_restart.
-	// This MUST happen before xrBeginFrame (called in VR_Renderer_BeginFrame).
-	// If swapchains were marked for recreation during the previous frame's Com_Frame,
-	// we destroy and recreate them here at a safe point outside the XR frame lifecycle.
-	VR_VK_Swapchains_HandlePendingRecreate(engine);
+	// Outside the XR frame, so the swapchains can be replaced; the renderer then rebuilds its views of them
+	if (VR_VK_Swapchains_HandlePendingRecreate(engine) && re.InitXRResources) {
+		re.InitXRResources();
+	}
 
 	const XrBool32 needsRecenter = VR_ProcessXrEvents(&engine->appState);
 

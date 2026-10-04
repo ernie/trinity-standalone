@@ -305,6 +305,7 @@ void vk_finish_subpass_post( void );
 void vk_end_post_scene_pass( void );
 qboolean vk_create_hud_buffer( void );
 void vk_shutdown_xr_resources( void );  // Cleanup XR-related resources
+void vk_release_xr_resources( void );  // Drops the views, framebuffers and pipelines built on the swapchain images
 
 void vk_bind_pipeline( uint32_t pipeline );
 void vk_bind_index( void );
@@ -525,6 +526,11 @@ typedef struct {
 	VkImageView vscreenDepthView;
 	VkPipeline vscreenModelPipeline;    // controller parts: opaque, writes depth
 	VkPipeline vscreenPointerPipeline;  // rays and their pools of light: blended, tests depth
+	// A plain sRGB swapchain (a runtime without the format-list extension, the Quest) has no UNORM view for the pass's
+	// encoded-space blends, so the pass draws into the stored scene's UNORM view and the present pass copies that over
+	qboolean vscreenSceneCopy;
+	VkFramebuffer vscreenPresentFramebuffers[MAX_SWAPCHAIN_IMAGES];
+	VkPipeline vscreenPresentPipeline;
 
 	// Initialization state
 	qboolean initialized;
@@ -577,6 +583,8 @@ typedef struct {
 		VkRenderPass virtualScreen;
 		// Virtual screen capture: single view, samples layer 0's crop into the screen texture's mip 0
 		VkRenderPass virtualScreenCapture;
+		// Copies the scene buffer's finished environment into the plain sRGB swapchain
+		VkRenderPass virtualScreenPresent;
 	} render_pass;
 
 	VkDescriptorPool descriptor_pool;
@@ -630,6 +638,9 @@ typedef struct {
 		VkImage resolve_image;
 		VkImageView resolve_view;
 		VkDeviceMemory resolve_memory;
+
+		// UNORM view of the stored scene: the virtual screen pass blends through it when the swapchain is plain
+		VkImageView scene_unorm_view;
 
 		// Combined image sampler on the stored scene
 		VkDescriptorSet scene_descriptor;
@@ -743,6 +754,7 @@ typedef struct {
 		VkShaderModule vscreen_capture_fs;
 		VkShaderModule vscreen_model_vs;    // controllers and pointer rays beside the virtual screen
 		VkShaderModule vscreen_model_fs;
+		VkShaderModule vscreen_present_fs;  // stored scene to a plain sRGB swapchain through matching sRGB views
 
 		VkShaderModule fog_fs;  // multiview
 		VkShaderModule fog_vs;  // multiview
