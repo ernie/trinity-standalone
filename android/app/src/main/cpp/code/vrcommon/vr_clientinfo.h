@@ -120,7 +120,6 @@ typedef struct {
 	qboolean menuCursorActive;      // module wants engine menu-cursor tracking
 	qboolean scoreboardCursorActive;// module wants engine scoreboard-cursor tracking
 	int pointerMode;                // VR_POINTER_*: who presents the menu selection (synced to modules)
-	int probeEcho;                  // ABI round-trip: module writes, engine reflects at sync
 	qboolean menuLeftHanded;
 	int offhandCursorX;             // offhand cursor X (640x480 virtual coords)
 	int offhandCursorY;             // offhand cursor Y (640x480 virtual coords)
