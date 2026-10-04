@@ -1,9 +1,9 @@
 # Trinity Standalone
 
 Trinity Standalone is the standalone-headset VR client for the Trinity Quake III Arena
-ecosystem — a fork of [ioq3quest](https://github.com/Team-Beef-Studios/ioq3quest)
+ecosystem, a fork of [ioq3quest](https://github.com/Team-Beef-Studios/ioq3quest)
 (Team Beef's port of [ioquake3](https://github.com/ioquake/ioq3) to Quest) with the
-[Trinity](https://github.com/ernie/trinity) mod and Trinity engine features compiled in.
+[Trinity](https://github.com/ernie/trinity) mod as native module libraries and Trinity engine features.
 It runs natively on Meta Quest and PICO headsets and plays crossplay with the flatscreen
 [Trinity Engine](https://github.com/ernie/trinity-engine) and
 [Trinity VR](https://github.com/ernie/trinity-vr) (PCVR) clients on Trinity servers,
@@ -22,23 +22,25 @@ specification.
 
 ### Trinity mod integration
 
-The Trinity mod's VR features — head and torso tracking, an orbital follow camera for
+The Trinity mod's VR features (head and torso tracking, an orbital follow camera for
 spectating and demo playback, Quake Live-style damage indicators, and visual
-enhancements — are compiled directly into the client, because flatscreen QVMs would
-replace the VR-specific function implementations.
+enhancements) ship as native module libraries built from the pinned Trinity release.
+A VR-aware Trinity QVM runs whenever the paks carry one; a flat-only
+QVM is replaced by the native module, because it would replace the VR-specific
+functions with flatscreen ones.
 
 ### Rec.709 headset color
 
 Declares Rec.709 color to the OpenXR runtime (`XR_COLOR_SPACE_REC709_FB`, requested via
 the `XR_FB_color_space` extension), which keeps wide-gamut Quest panels (e.g. the Quest
 Pro's QD-OLED) from over-saturating the game's sRGB/Rec.709 content as P3. It's a no-op on
-runtimes without the extension. **Quest does not support HDR output** — true HDR is a
+runtimes without the extension. **Quest does not support HDR output**: true HDR is a
 flatscreen / PCVR-desktop-mirror feature.
 
 ### Improved stencil shadows
 
 The same z-fail stencil shadow rework as Trinity Engine (`cg_shadows 2`): welded
-silhouettes, capped volumes, and BSP clipping. Heavier than blob shadows — reasonable on
+silhouettes, capped volumes, and BSP clipping. Heavier than blob shadows, reasonable on
 Quest 3, not recommended on older headsets.
 
 ### Modern blood
@@ -53,16 +55,16 @@ Plays back TrinityVision (`.tvd`) demos recorded by Trinity servers.
 
 ## The Trinity Ecosystem
 
-- **[Trinity](https://github.com/ernie/trinity)** — the unified Quake III Arena / Team
+- **[Trinity](https://github.com/ernie/trinity)**: the unified Quake III Arena / Team
   Arena game mod (server-side support for VR clients; flatscreen feature parity where
   possible).
-- **[Trinity Engine](https://github.com/ernie/trinity-engine)** — the flatscreen engine
-  (dedicated servers, demo playback), forked from Quake3e.
-- **[Trinity VR](https://github.com/ernie/trinity-vr)** — PCVR client (Windows,
-  OpenXR/SteamVR).
-- **[Trinity Standalone](https://github.com/ernie/trinity-standalone)** — this project.
+- **[Trinity Engine](https://github.com/ernie/trinity-engine)**: the flatscreen and
+  OpenXR PCVR client, dedicated server and demo player, forked from Quake3e.
+- **[Trinity VR](https://github.com/ernie/trinity-vr)**: the earlier PCVR client, sunset
+  once Trinity Engine's VR mode ships.
+- **[Trinity Standalone](https://github.com/ernie/trinity-standalone)**: this project.
   Standalone-headset VR client (Meta Quest, PICO).
-- **[Trinity Tracker](https://github.com/ernie/trinity-tracker)** — statistics and server
+- **[Trinity Tracker](https://github.com/ernie/trinity-tracker)**: statistics and server
   administration platform.
 
 ## Building
@@ -71,7 +73,7 @@ Plays back TrinityVision (`.tvd`) demos recorded by Trinity servers.
 1. Install your copy of Quake III Arena from Steam (for the `pak0.pk3` game data).
 2. Android Studio with NDK version 27.3.13750724.
 3. The OpenXR SDK is vendored in the repository (under
-   `android/app/src/main/cpp/code/OpenXR/` and `OpenXR-SDK/`) — no separate download needed.
+   `android/app/src/main/cpp/code/OpenXR/` and `OpenXR-SDK/`), so no separate download is needed.
 
 ### Building and running the build
 The scripts assume that you installed everything in the default locations. In case you want to deviate from that, the paths are in ./android/run.(sh|bat) and in Makefile.local.
