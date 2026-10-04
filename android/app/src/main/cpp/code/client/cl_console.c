@@ -23,6 +23,7 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 
 #include "client.h"
 #include "../vrcommon/vr_clientinfo.h"
+#include "../vrcommon/vr_screen_geometry.h"
 
 
 int g_console_field_width = 78;
@@ -286,6 +287,21 @@ void Con_ClearNotify( void ) {
 
 						
 
+// The console's glyphs count virtual-screen units, not eye pixels, so their size holds on every headset,
+// whatever its resolution: con_scale 1 is 4x8 units. The box's size needs no view angles.
+static float Con_Scale( void )
+{
+	int rect[4];
+	float scale = con_scale ? con_scale->value : 1.0f;
+
+	if ( cls.glconfig.vidWidth <= 0 || cls.glconfig.vidHeight <= 0 ) {
+		return scale;
+	}
+	VR_ScreenCaptureRect( cls.glconfig.vidWidth, cls.glconfig.vidHeight, cls.glconfig.vidWidth,
+		cls.glconfig.vidHeight, 0, 0, rect );
+	return scale * ( rect[2] - rect[0] ) / 640.0f * 0.5f;
+}
+
 /*
 ================
 Con_CheckResize
@@ -297,7 +313,7 @@ void Con_CheckResize (void)
 {
 	int		i, j, width, oldwidth, oldtotallines, numlines, numchars;
 	short	tbuf[CON_TEXTSIZE];
-	float	scale = con_scale ? con_scale->value : 2.0f;
+	float	scale = Con_Scale();
 
 	// Always use actual video width for line wrapping
 	width = (int)(cls.glconfig.vidWidth / (SMALLCHAR_WIDTH * scale)) - 2;
@@ -376,8 +392,8 @@ void Con_Init (void) {
 	con_notifytime = Cvar_Get ("con_notifytime", "3", 0);
 	con_conspeed = Cvar_Get ("scr_conspeed", "3", 0);
 	con_autoclear = Cvar_Get("con_autoclear", "1", CVAR_ARCHIVE);
-	con_scale = Cvar_Get("con_scale", "2", CVAR_ARCHIVE);  // Default 2x for VR readability
-	Cvar_CheckRange(con_scale, 1, 4, qtrue);
+	con_scale = Cvar_Get("con_scale", "1", CVAR_ARCHIVE);
+	Cvar_CheckRange(con_scale, 0.5, 4, qfalse);
 
 	Field_Clear( &g_consoleField );
 	g_consoleField.widthInChars = g_console_field_width;
@@ -551,7 +567,7 @@ DRAWING
 
 // Forward declarations
 static void Con_DrawChar_Scaled(float x, float y, float scale, int ch);
-void Field_Draw_Scaled( field_t *edit, int x, int y, int width, qboolean showCursor, qboolean noColorEscape, int scale );
+void Field_Draw_Scaled( field_t *edit, int x, int y, int width, qboolean showCursor, qboolean noColorEscape, float scale );
 
 /*
 ================
@@ -562,7 +578,7 @@ Draw the editline after a ] prompt
 */
 void Con_DrawInput (void) {
 	int		y;
-	float	scale = con_scale ? con_scale->value : 2.0f;
+	float	scale = Con_Scale();
 	int		charW, charH;
 
 	charW = (int)(SMALLCHAR_WIDTH * scale);
@@ -645,8 +661,8 @@ void Con_DrawNotify (void)
 
 	re.HUDBufferStart(qfalse);
 
-	// Use console scale setting for notify messages
-	float charScale = con_scale ? con_scale->value : 2.0f;
+	// A HUD unit covers about half the angle of a virtual-screen unit, so con_scale 1 reads alike on both
+	float charScale = ( con_scale ? con_scale->value : 1.0f ) * 2.0f;
 	float xadjust = 10.0f;
 	float yadjust = 10.0f;
 
@@ -802,7 +818,7 @@ void Con_DrawSolidConsole( float frac ) {
 //	qhandle_t		conShader;
 	int				currentColor;
 	vec4_t			color;
-	float			scale = con_scale ? con_scale->value : 2.0f;
+	float			scale = Con_Scale();
 	int				charW, charH;
 
 	charW = (int)(SMALLCHAR_WIDTH * scale);
@@ -991,7 +1007,7 @@ Scroll it up or down
 void Con_RunConsole (void) {
 	// decide on the destination height of the console
 	if ( Key_GetCatcher( ) & KEYCATCH_CONSOLE )
-		con.finalFrac = 0.4;		// half screen
+		con.finalFrac = 0.5;		// half screen
 	else
 		con.finalFrac = 0;				// none visible
 	

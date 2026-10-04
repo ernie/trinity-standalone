@@ -35,7 +35,7 @@ void Field_KeyDownEvent( field_t *edit, int key );
 void Field_CharEvent( field_t *edit, int ch );
 void Field_Draw( field_t *edit, int x, int y, int width, qboolean showCursor, qboolean noColorEscape );
 void Field_BigDraw( field_t *edit, int x, int y, int width, qboolean showCursor, qboolean noColorEscape );
-void Field_Draw_Scaled( field_t *edit, int x, int y, int width, qboolean showCursor, qboolean noColorEscape, int scale );
+void Field_Draw_Scaled( field_t *edit, int x, int y, int width, qboolean showCursor, qboolean noColorEscape, float scale );
 
 #define		COMMAND_HISTORY		32
 extern	field_t	historyEditLines[COMMAND_HISTORY];

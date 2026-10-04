@@ -33,6 +33,7 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 
 #include "../vrcommon/vr_base.h"
 #include "../vrcommon/vr_cvars.h"
+#include "../vrcommon/vr_virtual_screen.h"
 
 #include <SDL.h>
 
@@ -3273,6 +3274,7 @@ void CL_InitRef( void ) {
 	// VR Vulkan accessors: renderer pulls XR-created resources during init
 	ri.VR_Vulkan_GetDeviceInfo = VR_Vulkan_GetDeviceInfo;
 	ri.VR_Vulkan_GetSwapchainInfo = VR_Vulkan_GetSwapchainInfo;
+	ri.VR_VirtualScreen_EyeTangents = VR_VirtualScreen_EyeTangents;
 
 	// VR session initialization (called from renderer after graphics init)
 	ri.GLimp_InitVR = GLimp_InitVR;

@@ -266,6 +266,9 @@ typedef struct {
 	// VR Vulkan swapchain accessor (pull model for XR swapchain initialization)
 	// Returns const VR_VulkanSwapchainInfo* (void* to avoid Vulkan header dependency)
 	const void* (*VR_Vulkan_GetSwapchainInfo)( void );
+
+	// The located views' tangent spans; false until a frame has located them
+	qboolean (*VR_VirtualScreen_EyeTangents)( float *tanWidth, float *tanHeight );
 } refimport_t;
 
 extern	refimport_t	ri;

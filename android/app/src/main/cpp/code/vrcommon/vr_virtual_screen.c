@@ -7,6 +7,7 @@
 #include "vr_virtual_screen.h"
 
 #include <string.h>
+#include <math.h>
 
 #include "vr_clientinfo.h"
 #include "vr_gameplay.h"
@@ -212,5 +213,24 @@ qboolean VR_VirtualScreen_Hit( const float origin[3], const float direction[3], 
 	}
 	*x = uv[0] * 640.0f;
 	*y = uv[1] * 480.0f;
+	return qtrue;
+}
+
+qboolean VR_VirtualScreen_EyeTangents( float *tanWidth, float *tanHeight )
+{
+	float w = 0, h = 0;
+	uint32_t e;
+
+	for ( e = 0; e < s_viewCount; e++ )
+	{
+		w += tanf( s_views[e].fov.angleRight ) - tanf( s_views[e].fov.angleLeft );
+		h += tanf( s_views[e].fov.angleUp ) - tanf( s_views[e].fov.angleDown );
+	}
+	if ( !s_viewCount || !( w > 0 ) || !( h > 0 ) )
+	{
+		return qfalse;
+	}
+	*tanWidth = w / s_viewCount;
+	*tanHeight = h / s_viewCount;
 	return qtrue;
 }

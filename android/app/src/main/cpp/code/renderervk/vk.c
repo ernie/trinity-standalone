@@ -11457,6 +11457,7 @@ static void vk_destroy_virtual_screen( void )
 	VkXrResources *xr = &vk.xr;
 	uint32_t i;
 
+	xr->vscreenFitted = qfalse;
 	if ( xr->vscreenCapturePipeline != VK_NULL_HANDLE ) {
 		qvkDestroyPipeline( vk.device, xr->vscreenCapturePipeline, NULL );
 		xr->vscreenCapturePipeline = VK_NULL_HANDLE;
@@ -11870,9 +11871,13 @@ static void vk_create_virtual_screen_depth( void )
 static VkPipeline vk_create_virtual_screen_capture_pipeline( void )
 {
 	VkXrResources *xr = &vk.xr;
-	const int32_t specData[2] = { (int32_t)xr->vscreenX, (int32_t)xr->vscreenY };
-	VkSpecializationMapEntry specEntries[2];
+	struct {
+		int32_t offsetX, offsetY;
+		float scaleX, scaleY, invWidth, invHeight;
+	} specData;
+	VkSpecializationMapEntry specEntries[6];
 	VkSpecializationInfo specInfo;
+	uint32_t i;
 	VkPipelineShaderStageCreateInfo stages[2];
 	VkPipelineVertexInputStateCreateInfo vertexInput;
 	VkPipelineInputAssemblyStateCreateInfo inputAssembly;
@@ -11886,16 +11891,21 @@ static VkPipeline vk_create_virtual_screen_capture_pipeline( void )
 	VkGraphicsPipelineCreateInfo ci;
 	VkPipeline pipeline = VK_NULL_HANDLE;
 
-	specEntries[0].constantID = 0;
-	specEntries[0].offset = 0;
-	specEntries[0].size = sizeof( int32_t );
-	specEntries[1].constantID = 1;
-	specEntries[1].offset = sizeof( int32_t );
-	specEntries[1].size = sizeof( int32_t );
-	specInfo.mapEntryCount = 2;
+	specData.offsetX = (int32_t)xr->vscreenX;
+	specData.offsetY = (int32_t)xr->vscreenY;
+	specData.scaleX = (float)xr->vscreenCropWidth / xr->vscreenWidth;
+	specData.scaleY = (float)xr->vscreenCropHeight / xr->vscreenHeight;
+	specData.invWidth = 1.0f / xr->width;
+	specData.invHeight = 1.0f / xr->height;
+	for ( i = 0; i < 6; i++ ) {
+		specEntries[i].constantID = i;
+		specEntries[i].offset = i * 4;
+		specEntries[i].size = 4;
+	}
+	specInfo.mapEntryCount = 6;
 	specInfo.pMapEntries = specEntries;
 	specInfo.dataSize = sizeof( specData );
-	specInfo.pData = specData;
+	specInfo.pData = &specData;
 
 	set_shader_stage_desc( &stages[0], VK_SHADER_STAGE_VERTEX_BIT, vk.modules.vscreen_capture_vs, "main" );
 	set_shader_stage_desc( &stages[1], VK_SHADER_STAGE_FRAGMENT_BIT, vk.modules.vscreen_capture_fs, "main" );
@@ -12081,6 +12091,29 @@ static void vk_write_virtual_screen_set( VkDescriptorSet set, VkSampler sampler,
 }
 
 
+// The crop's size scaled to the eye's pixel density at the screen's center, which sits at the center distance
+// whatever the curvature; never larger than the crop. False, and the crop itself, until the views are located.
+static qboolean vk_virtual_screen_fit_size( uint32_t *width, uint32_t *height )
+{
+	VkXrResources *xr = &vk.xr;
+	float tanWidth, tanHeight, scaleX, scaleY;
+
+	*width = xr->vscreenCropWidth;
+	*height = xr->vscreenCropHeight;
+	if ( !ri.VR_VirtualScreen_EyeTangents || !ri.VR_VirtualScreen_EyeTangents( &tanWidth, &tanHeight ) ) {
+		return qfalse;
+	}
+	scaleX = VR_SCREEN_ARC_LENGTH / ( xr->vscreenCropWidth * VR_SCREEN_CENTER_DISTANCE ) * ( xr->width / tanWidth );
+	scaleY = VR_SCREEN_HEIGHT / ( xr->vscreenCropHeight * VR_SCREEN_CENTER_DISTANCE ) * ( xr->height / tanHeight );
+	if ( scaleX < 1 ) {
+		*width = MAX( 1, (uint32_t)( xr->vscreenCropWidth * scaleX + 0.5f ) );
+	}
+	if ( scaleY < 1 ) {
+		*height = MAX( 1, (uint32_t)( xr->vscreenCropHeight * scaleY + 0.5f ) );
+	}
+	return qtrue;
+}
+
 static qboolean vk_create_virtual_screen( void )
 {
 	VkXrResources *xr = &vk.xr;
@@ -12122,8 +12155,9 @@ static qboolean vk_create_virtual_screen( void )
 	VR_ScreenCaptureRect( xr->width, xr->height, xr->width, xr->height, 0.0f, 0.0f, rect );
 	xr->vscreenX = rect[0];
 	xr->vscreenY = rect[1];
-	xr->vscreenWidth = rect[2] - rect[0];
-	xr->vscreenHeight = rect[3] - rect[1];
+	xr->vscreenCropWidth = rect[2] - rect[0];
+	xr->vscreenCropHeight = rect[3] - rect[1];
+	xr->vscreenFitted = vk_virtual_screen_fit_size( &xr->vscreenWidth, &xr->vscreenHeight );
 
 	// The mip chain is built by linear blits; without them the reflection is sharp instead of blurred
 	qvkGetPhysicalDeviceFormatProperties( vk.physical_device, format, &formatProps );
@@ -12199,8 +12233,6 @@ static qboolean vk_create_virtual_screen( void )
 	VK_CHECK( qvkCreateSampler( vk.device, &samplerCI, NULL, &xr->vscreenSampler ) );
 	SET_OBJECT_NAME( xr->vscreenSampler, "virtual screen sampler", VK_DEBUG_REPORT_OBJECT_TYPE_SAMPLER_EXT );
 
-	samplerCI.magFilter = VK_FILTER_NEAREST;
-	samplerCI.minFilter = VK_FILTER_NEAREST;
 	samplerCI.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
 	samplerCI.maxLod = 0.0f;
 	VK_CHECK( qvkCreateSampler( vk.device, &samplerCI, NULL, &xr->vscreenSourceSampler ) );
@@ -12440,7 +12472,8 @@ static qboolean vk_create_virtual_screen( void )
 		}
 	}
 
-	ri.Printf( PRINT_ALL, "Virtual screen: %ux%u crop, %u mips%s%s\n", xr->vscreenWidth, xr->vscreenHeight, xr->vscreenMips,
+	ri.Printf( PRINT_ALL, "Virtual screen: %ux%u crop captured at %ux%u, %u mips%s%s\n", xr->vscreenCropWidth, xr->vscreenCropHeight,
+		xr->vscreenWidth, xr->vscreenHeight, xr->vscreenMips,
 		vk.imageFormatList ? ", view formats listed" : "",
 		xr->vscreenSceneCopy ? ", drawn in the stored scene and copied over" : "" );
 	return qtrue;
@@ -12524,6 +12557,23 @@ static void vk_capture_virtual_screen( void )
 	VkXrResources *xr = &vk.xr;
 	VkRenderPassBeginInfo begin;
 	uint32_t i;
+
+	// The first capture after the views are located rebuilds the screen at the eye's density: nothing submitted
+	// still reads it once the queue has drained, and this frame has not bound any of it yet
+	if ( !xr->vscreenFitted ) {
+		uint32_t width, height;
+		if ( vk_virtual_screen_fit_size( &width, &height ) ) {
+			if ( width == xr->vscreenWidth && height == xr->vscreenHeight ) {
+				xr->vscreenFitted = qtrue;
+			} else {
+				qvkDeviceWaitIdle( vk.device );
+				if ( !vk_create_virtual_screen() || !vk_virtual_screen_descriptors() ) {
+					ri.Error( ERR_FATAL, "Virtual screen: rebuilding the capture at the eye's density failed" );
+				}
+				vk.cmd->last_pipeline = VK_NULL_HANDLE; // a new pipeline may reuse a destroyed handle
+			}
+		}
+	}
 
 	// Waits for the previous screen frame's sampling, earlier on the same queue
 	if ( xr->vscreenMips > 1 ) {

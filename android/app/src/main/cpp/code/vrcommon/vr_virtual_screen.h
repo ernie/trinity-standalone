@@ -37,6 +37,8 @@ qboolean VR_VirtualScreen_ShowPointer( int hand, const float origin[3], const fl
 const vrScreenPointer_t *VR_VirtualScreen_Pointer( int hand );
 // The screen's height in meters and the point midway between the eyes
 float VR_VirtualScreen_Height( void );
+// Per-eye tangent spans of the located views, averaged; false until a frame has located them
+qboolean VR_VirtualScreen_EyeTangents( float *tanWidth, float *tanHeight );
 void VR_VirtualScreen_Head( float head[3] );
 
 #endif

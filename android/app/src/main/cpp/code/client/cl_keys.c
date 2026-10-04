@@ -464,7 +464,7 @@ Field_Draw_Scaled
 Draw an editable field with scaling for VR console
 ===================
 */
-void Field_Draw_Scaled( field_t *edit, int x, int y, int width, qboolean showCursor, qboolean noColorEscape, int scale )
+void Field_Draw_Scaled( field_t *edit, int x, int y, int width, qboolean showCursor, qboolean noColorEscape, float scale )
 {
 	int		len;
 	int		drawLen;

@@ -346,7 +346,7 @@ void SCR_DrawSmallChar( int x, int y, int ch ) {
 ** SCR_DrawSmallCharScaled
 ** small chars drawn with scaling factor
 */
-void SCR_DrawSmallCharScaled( int x, int y, int ch, int scale ) {
+void SCR_DrawSmallCharScaled( int x, int y, int ch, float scale ) {
 	int row, col;
 	float frow, fcol;
 	float size;
@@ -529,7 +529,7 @@ Draws a multi-colored string with scaling, optionally forcing to a fixed color.
 ==================
 */
 void SCR_DrawSmallStringExtScaled( int x, int y, const char *string, float *setColor, qboolean forceColor,
-		qboolean noColorEscape, int scale ) {
+		qboolean noColorEscape, float scale ) {
 	vec4_t		color;
 	const char	*s;
 	int			xx;

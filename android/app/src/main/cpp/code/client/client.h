@@ -721,11 +721,11 @@ void	SCR_DrawNamedPic( float x, float y, float width, float height, const char *
 void	SCR_DrawBigString( int x, int y, const char *s, float alpha, qboolean noColorEscape );			// draws a string with embedded color control characters with fade
 void	SCR_DrawBigStringColor( int x, int y, const char *s, vec4_t color, qboolean noColorEscape );	// ignores embedded color control characters
 void	SCR_DrawSmallStringExt( int x, int y, const char *string, float *setColor, qboolean forceColor, qboolean noColorEscape );
-void	SCR_DrawSmallStringExtScaled( int x, int y, const char *string, float *setColor, qboolean forceColor, qboolean noColorEscape, int scale );
+void	SCR_DrawSmallStringExtScaled( int x, int y, const char *string, float *setColor, qboolean forceColor, qboolean noColorEscape, float scale );
 void	SCR_DrawStringExt( int x, int y, float size, const char *string, float *setColor, qboolean forceColor, qboolean noColorEscape );
 void	SCR_DrawStringExtNoShadow( int x, int y, float size, const char *string, float *setColor, qboolean forceColor, qboolean noColorEscape );
 void	SCR_DrawSmallChar( int x, int y, int ch );
-void	SCR_DrawSmallCharScaled( int x, int y, int ch, int scale );
+void	SCR_DrawSmallCharScaled( int x, int y, int ch, float scale );
 
 
 //

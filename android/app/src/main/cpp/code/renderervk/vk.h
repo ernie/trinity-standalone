@@ -509,11 +509,13 @@ typedef struct {
 	VkImageView vscreenView;        // UNORM, so sampling returns the encoded bytes
 	VkImageView vscreenMip0View;    // UNORM, the capture pass's attachment
 	VkSampler vscreenSampler;
-	VkSampler vscreenSourceSampler; // nearest: the capture is an exact texel copy
+	VkSampler vscreenSourceSampler; // linear: the capture filters the crop down to the eye's density
 	VkDescriptorSet vscreenDescriptor;  // from the shared pool; reallocated after a pool reset
 	VkDescriptorSet vscreenSourceDescriptor[MAX_SWAPCHAIN_IMAGES];  // swapchain gammaViews, same pool rules
 	uint32_t vscreenX, vscreenY;    // crop's top left in layer 0; constant, screen frames publish a symmetric FOV
-	uint32_t vscreenWidth, vscreenHeight, vscreenMips;
+	uint32_t vscreenCropWidth, vscreenCropHeight;  // the 4:3 box in layer 0
+	uint32_t vscreenWidth, vscreenHeight, vscreenMips;  // the capture: the crop at the eye's density, or the crop itself until the views are located
+	qboolean vscreenFitted;
 	VkFramebuffer vscreenCaptureFramebuffer;
 	VkFramebuffer vscreenFramebuffers[MAX_SWAPCHAIN_IMAGES];
 	VkPipeline vscreenCapturePipeline;
