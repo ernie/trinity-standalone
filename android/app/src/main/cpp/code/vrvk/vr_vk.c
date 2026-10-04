@@ -616,8 +616,8 @@ XrResult VR_Vulkan_CreateDevice(XrInstance xrInstance, XrSystemId systemId)
     if (vr_vk.imageFormatListEnabled) {
         extensions[extensionCount++] = VK_KHR_IMAGE_FORMAT_LIST_EXTENSION_NAME;
     }
-    __android_log_print(ANDROID_LOG_INFO, "VRVK", "VK_KHR_image_format_list %s",
-        vr_vk.imageFormatListEnabled ? "enabled" : "absent, the virtual screen image stays uncompressed");
+    VR_VK_LogLine(va("VK_KHR_image_format_list %s",
+        vr_vk.imageFormatListEnabled ? "enabled" : "absent, the virtual screen image stays uncompressed"));
 
     // Find graphics queue family
     uint32_t queueFamilyCount = 0;

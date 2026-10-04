@@ -22,7 +22,7 @@ static inline int VK_TransmittanceReadsDestination( VkBlendFactor factor ) {
 		factor == VK_BLEND_FACTOR_SRC_ALPHA_SATURATE;
 }
 
-/* Post-scene draws blend color as they always did; alpha instead tracks whatever multiplies the destination.
+/* Post-scene draws keep their color blend; alpha instead tracks whatever multiplies the destination.
  * Exact for scalar multipliers, through the source's luminance for per-channel ones (returns 1 so the
  * shader writes luminance to alpha), unchanged where the blend reads the scene. */
 static inline int VK_TransmittanceBlend( VkPipelineColorBlendAttachmentState *t ) {

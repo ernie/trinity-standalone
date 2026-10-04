@@ -1815,7 +1815,6 @@ static const void* RB_HUDBuffer( const void* data ) {
 	// Mode 2 overlays: no HUD render pass, just track state. So does mode 0 (no floating HUD),
 	// except its clears, which must still empty the texture cgame's sprite samples; an end
 	// closes whichever the start opened.
-	// 3D HUD icons should render to the current target (overlay or XR swapchain).
 	status = vr_currentHudDrawStatus->integer;
 	overlay = cmd->start ? ( status == 2 || ( status == 0 && !cmd->clear ) ) : vk.renderPassIndex != RENDER_PASS_HUD;
 	if ( overlay ) {

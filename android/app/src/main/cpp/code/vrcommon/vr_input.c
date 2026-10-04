@@ -6,6 +6,7 @@
 
 #include "vr_base.h"
 #include "vr_clientinfo.h"
+#include "vr_shared.h"
 #include "vr_gameplay.h"
 #include "vr_bhaptics.h"
 #include "vr_graphics.h"
@@ -142,14 +143,6 @@ void VR_UpdateInteractionProfiles( void )
 				vrCurrentProfile[hand] = p;
 		}
 	}
-#if __ANDROID__
-	for (int hand = 0; hand < 2; hand++)
-	{
-		int p = vrCurrentProfile[hand];
-		__android_log_print(ANDROID_LOG_INFO, "OpenXR", "%s hand profile: %s", hand ? "right" : "left",
-			p >= 0 ? vrProfiles[p].name : "none");
-	}
-#endif
 }
 
 void VR_PrintInputInfo( void )
@@ -381,8 +374,6 @@ XrAction CreateAction(
 	int countSubactionPaths,
 	XrPath* subactionPaths)
 {
-	printf("CreateAction %s, %d", actionName, countSubactionPaths);
-
 	XrActionCreateInfo aci = {};
 	aci.type = XR_TYPE_ACTION_CREATE_INFO;
 	aci.next = NULL;
@@ -464,16 +455,9 @@ static int VR_SuggestBindings( VR_Engine* engine, const char* profile, const XrA
 	if (XR_FAILED(result))
 	{
 		// A runtime may not know every vendor's profile; the others still bind
-		printf("[OpenXR] %s bindings rejected (%d)\n", profile, (int)result);
-#if __ANDROID__
-		__android_log_print(ANDROID_LOG_INFO, "OpenXR", "%s bindings rejected (%d)", profile, (int)result);
-#endif
+		Com_Printf( "OpenXR %s bindings rejected (%d)\n", profile, (int)result );
 		return 0;
 	}
-	printf("[OpenXR] %s bindings accepted\n", profile);
-#if __ANDROID__
-	__android_log_print(ANDROID_LOG_INFO, "OpenXR", "%s bindings accepted", profile);
-#endif
 	return 1;
 }
 
@@ -665,90 +649,6 @@ void VR_InitSessionInput( VR_Engine* engine )
 	rightControllerGripSpace = CreateActionSpace(handPoseRightAction, rightHandPath);
 	leftControllerAimSpace = CreateActionSpace(aimPoseLeftAction, leftHandPath);
 	rightControllerAimSpace = CreateActionSpace(aimPoseRightAction, rightHandPath);
-
-	// Enumerate actions
-	XrPath actionPathsBuffer[32];
-	char stringBuffer[256];
-	XrAction actionsToEnumerate[] = {
-		indexLeftAction,
-		indexRightAction,
-		menuAction,
-		buttonAAction,
-		buttonBAction,
-		buttonXAction,
-		buttonYAction,
-		gripLeftAction,
-		gripRightAction,
-		trackpadLeftAction,
-		trackpadRightAction,
-		moveOnLeftJoystickAction,
-		moveOnRightJoystickAction,
-		thumbstickLeftClickAction,
-		thumbstickRightClickAction,
-		thumbrestLeftTouchAction,
-		thumbrestRightTouchAction,
-		vibrateLeftFeedback,
-		vibrateRightFeedback,
-		handPoseLeftAction,
-		handPoseRightAction,
-		bumperLeftAction,
-		bumperRightAction,
-		dpadUpAction,
-		dpadDownAction,
-		dpadLeftAction,
-		dpadRightAction,
-		viewAction,
-		gripClickLeftAction,
-		gripClickRightAction
-	};
-	for (size_t i = 0; i < sizeof(actionsToEnumerate) / sizeof(actionsToEnumerate[0]); ++i)
-	{
-		XrBoundSourcesForActionEnumerateInfo enumerateInfo = {};
-		enumerateInfo.type = XR_TYPE_BOUND_SOURCES_FOR_ACTION_ENUMERATE_INFO;
-		enumerateInfo.next = NULL;
-		enumerateInfo.action = actionsToEnumerate[i];
-
-		// Get Count
-		uint32_t countOutput = 0;
-		OXR(xrEnumerateBoundSourcesForAction(
-			engine->appState.Session, &enumerateInfo, 0 /* request size */, &countOutput, NULL));
-		printf(
-			"xrEnumerateBoundSourcesForAction action=%lld count=%u\n",
-			(long long)enumerateInfo.action,
-			countOutput);
-
-		if (countOutput < 32)
-		{
-			OXR(xrEnumerateBoundSourcesForAction(
-				engine->appState.Session, &enumerateInfo, 32, &countOutput, actionPathsBuffer));
-			for (uint32_t a = 0; a < countOutput; ++a)
-			{
-				XrInputSourceLocalizedNameGetInfo nameGetInfo = {};
-				nameGetInfo.type = XR_TYPE_INPUT_SOURCE_LOCALIZED_NAME_GET_INFO;
-				nameGetInfo.next = NULL;
-				nameGetInfo.sourcePath = actionPathsBuffer[a];
-				nameGetInfo.whichComponents = 
-					XR_INPUT_SOURCE_LOCALIZED_NAME_USER_PATH_BIT |
-					XR_INPUT_SOURCE_LOCALIZED_NAME_INTERACTION_PROFILE_BIT |
-					XR_INPUT_SOURCE_LOCALIZED_NAME_COMPONENT_BIT;
-
-				uint32_t stringCount = 0u;
-				OXR(xrGetInputSourceLocalizedName(engine->appState.Session, &nameGetInfo, 0, &stringCount, NULL));
-				if (stringCount < 256)
-				{
-					OXR(xrGetInputSourceLocalizedName(engine->appState.Session, &nameGetInfo, 256, &stringCount, stringBuffer));
-					char pathStr[256];
-					uint32_t strLen = 0;
-					OXR(xrPathToString(engine->appState.Instance, actionPathsBuffer[a], (uint32_t)sizeof(pathStr), &strLen, pathStr));
-					printf(
-						"  -> path = %lld `%s` -> `%s`\n",
-						(long long)actionPathsBuffer[a],
-						pathStr,
-						stringBuffer);
-				}
-			}
-		}
-	}
 
 	XrSessionActionSetsAttachInfo attachInfo = {};
 	attachInfo.type = XR_TYPE_SESSION_ACTION_SETS_ATTACH_INFO;
@@ -1008,9 +908,7 @@ static void VR_PublishFov( void )
 
 void VR_RefreshDerivedModeState( void )
 {
-	// recompute continuously: single_player arrives via the modules' config
-	// sync-out after cgame/game init, so an edge-triggered evaluation here
-	// would latch false before any map is loaded
+	// every frame: single_player only arrives at the modules' first sync-out
 	vr.use_6dof = vr.single_player && vr_6dof->integer;
 
 	vr.follow_mode = VR_FollowModeFor( Cvar_VariableIntegerValue( "cg_followMode" ), tvPlay.active );

@@ -5761,8 +5761,8 @@ The r_foveationDebug tint, built on first enable rather than alongside the rest:
 nobody asks for should cost the binary its shader and no more. The first frame after the
 cvar goes on hitches, which is the right trade.
 
-It belongs to whichever pass carries the density map -- fov_scene under r_fbo 1, main
-under r_fbo 0 -- since that is where gl_FragSizeEXT reports the map's fragment.
+It belongs to whichever pass carries the density map (fov_scene under r_fbo 1, main
+under r_fbo 0), since that is where gl_FragSizeEXT reports the map's fragment.
 ==================
 */
 static void vk_create_foveation_debug_pipeline( VkRenderPass renderPass )
@@ -8011,9 +8011,7 @@ void vk_begin_main_render_pass( void )
 		if ( VK_IN_POST_SCENE() ) {
 			vk_end_post_scene_pass();
 		} else {
-			// The scene pass is still open: open the post-scene pass first, then close it
-			// Use vk_finish_subpass_post if we haven't done the post processing yet,
-			// then vk_end_post_scene_pass to finish cleanly
+			// The scene pass is still open: go through the post-scene pass so the output pass still runs
 			if ( vk.renderPassIndex == RENDER_PASS_MAIN_WITH_POST ) {
 				if ( !vk.subpassPostDone ) {
 					vk_finish_subpass_post();  // opens the post-scene pass
@@ -8428,7 +8426,6 @@ void vk_begin_frame( uint32_t colorIndex, uint32_t depthIndex )
 	// vk_release_resources() and vk_init_descriptors()); refuse to start a
 	// frame that would bind freed or dangling descriptors.
 	if ( !vk.descriptorsReady ) {
-		ri.Printf( PRINT_DEVELOPER, "vk_begin_frame: skipped, descriptor sets not initialized\n" );
 		// Guard: abandon a frame left open across the pool reset rather than
 		// let vk_end_frame submit dead-set binds.
 		if ( vk.recordingCommands || vk.inRenderPass ) {
@@ -8949,7 +8946,7 @@ void vk_read_pixels( byte *buffer, uint32_t width, uint32_t height )
 	} else if ( vk.xr.initialized && vk.xr.colorInfo && vk.xr.colorIndex < vk.xr.colorInfo->imageCount &&
 		( vk.xr.colorInfo->usage & XR_SWAPCHAIN_USAGE_TRANSFER_SRC_BIT ) ) {
 		// Subpass FBO mode: this frame's image is not submitted yet, so this reads the previous
-		// complete frame -- fine for a screenshot. Left eye only; foveated swapchains are not transferable.
+		// complete frame, fine for a screenshot. Left eye only; foveated swapchains are not transferable.
 		srcImageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
 		srcImage = vk.xr.colorInfo->images[vk.xr.colorIndex];
 	} else {
@@ -10047,8 +10044,8 @@ int vk_foveation_block_at( int eye, float ndcX, float ndcY )
 ==================
 vk_log_tile_size
 
-The tiler applies a density map one bin at a time -- one sample per bin, held across
-the whole bin -- so the bin is the map's real resolution.
+The tiler applies a density map one bin at a time (one sample per bin, held across
+the whole bin), so the bin is the map's real resolution.
 Print it once per framebuffer set; it is the number that says how much of the falloff
 survives, and whether the bin grid is a strip grid or something square.
 ==================

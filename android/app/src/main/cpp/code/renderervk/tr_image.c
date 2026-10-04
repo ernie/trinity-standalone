@@ -1797,10 +1797,7 @@ void R_InitImages( void ) {
 	// This must happen before CreateExternalShaders() sets up tr.hudShader
 	vk_create_hud_buffer();
 
-	// Note: Processed image and virtual screen resources are NOT created here.
-	// - Processed image is only needed for FBO mode (r_fbo 1), created in vk_init_xr_resources()
-	// - Virtual screen (menus, spectator mode) is handled by OpenXR cylinder layer
-	//   composition in VR_EndFrame, so no in-engine mesh rendering is needed
+	// the processed image and the virtual screen belong to vk_init_xr_resources()
 #endif
 }
 

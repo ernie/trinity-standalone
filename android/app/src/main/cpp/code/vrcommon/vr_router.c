@@ -3,6 +3,7 @@
 #include "../client/client.h"
 #include "../client/cl_vr_bind.h"
 #include "vr_clientinfo.h"
+#include "vr_shared.h"
 #include "vr_haptics.h"
 #include "vr_input.h"
 #include "vr_virtual_screen.h"
@@ -571,8 +572,7 @@ void VR_Router_ApplyMove( usercmd_t *cmd ) {
 		VectorCopy( vr.calculated_weaponangles, angles );
 		angles[PITCH] -= SHORT2ANGLE( cl.snap.ps.delta_angles[PITCH] );
 		angles[YAW] += cl.viewangles[YAW] - vr.hmdorientation[YAW];
-		// Servers reading 32-bit commands take head roll from the angles; this option sends it
-		// to the rest.
+		// 32-bit-command servers always get head roll; vr_sendRollToServer extends it to the rest
 		angles[ROLL] = (vr_sendRollToServer->integer || clc.serverSupportsVR)
 							? Com_Clamp( -60, 60, vr.hmdorientation[ROLL] )
 							: 0;

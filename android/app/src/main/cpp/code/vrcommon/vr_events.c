@@ -44,7 +44,6 @@ XrBool32 VR_ProcessXrEvents(VR_App* app)
 			} break;
 
 			case XR_TYPE_EVENT_DATA_INTERACTION_PROFILE_CHANGED:
-				printf("[OpenXR][EVT_INTERACTION_PROFILE_CHANGED]\n");
 				VR_UpdateInteractionProfiles();
 				break;
 
@@ -71,8 +70,6 @@ XrBool32 VR_ProcessXrEvents(VR_App* app)
 
 			case XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED: {
 				const XrEventDataSessionStateChanged* session_state_changed_event = (XrEventDataSessionStateChanged*)(baseEventHeader);
-				printf("[OpenXR][EVT_SESSION_STATE_CHANGED] Session state changed: %d\n",
-					session_state_changed_event->state);
 				_VR_HandleSessionStateChange(app, session_state_changed_event->state);
 			} break;
 

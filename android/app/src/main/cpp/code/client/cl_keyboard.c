@@ -9,6 +9,7 @@
 #include "client.h"
 #include "cl_vkb_layout.h"
 #include "../vrcommon/vr_clientinfo.h"
+#include "../vrcommon/vr_shared.h"
 #include "../vrcommon/vr_haptics.h"
 #include "../vrcommon/vr_router.h"
 
