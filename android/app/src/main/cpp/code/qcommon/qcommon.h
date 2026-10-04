@@ -397,14 +397,7 @@ void	VM_CheckBounds2( const vm_t *vm, unsigned int addr1, unsigned int addr2, un
 // the vendored VM subsystem dropped the old global currentVM tracking.
 void	*GVM_ArgPtr( intptr_t intValue ); // exported for resolving a game VM pointer outside a VM_Call
 
-#define VR_WRITER_CGAME	0
-#define VR_WRITER_GAME	1
-#define VR_WRITER_UI	2
-
-struct vr_shared_s;
-void VR_SharedSyncIn( struct vr_shared_s *s, int structSize );
-void VR_SharedSyncOut( const struct vr_shared_s *s, int writer, int structSize );
-void VR_SharedModuleUnloaded( int writer );
+#include "../vrcommon/vr_state.h"
 
 #define	VMA(x) VM_ArgPtr(args[x])
 static ID_INLINE float _vmf(intptr_t x)
@@ -666,7 +659,6 @@ qboolean FS_FileExists( const char *file );
 qboolean FS_CreatePath (char *OSPath);
 
 int FS_FindVM(void **startSearch, char *found, int foundlen, const char *name, qboolean findQvm);
-int FS_GetVMVRAPIVersion( const char *name, void *searchPath, int *outMinor );
 const char *FS_VMSearchPathName( void *searchPath );
 
 char   *FS_BuildOSPath( const char *base, const char *game, const char *qpath );

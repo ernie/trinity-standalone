@@ -1,6 +1,15 @@
 #include "vm_local.h"
 #include "vm_vr.h"
+#include "vm_vr_select.h"
 #include "../vrcommon/vr_shared.h"
+
+// the select's read of the QVM, handed to VM_LoadQVM so the file is read once
+static struct {
+	vm_t *vm;
+	void *buffer;
+	int length;
+	qboolean sentinel;
+} s_read;
 
 /*
 ==============
@@ -95,6 +104,7 @@ qboolean VM_VRSelectModule( vm_t *vm, vmInterpret_t *interpret, qboolean qvmOnly
 	const int privateFlag = vm->privateFlag;
 
 	*header = NULL;
+	s_read.buffer = NULL;
 
 	// vm_* 0: honor native (pure servers excepted)
 	if ( *interpret == VMI_NATIVE && !qvmOnly ) {
@@ -105,14 +115,27 @@ qboolean VM_VRSelectModule( vm_t *vm, vmInterpret_t *interpret, qboolean qvmOnly
 	}
 
 	if ( FS_FindVM( &startSearch, filename, sizeof( filename ), name, qtrue ) == VMI_COMPILED ) {
-		int minor = 0;
-		int major = FS_GetVMVRAPIVersion( name, startSearch, &minor );
+		int major = 0, minor = 0;
+		qboolean vrAware;
 		const char *pakName = FS_VMSearchPathName( startSearch );
-		if ( major == VR_API_MAJOR && minor <= VR_API_MINOR ) {
+		void *buffer;
+		int length = FS_ReadFile( va( "vm/%s.qvm", name ), &buffer );
+		if ( buffer )
+			major = VM_VRParseMarker( (const byte *)buffer, length, &minor );
+		vrAware = major == VR_API_MAJOR && minor <= VR_API_MINOR;
+		if ( buffer && !vrAware )
+			FS_FreeFile( buffer );
+		if ( vrAware ) {
 			Com_Printf( "%s: loading VR-aware QVM (VR API %d.%d) from %s\n", name, major, minor, pakName );
-			vm->searchPath = startSearch;
-			if ( ( *header = VM_LoadQVM( vm, qtrue ) ) != NULL ) {
-				vm->vrSentinel = qtrue;
+			s_read.vm = vm;
+			s_read.buffer = buffer;
+			s_read.length = length;
+			s_read.sentinel = VM_VRAccepts( major, minor, VR_API_MAJOR, VR_API_MINOR );
+			*header = VM_LoadQVM( vm, qtrue );
+			if ( s_read.buffer )
+				FS_FreeFile( s_read.buffer );
+			s_read.buffer = NULL;
+			if ( *header != NULL ) {
 				// a QVM can't run native; execute under the JIT
 				if ( *interpret == VMI_NATIVE )
 					*interpret = VMI_COMPILED;
@@ -138,7 +161,6 @@ qboolean VM_VRSelectModule( vm_t *vm, vmInterpret_t *interpret, qboolean qvmOnly
 		} else if ( index == VM_GAME && !VM_VRBaseGame( FS_GetCurrentGameDir() ) ) {
 			// the server game needs no VR marker, and the mod's cgame expects its own game code
 			Com_Printf( "%s.qvm in %s is not VR-aware; running it as this mod's server game\n", name, pakName );
-			vm->searchPath = startSearch;
 			if ( ( *header = VM_LoadQVM( vm, qtrue ) ) == NULL )
 				return qfalse;
 			if ( *interpret == VMI_NATIVE )
@@ -169,97 +191,21 @@ qboolean VM_VRSelectModule( vm_t *vm, vmInterpret_t *interpret, qboolean qvmOnly
 ==============
 VM_VRLoadQVMFile
 
-Read the QVM from the search path VM_VRSelectModule checked.
+Read the pk3-priority QVM and take its VR marker from the bytes loaded.
 ==============
 */
 int VM_VRLoadQVMFile( vm_t *vm, const char *filename, void **buffer ) {
-	if ( vm->searchPath )
-		return (int)FS_ReadFileDir( filename, vm->searchPath, qfalse, buffer );
-	return (int)FS_ReadFile( filename, buffer );
-}
-
-void VM_VRModuleUnloaded( vm_t *vm ) {
-	if ( vm->vrShared ) {
-		VR_SharedModuleUnloaded( vm->vrWriter );
+	int length, major, minor;
+	vm->vrSentinel = qfalse;
+	if ( s_read.buffer && s_read.vm == vm ) {
+		*buffer = s_read.buffer;
+		vm->vrSentinel = s_read.sentinel;
+		s_read.buffer = NULL;
+		return s_read.length;
 	}
-	// module must re-register during INIT; vrSentinel is preserved (same image)
-	vm->vrShared = NULL;
-}
-
-/*
-Sync only around the outermost call: the mirror is shared-pointer state,
-so a nested same-VM call (e.g. trap_UpdateScreen -> UI_REFRESH) must see
-the mirror as-is (fresh engine state plus the outer call's own writes).
-Re-syncing on nested entry would clobber uncommitted writer-block writes,
-and re-committing on nested exit would push stale values back to the engine.
-*/
-void VM_VRCallEnter( vm_t *vm ) {
-	if ( vm->vrShared && vm->callLevel == 1 )
-		VR_SharedSyncIn( (vr_shared_t *)vm->vrShared, vm->vrStructSize );
-}
-
-void VM_VRCallLeave( vm_t *vm ) {
-	if ( vm->vrShared && vm->callLevel == 1 )
-		VR_SharedSyncOut( (vr_shared_t *)vm->vrShared, vm->vrWriter, vm->vrStructSize );
-}
-
-/*
-==============
-VM_RegisterVRShared
-
-Module handed us its vr_shared_t mirror. Validate the handshake, translate
-the address (QVM: offset into dataBase; DLL: host pointer), and start syncing.
-==============
-*/
-void VM_RegisterVRShared( vm_t *vm, int writer, intptr_t vmAddr, int structSize, int apiMajor, int apiMinor ) {
-	const char *pakName = FS_VMSearchPathName( vm->searchPath );
-	// Registration is the module's version advertisement: the major.minor pair
-	// it was compiled against. Enforce the same contract as the load gate: run
-	// a module whose major matches and whose minor the engine can meet. For
-	// native modules, which never go through the QVM sentinel check, this is
-	// the only version check; for QVMs it holds the compiled-in pair to the sentinel's word.
-	if ( apiMajor != VR_API_MAJOR || apiMinor > VR_API_MINOR ) {
-		Com_Error( ERR_DROP, "%s: VR API incompatible: engine %d.%d, mod %d.%d",
-			vm->name, VR_API_MAJOR, VR_API_MINOR, apiMajor, apiMinor );
-	}
-	// structSize comes from (possibly hostile) module memory, so clamp it to
-	// [0,sizeof] ONCE here and drive every sync from the stored value: never
-	// re-read it from the module (TOCTOU). The engine only ever touches
-	// structSize bytes of the block.
-	if ( structSize < 0 )
-		structSize = 0;
-	if ( structSize > (int)sizeof( vr_shared_t ) )
-		structSize = (int)sizeof( vr_shared_t );
-	vm->vrStructSize = structSize;
-	if ( vm->entryPoint ) {
-		// native DLL: shared address space
-		if ( vmAddr == 0 ) {
-			Com_Error( ERR_DROP, "%s: VR shared block address invalid", vm->name );
-		}
-		vm->vrShared = (struct vr_shared_s *)vmAddr;
-	} else {
-		unsigned dest = (unsigned)vmAddr;
-		if ( dest == 0 || ( dest & 3 ) != 0 ) {
-			Com_Error( ERR_DROP, "%s: VR shared block address invalid", vm->name );
-		}
-		if ( dest > (unsigned)vm->dataMask ||
-			 (unsigned)structSize > (unsigned)vm->dataMask + 1 - dest ) {
-			Com_Error( ERR_DROP, "%s (from %s): VR shared block out of VM bounds", vm->name, pakName );
-		}
-		vm->vrShared = (struct vr_shared_s *)( vm->dataBase + dest );
-	}
-	vm->vrWriter = writer;
-	Com_Printf( "%s: VR shared state registered (mod VR API %d.%d, %s)\n",
-		vm->name, apiMajor, apiMinor, vm->entryPoint ? "native" : "QVM" );
-	// module registered mid-call; give it fresh state immediately so init code
-	// after the register call reads live values
-	VR_SharedSyncIn( (vr_shared_t *)vm->vrShared, vm->vrStructSize );
-}
-
-qboolean VM_VRSentinel( vm_t *vm ) {
-	return vm ? vm->vrSentinel : qfalse;
-}
-
-qboolean VM_VRRegistered( vm_t *vm ) {
-	return ( vm && vm->vrShared ) ? qtrue : qfalse;
+	length = FS_ReadFile( filename, buffer );
+	if ( length <= 0 || !buffer || !*buffer ) return length;
+	major = VM_VRParseMarker( (const byte *)*buffer, length, &minor );
+	vm->vrSentinel = VM_VRAccepts( major, minor, VR_API_MAJOR, VR_API_MINOR );
+	return length;
 }

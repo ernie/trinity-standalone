@@ -4,8 +4,8 @@
 #include "vm_local.h"
 
 // VR module selection + shared-state protocol glue between vm.c and vrcommon.
-// All VR-specific VM logic lives here so the vendored vm.c stays a clean drop
-// from trinity-engine (end-state: one shared vm.c across all three engines).
+// Everything VR-specific in the VM lives beside this header, so the shared vm.c
+// stays a clean drop between trinity-engine and trinity-standalone.
 
 qboolean VM_VRSelectModule( vm_t *vm, vmInterpret_t *interpret, qboolean qvmOnly, vmHeader_t **header );
 int VM_VRLoadQVMFile( vm_t *vm, const char *filename, void **buffer );

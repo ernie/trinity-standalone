@@ -141,15 +141,24 @@ typedef enum {
 } opcode_t;
 
 typedef struct {
-	int32_t	value;     // 32
-	byte	op;        // 8
-	byte	opStack;   // 8
-	unsigned jused:1;  // this instruction is a jump target
-	unsigned swtch:1;  // indirect jump
-	unsigned safe:1;   // non-masked OP_STORE*
-	unsigned endp:1;   // for last OP_LEAVE instruction
-	unsigned fpu:1;    // load into FPU register
-	unsigned njump:1;  // near jump
+	int32_t	value;			// 32
+	byte	op;				// 8 -> opcode_t
+	union {					// 8
+		byte	opStack;	// for OP_ENTER and tracking max.opStack during initial bytecode load
+		byte	origOp;		// original opcode for a macro op, used in vm_x86
+	};						
+	unsigned jused:1;		// this instruction is a jump target
+	unsigned swtch:1;		// indirect jump
+	unsigned safe:1;		// non-masked OP_STORE* with known/verified address
+	unsigned endp:1;		// for last OP_LEAVE instruction
+	unsigned fpu:1;			// load into FPU register
+	unsigned njump:1;		// near jump
+#if (id386 || idx64)
+	unsigned nanchk:1;		// check for NaN on vm_x86
+#ifdef USE_X87
+	unsigned flush:1;		// x87 ST register must be flushed to avoid stack overflow
+#endif
+#endif
 } instruction_t;
 
 typedef struct vmSymbol_s {
@@ -228,13 +237,12 @@ struct vm_s {
 	int			vrWriter;			// VR_WRITER_* sync-out scope
 	int			vrStructSize;		// module-declared struct size, sanitized to [0,sizeof]; bounds every sync
 	qboolean	vrSentinel;			// loaded QVM carried the VR API sentinel
-	void		*searchPath;		// search path that supplied the loaded QVM
 };
 
 qboolean VM_Compile( vm_t *vm, vmHeader_t *header );
 int32_t VM_CallCompiled( vm_t *vm, int nargs, int32_t *args );
 
-// [vm_vr]: exported for VM_VRSelectModule in vm_vr.c
+// [vm_vr]: exported for the VR module ladder in vm_vr.c
 vmHeader_t *VM_LoadQVM( vm_t *vm, qboolean alloc );
 
 qboolean VM_PrepareInterpreter2( vm_t *vm, vmHeader_t *header );

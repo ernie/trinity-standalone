@@ -7,7 +7,7 @@
 
 // Engine <-> game-module VR state ABI. QVM-safe: 4-byte scalar types only,
 // no pointers, identical layout on 64-bit host and 32-bit QVM.
-// LAYOUT IS FROZEN once published: append to a block, never reorder/remove.
+// Preserve existing field offsets; append compatible fields only at the struct tail.
 // Additive changes (new tail field, new trap) bump the MINOR; reordering,
 // removing, or retyping an existing field or trap bumps the MAJOR. The engine
 // runs a QVM whose major matches and whose minor it can meet or exceed.
@@ -86,8 +86,8 @@ typedef struct vr_shared_s {
 	// ---- uiShared block: cgame+ui-writable ----
 	float menuYaw;
 	int   menuYawLocked;
-	int   menuCursorActive;       // replaces int* cursor registration
-	int   scoreboardCursorActive; // replaces int* cursor registration
+	int   menuCursorActive;       // menu cursor tracking requested
+	int   scoreboardCursorActive; // scoreboard cursor tracking requested
 
 	// ---- cfg block: cgame+game-writable ----
 	int   no_crosshair;

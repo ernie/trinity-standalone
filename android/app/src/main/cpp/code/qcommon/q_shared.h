@@ -376,7 +376,8 @@ typedef enum {
 typedef enum {
 	h_high,
 	h_low,
-	h_dontcare
+	h_dontcare,
+	h_current	// the bank the last preference chose; the shared vm.c allocates with it
 } ha_pref;
 
 #ifdef HUNK_DEBUG

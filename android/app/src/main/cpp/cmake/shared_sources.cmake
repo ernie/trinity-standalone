@@ -26,6 +26,8 @@ set(COMMON_SOURCES
     ${SOURCE_DIR}/qcommon/vm.c
     ${SOURCE_DIR}/qcommon/vm_interpreted.c
     ${SOURCE_DIR}/qcommon/vm_vr.c
+    ${SOURCE_DIR}/qcommon/vm_vr_select.c
+    ${SOURCE_DIR}/qcommon/vm_vr_state.c
     ${SOURCE_DIR}/qcommon/vm_aarch64.c
 )
 
