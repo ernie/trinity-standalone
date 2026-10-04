@@ -26,6 +26,7 @@ layout(constant_id = 9) const int depth_g = 255;
 layout(constant_id = 10) const int depth_b = 255;
 // 1: the target view encodes sRGB itself, so the display-encoded result goes out decoded to linear
 layout(constant_id = 11) const int srgbTarget = 0;
+layout(constant_id = 12) const int bloomFine = 0; // adds the half-resolution level
 
 vec3 srgbToLinear(vec3 c) {
 	c = clamp(c, 0.0, 1.0);
@@ -71,10 +72,12 @@ void main() {
 	vec3 base = scene.rgb;
 
 	// Blur is from this frame's scene, so it lines up and needs no reprojection
-	vec3 bloom = texture(texture0, vec3(frag_tex_coord, layer)).rgb
-	           + texture(texture1, vec3(frag_tex_coord, layer)).rgb
+	vec3 bloom = texture(texture1, vec3(frag_tex_coord, layer)).rgb
 	           + texture(texture2, vec3(frag_tex_coord, layer)).rgb
 	           + texture(texture3, vec3(frag_tex_coord, layer)).rgb;
+	if ( bloomFine != 0 ) {
+		bloom += texture(texture0, vec3(frag_tex_coord, layer)).rgb;
+	}
 
 	// bloom lands under the post-scene draws: the scene's alpha is what they let through
 	base = base + bloom * bloomFactor * scene.a;

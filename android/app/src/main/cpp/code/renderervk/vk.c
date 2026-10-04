@@ -5367,7 +5367,7 @@ void vk_create_post_process_pipelines( void )
 	VkGraphicsPipelineCreateInfo create_info;
 	VkViewport viewport;
 	VkRect2D scissor;
-	VkSpecializationMapEntry spec_entries[12];
+	VkSpecializationMapEntry spec_entries[13];
 	VkSpecializationInfo frag_spec_info;
 	uint32_t i, width, height;
 
@@ -5384,6 +5384,7 @@ void vk_create_post_process_pipelines( void )
 		int depth_g;
 		int depth_b;
 		int srgb_target;
+		int bloom_fine;
 	} frag_spec_data;
 
 	// Note: This is called during vk_init_xr_resources() before vk.xr.initialized is set
@@ -5463,6 +5464,7 @@ void vk_create_post_process_pipelines( void )
 	frag_spec_data.bloom_modulate = r_bloom_modulate->integer;
 	frag_spec_data.dither = r_dither->integer;
 	frag_spec_data.srgb_target = vk_xr_srgb_target() ? 1 : 0;
+	frag_spec_data.bloom_fine = r_bloom_fine->integer;
 
 	// Get color depth from XR swapchain format
 	if ( vk.xr.colorInfo && !vk_surface_format_color_depth( vk.xr.colorInfo->format,
@@ -5518,7 +5520,11 @@ void vk_create_post_process_pipelines( void )
 	spec_entries[11].offset = offsetof( struct FragSpecData, srgb_target );
 	spec_entries[11].size = sizeof( frag_spec_data.srgb_target );
 
-	frag_spec_info.mapEntryCount = 12;
+	spec_entries[12].constantID = 12;
+	spec_entries[12].offset = offsetof( struct FragSpecData, bloom_fine );
+	spec_entries[12].size = sizeof( frag_spec_data.bloom_fine );
+
+	frag_spec_info.mapEntryCount = 13;
 	frag_spec_info.pMapEntries = spec_entries;
 	frag_spec_info.dataSize = sizeof( frag_spec_data );
 	frag_spec_info.pData = &frag_spec_data;
@@ -5596,8 +5602,10 @@ void vk_create_post_process_pipelines( void )
 			blur_width = gls.captureWidth / ( 2 << ( i / 2 ) );
 			blur_height = gls.captureHeight / ( 2 << ( i / 2 ) );
 
-			// Offsets are in source texels; the horizontal passes downsample 2:1
-			blur_spec_data[0] = 1.2f / (float)( blur_width * 2 );  // x offset
+			// Offsets are in source texels. The horizontal passes downsample 2:1, so one output texel out
+			// lands every tap between two source texels: three 2x2 boxes, a [5 5 6 6 5 5] kernel that
+			// averages the most before the first pass thresholds. The verticals emulate the 5-tap gaussian.
+			blur_spec_data[0] = 1.0f / (float)blur_width;           // x offset
 			blur_spec_data[1] = 1.2f / (float)blur_height;         // y offset
 			blur_spec_data[2] = 1.0f;                              // intensity
 
@@ -5634,8 +5642,9 @@ void vk_create_post_process_pipelines( void )
 				float threshold;
 				int mode;
 				int modulate;
+				float knee;
 			} blur_extract_data;
-			VkSpecializationMapEntry blur_extract_entries[6];
+			VkSpecializationMapEntry blur_extract_entries[7];
 			VkSpecializationInfo blur_extract_info;
 
 			if ( i == 0 ) {
@@ -5643,6 +5652,7 @@ void vk_create_post_process_pipelines( void )
 				blur_extract_data.threshold = frag_spec_data.bloom_threshold;
 				blur_extract_data.mode = frag_spec_data.bloom_threshold_mode;
 				blur_extract_data.modulate = frag_spec_data.bloom_modulate;
+				blur_extract_data.knee = r_bloom_knee->value;
 
 				Com_Memcpy( blur_extract_entries, blur_spec_entries, sizeof( blur_spec_entries ) );
 				blur_extract_entries[3].constantID = 3;
@@ -5654,8 +5664,11 @@ void vk_create_post_process_pipelines( void )
 				blur_extract_entries[5].constantID = 6;
 				blur_extract_entries[5].offset = offsetof( struct BlurExtractSpec, modulate );
 				blur_extract_entries[5].size = sizeof( blur_extract_data.modulate );
+				blur_extract_entries[6].constantID = 7;
+				blur_extract_entries[6].offset = offsetof( struct BlurExtractSpec, knee );
+				blur_extract_entries[6].size = sizeof( blur_extract_data.knee );
 
-				blur_extract_info.mapEntryCount = 6;
+				blur_extract_info.mapEntryCount = 7;
 				blur_extract_info.pMapEntries = blur_extract_entries;
 				blur_extract_info.dataSize = sizeof( blur_extract_data );
 				blur_extract_info.pData = &blur_extract_data;
