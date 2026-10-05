@@ -38,6 +38,14 @@ static int	cvar_group[CVG_MAX];
 #define FILE_HASH_SIZE		256
 static	cvar_t	*hashTable[FILE_HASH_SIZE];
 
+static qboolean cvar_loadingConfig;
+
+static void Cvar_SetCliSaved( cvar_t *var, const char *value ) {
+	if ( var->cliSaved )
+		Z_Free( var->cliSaved );
+	var->cliSaved = value ? CopyString( value ) : NULL;
+}
+
 /*
 ================
 return a hash value for the filename
@@ -524,6 +532,11 @@ cvar_t *Cvar_Set2( const char *var_name, const char *value, qboolean force ) {
 #endif
 
 	var = Cvar_FindVar (var_name);
+	if ( var && var->cliHeld && cvar_loadingConfig ) {
+		Cvar_SetCliSaved( var, value );
+		if ( var->flags & CVAR_NOCLI )
+			return var;
+	}
 	if (!var) {
 		if ( !value ) {
 			return NULL;
@@ -541,6 +554,13 @@ cvar_t *Cvar_Set2( const char *var_name, const char *value, qboolean force ) {
 	}
 
 	value = Cvar_Validate(var, value, qtrue);
+
+	// the player's own change is saved from now on; a set the checks below refuse is not one
+	if ( var->cliHeld && !cvar_loadingConfig && strcmp( value, var->latchedString ? var->latchedString : var->string )
+		&& ( force || !( ( var->flags & ( CVAR_ROM | CVAR_INIT ) ) || ( ( var->flags & CVAR_CHEAT ) && !cvar_cheats->integer ) ) ) ) {
+		var->cliHeld = qfalse;
+		Cvar_SetCliSaved( var, NULL );
+	}
 
 	if((var->flags & CVAR_LATCH) && var->latchedString)
 	{
@@ -926,6 +946,39 @@ void Cvar_Reset_f( void ) {
 
 /*
 ============
+Cvar_SetStartup
+
+Applies a command-line value and keeps the value it replaced, which a CVAR_NOCLI cvar writes to the config
+============
+*/
+void Cvar_SetStartup( const char *var_name, const char *value ) {
+	cvar_t *var = Cvar_FindVar( var_name );
+
+	if ( !var ) {
+		var = Cvar_Get( var_name, value, CVAR_USER_CREATED );
+	} else {
+		// a later pass keeps the first replaced value, or the config's once a config has set it
+		if ( !var->cliHeld )
+			Cvar_SetCliSaved( var, var->latchedString ? var->latchedString : var->string );
+		var->cliHeld = qfalse;
+		Cvar_Set2( var_name, value, qfalse );
+	}
+	var->cliHeld = qtrue;
+}
+
+/*
+============
+Cvar_LoadingConfig
+
+Config lines executed while loading set what a CVAR_NOCLI cvar holding its command-line value saves, not its session value
+============
+*/
+void Cvar_LoadingConfig( qboolean loading ) {
+	cvar_loadingConfig = loading;
+}
+
+/*
+============
 Cvar_WriteVariables
 
 Appends lines containing "set variable value" for all variables
@@ -936,6 +989,7 @@ void Cvar_WriteVariables(fileHandle_t f)
 {
 	cvar_t	*var;
 	char	buffer[1024];
+	const char	*value;
 
 	for (var = cvar_vars; var; var = var->next)
 	{
@@ -943,27 +997,21 @@ void Cvar_WriteVariables(fileHandle_t f)
 			continue;
 
 		if( var->flags & CVAR_ARCHIVE ) {
+			// write the latched value, even if it hasn't taken effect yet
+			value = var->latchedString ? var->latchedString : var->string;
+			if ( ( var->flags & CVAR_NOCLI ) && var->cliHeld )
+				value = var->cliSaved ? var->cliSaved : var->resetString;
 			// skip writing if NODEFAULT and value matches default
-			if ( (var->flags & CVAR_NODEFAULT) && var->latchedString == NULL
-					&& strcmp( var->string, var->resetString ) == 0 ) {
+			if ( (var->flags & CVAR_NODEFAULT) && value != var->latchedString
+					&& strcmp( value, var->resetString ) == 0 ) {
 				continue;
 			}
-			// write the latched value, even if it hasn't taken effect yet
-			if ( var->latchedString ) {
-				if( strlen( var->name ) + strlen( var->latchedString ) + 10 > sizeof( buffer ) ) {
-					Com_Printf( S_COLOR_YELLOW "WARNING: value of variable "
-							"\"%s\" too long to write to file\n", var->name );
-					continue;
-				}
-				Com_sprintf (buffer, sizeof(buffer), "seta %s \"%s\"\n", var->name, var->latchedString);
-			} else {
-				if( strlen( var->name ) + strlen( var->string ) + 10 > sizeof( buffer ) ) {
-					Com_Printf( S_COLOR_YELLOW "WARNING: value of variable "
-							"\"%s\" too long to write to file\n", var->name );
-					continue;
-				}
-				Com_sprintf (buffer, sizeof(buffer), "seta %s \"%s\"\n", var->name, var->string);
+			if( strlen( var->name ) + strlen( value ) + 10 > sizeof( buffer ) ) {
+				Com_Printf( S_COLOR_YELLOW "WARNING: value of variable "
+						"\"%s\" too long to write to file\n", var->name );
+				continue;
 			}
+			Com_sprintf (buffer, sizeof(buffer), "seta %s \"%s\"\n", var->name, value);
 			FS_Write( buffer, strlen( buffer ), f );
 		}
 	}
@@ -1153,6 +1201,8 @@ cvar_t *Cvar_Unset(cvar_t *cv)
 		Z_Free(cv->resetString);
 	if(cv->description)
 		Z_Free(cv->description);
+	if(cv->cliSaved)
+		Z_Free(cv->cliSaved);
 
 	if(cv->prev)
 		cv->prev->next = cv->next;

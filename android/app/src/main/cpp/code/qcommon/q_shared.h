@@ -1035,6 +1035,7 @@ default values.
 #define CVAR_NODEFAULT		0x4000	// do not write to config if matching with default value
 #define CVAR_PRIVATE		0x8000	// can't be read from VM (reserved: matches Quake3e)
 #define CVAR_DEVELOPER		0x10000	// developer-only cvar (renderervk compatibility)
+#define CVAR_NOCLI		0x40000	// a command-line value lasts the session unsaved; kept through a game switch only with CVAR_NORESTART
 // These flags are only returned by the Cvar_Flags() function
 #define CVAR_MODIFIED		0x40000000	// Cvar was modified
 #define CVAR_NONEXISTENT	0x80000000	// Cvar doesn't exist.
@@ -1044,6 +1045,7 @@ default values.
 #define COM_TRAP_GETVALUE 700
 
 #define CVAR_ARCHIVE_ND		(CVAR_ARCHIVE | CVAR_NODEFAULT)	// archived, but not written if value equals default
+#define CVAR_ARCHIVE_NOCLI	(CVAR_ARCHIVE | CVAR_NOCLI)
 
 // Cvar groups for batch modification checking (renderervk)
 typedef enum {
@@ -1078,6 +1080,8 @@ struct cvar_s {
 	cvar_t *hashNext;
 	cvar_t *hashPrev;
 	int			hashIndex;
+	char		*cliSaved;			// the value a command-line set replaced; NULL means the default
+	qboolean	cliHeld;			// the value is still the command-line one
 };
 
 #define	MAX_CVAR_VALUE_STRING	256

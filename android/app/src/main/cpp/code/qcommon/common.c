@@ -315,6 +315,7 @@ void QDECL Com_Error( int code, const char *fmt, ... ) {
 
 	com_gameRestarting = qfalse;
 	com_gameClientRestarting = qfalse;
+	Cvar_LoadingConfig( qfalse );
 
 	if (code == ERR_DISCONNECT || code == ERR_SERVERDISCONNECT) {
 		VM_Forced_Unload_Start();
@@ -493,7 +494,12 @@ void Com_StartupVariable( const char *match ) {
 
 	for (i=0 ; i < com_numConsoleLines ; i++) {
 		Cmd_TokenizeString( com_consoleLines[i] );
-		if ( strcmp( Cmd_Argv(0), "set" ) ) {
+		s = Cmd_Argv(0);
+		if ( strcmp( s, "set" ) && strcmp( s, "seta" ) && strcmp( s, "setu" ) && strcmp( s, "sets" ) ) {
+			continue;
+		}
+		// without a value these only print the cvar, which the command buffer does later
+		if ( strcmp( s, "set" ) && Cmd_Argc() < 3 ) {
 			continue;
 		}
 
@@ -501,10 +507,7 @@ void Com_StartupVariable( const char *match ) {
 		
 		if(!match || !strcmp(s, match))
 		{
-			if(Cvar_Flags(s) == CVAR_NONEXISTENT)
-				Cvar_Get(s, Cmd_ArgsFrom(2), CVAR_USER_CREATED);
-			else
-				Cvar_Set2(s, Cmd_ArgsFrom(2), qfalse);
+			Cvar_SetStartup(s, Cmd_ArgsFrom(2));
 		}
 	}
 }
@@ -2393,6 +2396,7 @@ For controlling environment variables
 
 void Com_ExecuteCfg(void)
 {
+	Cvar_LoadingConfig( qtrue );
 	Cbuf_ExecuteText(EXEC_NOW, "exec default.cfg\n");
 	Cbuf_Execute(); // Always execute after exec to prevent text buffer overflowing
 
@@ -2404,6 +2408,7 @@ void Com_ExecuteCfg(void)
 		Cbuf_ExecuteText(EXEC_NOW, "exec autoexec.cfg\n");
 		Cbuf_Execute();
 	}
+	Cvar_LoadingConfig( qfalse );
 }
 
 /*

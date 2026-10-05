@@ -583,6 +583,10 @@ void 	Cvar_WriteVariables( fileHandle_t f );
 // writes lines containing "set variable value" for all variables
 // with the archive flag set to true.
 
+void	Cvar_SetStartup( const char *var_name, const char *value );
+void	Cvar_LoadingConfig( qboolean loading );
+// a CVAR_NOCLI cvar keeps a command-line value for the session while the config keeps its own
+
 void	Cvar_Init( void );
 
 char	*Cvar_InfoString( int bit );
