@@ -648,8 +648,8 @@ void Con_DrawNotify (void)
 	int		skip;
 	int		currentColor;
 
-	// scope up: only the minimal HUD draws, so console text hides with the full HUD
-	if ( vr.weapon_zoomed ) {
+	// the scope and the weapon adjust overlay hide the full HUD; the notify lines hide with it
+	if ( vr.weapon_zoomed || vr.weapon_adjust ) {
 		return;
 	}
 
