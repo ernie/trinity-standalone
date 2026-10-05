@@ -755,7 +755,7 @@ static qboolean CL_UIGetValue( char *value, int valueSize, const char *key ) {
 		return qtrue;
 	}
 
-	// Value keys (no syscall): names of the bound buttons, so ui prompts can name the real controls
+	// Value keys (no syscall): key codes and glyph names, so module prompts show the real controls
 	if ( CL_VRBind_GetValue( key, value, valueSize ) )
 		return qtrue;
 	return qfalse;

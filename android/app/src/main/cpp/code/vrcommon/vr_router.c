@@ -396,9 +396,6 @@ void VR_Router_Frame( const clXRHandInput_t hands[2] ) {
 	}
 	{
 		const int mapping = vr.right_handed | (vr_switchThumbsticks->integer != 0) << 1;
-		/* Role keys change names with handedness, so an open vote prompt must rename them. */
-		if ( holds.mapping >= 0 && holds.mapping != mapping )
-			CL_ResolveVoteKeys();
 		VR_Router_RunEvents( events, VR_HoldsSetMapping( &holds, mapping, events, ARRAY_LEN( events ) ), qfalse );
 	}
 	if ( !VR_Router_Capture() )
@@ -492,7 +489,7 @@ void VR_Router_ApplyMove( usercmd_t *cmd ) {
 	side = cosf( angle ) * x - sinf( angle ) * forward;
 	forward = cosf( angle ) * forward + sinf( angle ) * x;
 	if ( vr.use_6dof && input.previousTime && input.time > input.previousTime ) {
-		/* Convert room-scale metres per millisecond to command movement units. */
+		/* Convert room-scale meters per millisecond to command movement units. */
 		float factor = 10000.0f / (72.0f * (input.time - input.previousTime));
 		float px = -vr.hmdposition_delta[0] * factor, py = vr.hmdposition_delta[2] * factor;
 		float yaw = -vr.hmdorientation[YAW] * (float)M_PI / 180;

@@ -136,18 +136,13 @@ cvar_t	*cl_tvdOffer;
 cvar_t	*cl_voteYesKey;
 cvar_t	*cl_voteNoKey;
 
-/* The vote prompts name the button that votes: the VR vote binding, else the keyboard's "vote" binds. */
+/* The vote prompts name the keyboard's "vote" binds; in VR the cgame asks for the VR buttons itself (vr_bindkeys). */
 void CL_ResolveVoteKeys( void ) {
-	static const char *commands[2][2] = {{"vote yes", "+vote_yes"}, {"vote no", "+vote_no"}};
+	static const char *commands[2] = {"vote yes", "vote no"};
 	static const char *cvars[2] = {"cl_voteYesKey", "cl_voteNoKey"};
-	char name[64];
 	int i, keynum;
 	for ( i = 0; i < 2; i++ ) {
-		if ( CL_VRBind_NameFor( "vote", commands[i][1], name, sizeof( name ) ) ) {
-			Cvar_Set( cvars[i], name );
-			continue;
-		}
-		keynum = Key_GetKey( commands[i][0] );
+		keynum = Key_GetKey( commands[i] );
 		Cvar_Set( cvars[i], keynum >= 0 ? Key_KeynumToString( keynum ) : "" );
 	}
 }
