@@ -42,9 +42,8 @@ qboolean VR_IsSPIntermission( void )
 
 qboolean VR_Gameplay_ShouldRenderInVirtualScreen( void )
 {
-	// Use screen layer for UI/console, EXCEPT during single-player intermission
-	// where we want the in-world podium view even with the postgame menu active
-	if ( VR_IsInMenu() && !VR_IsSPIntermission() )
+	// The SP postgame UI draws on the podium HUD; the console reads on the virtual screen everywhere
+	if ( VR_IsInConsole() || ( VR_IsInMenu() && !VR_IsSPIntermission() ) )
 	{
 		return qtrue;
 	}
