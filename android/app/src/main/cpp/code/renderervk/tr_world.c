@@ -618,6 +618,16 @@ static void R_RecursiveWorldNode( mnode_t *node, unsigned int planeBits, unsigne
 				}
 			}
 
+			if ( planeBits & 16 ) {
+				r = BoxOnPlaneSide(node->mins, node->maxs, &tr.viewParms.portalPlane);
+				if (r == 2) {
+					return;						// culled
+				}
+				if ( r == 1 ) {
+					planeBits &= ~16;			// all descendants will also be in front
+				}
+			}
+
 		}
 
 		if ( node->contents != CONTENTS_NODE ) {
@@ -780,7 +790,8 @@ cluster
 ===============
 */
 static void R_MarkLeaves (void) {
-	const byte	*vis;
+	const byte	*vis, *eyeVis[2] = {NULL,NULL};
+	int eyeCluster[2] = {-1,-1};
 	mnode_t	*leaf, *parent;
 	int		i;
 	int		cluster;
@@ -794,13 +805,29 @@ static void R_MarkLeaves (void) {
 	// current viewcluster
 	leaf = R_PointInLeaf( tr.viewParms.pvsOrigin );
 	cluster = leaf->cluster;
+	if ( tr.viewParms.xrMultiview ) {
+		int eye;
+		for ( eye = 0; eye < 2; eye++ ) {
+			vec3_t origin, axis[3], offset, eyePvsOrigin;
+			R_EyeOrientation( &tr.viewParms, eye, origin, axis );
+			/* Portal PVS uses the destination anchor, plus transformed eye separation. */
+			VectorSubtract( origin, tr.viewParms.or.origin, offset );
+			VectorAdd( tr.viewParms.pvsOrigin, offset, eyePvsOrigin );
+			eyeCluster[eye] = R_PointInLeaf( eyePvsOrigin )->cluster;
+		}
+	}
 
 	// if the cluster is the same and the area visibility matrix
 	// hasn't changed, we don't need to mark everything again
 
-	// if r_showcluster was just turned on, remark everything 
-	if ( tr.viewCluster == cluster && !tr.refdef.areamaskModified 
-		&& !r_showcluster->modified ) {
+	// if r_showcluster was just turned on, remark everything
+	if ( tr.pvsCache.valid && tr.pvsCache.world == tr.world &&
+		tr.pvsCache.center == cluster &&
+		tr.pvsCache.multiview == tr.viewParms.xrMultiview &&
+		tr.pvsCache.eye[0] == eyeCluster[0] && tr.pvsCache.eye[1] == eyeCluster[1] &&
+		tr.pvsCache.novis == r_novis->integer && !tr.refdef.areamaskModified &&
+		!memcmp( tr.pvsCache.areamask, tr.refdef.areamask, sizeof( tr.pvsCache.areamask ) ) &&
+		!r_showcluster->modified ) {
 		return;
 	}
 
@@ -811,10 +838,19 @@ static void R_MarkLeaves (void) {
 		}
 	}
 
+	/* The cache is renderer-owned and reset with tr, including world reloads. */
+	tr.pvsCache.valid = qtrue;
+	tr.pvsCache.world = tr.world;
+	tr.pvsCache.center = cluster;
+	tr.pvsCache.eye[0] = eyeCluster[0];
+	tr.pvsCache.eye[1] = eyeCluster[1];
+	tr.pvsCache.multiview = tr.viewParms.xrMultiview;
+	tr.pvsCache.novis = r_novis->integer;
+	Com_Memcpy( tr.pvsCache.areamask, tr.refdef.areamask, sizeof( tr.pvsCache.areamask ) );
 	tr.visCount++;
 	tr.viewCluster = cluster;
 
-	if ( r_novis->integer || tr.viewCluster == -1 ) {
+	if ( r_novis->integer || tr.viewCluster == -1 || (tr.viewParms.xrMultiview && (eyeCluster[0] == -1 || eyeCluster[1] == -1)) ) {
 		for (i=0 ; i<tr.world->numnodes ; i++) {
 			if (tr.world->nodes[i].contents != CONTENTS_SOLID) {
 				tr.world->nodes[i].visframe = tr.visCount;
@@ -824,7 +860,11 @@ static void R_MarkLeaves (void) {
 	}
 
 	vis = R_ClusterPVS (tr.viewCluster);
-	
+	if ( tr.viewParms.xrMultiview ) {
+		eyeVis[0] = R_ClusterPVS( eyeCluster[0] );
+		eyeVis[1] = R_ClusterPVS( eyeCluster[1] );
+	}
+
 	for (i=0,leaf=tr.world->nodes ; i<tr.world->numnodes ; i++, leaf++) {
 		cluster = leaf->cluster;
 		if ( cluster < 0 || cluster >= tr.world->numClusters ) {
@@ -832,12 +872,14 @@ static void R_MarkLeaves (void) {
 		}
 
 		// check general pvs
-		if ( !(vis[cluster>>3] & (1<<(cluster&7))) ) {
+		if ( !(vis[cluster>>3] & (1<<(cluster&7))) &&
+			!(eyeVis[0] && (eyeVis[0][cluster>>3] & (1<<(cluster&7)))) &&
+			!(eyeVis[1] && (eyeVis[1][cluster>>3] & (1<<(cluster&7)))) ) {
 			continue;
 		}
 
 		// check for door connection
-		if ( (tr.refdef.areamask[leaf->area>>3] & (1<<(leaf->area&7)) ) ) {
+		if ( leaf->area >= 0 && (tr.refdef.areamask[leaf->area>>3] & (1<<(leaf->area&7))) ) {
 			continue;		// not visible
 		}
 
@@ -885,7 +927,7 @@ void R_AddWorldSurfaces( void ) {
 		tr.refdef.num_dlights = MAX_DLIGHTS;
 	}
 
-	R_RecursiveWorldNode( tr.world->nodes, 15, ( 1ULL << tr.refdef.num_dlights ) - 1 );
+	R_RecursiveWorldNode( tr.world->nodes, tr.viewParms.portalView != PV_NONE ? 31 : 15, ( 1ULL << tr.refdef.num_dlights ) - 1 );
 
 #ifdef USE_PMLIGHT
 #ifdef USE_LEGACY_DLIGHTS

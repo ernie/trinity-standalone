@@ -965,9 +965,6 @@ typedef struct {
 	int dirty_depth_attachment;
 
 	float modelview_transform[16];
-
-	// Per-eye projection matrices from OpenXR (set via RE_SetVRHeadsetParms)
-	float projectionEye[2][16];
 } Vk_World;
 
 extern Vk_Instance	vk;				// shouldn't be cleared during ref re-init

@@ -460,15 +460,21 @@ void VR_Renderer_BeginFrame(VR_Engine* engine, XrBool32 needsRecenter)
 
 	// Create per-eye projection matrices from actual OpenXR FOVs
 	XrMatrix4x4f vrMatrixEye[2];
+	float eyeFovs[2][4] = {{0}};
 	for (int eye = 0; eye < 2 && eye < (int)viewCount; eye++)
 	{
-		XrFovf eyeFov = {
+		// Scope: both eyes take the scope frustum, matching the image drawn
+		XrFovf eyeFov = vr.weapon_zoomed ? projectionFov : (XrFovf){
 			views[eye].fov.angleLeft / vr.weapon_zoomLevel,
 			views[eye].fov.angleRight / vr.weapon_zoomLevel,
 			views[eye].fov.angleUp / vr.weapon_zoomLevel,
 			views[eye].fov.angleDown / vr.weapon_zoomLevel,
 		};
 		XrMatrix4x4f_CreateProjectionFov(&vrMatrixEye[eye], graphicsApi, eyeFov, nearPlane, 0.0f);
+		eyeFovs[eye][0] = eyeFov.angleLeft;
+		eyeFovs[eye][1] = eyeFov.angleRight;
+		eyeFovs[eye][2] = eyeFov.angleUp;
+		eyeFovs[eye][3] = eyeFov.angleDown;
 	}
 
 	// Convert to reversed depth (near=1.0, far=0.0) for Quake3e's depth precision
@@ -477,39 +483,8 @@ void VR_Renderer_BeginFrame(VR_Engine* engine, XrBool32 needsRecenter)
 	ConvertToReversedDepth(&vrMatrixEye[0]);
 	ConvertToReversedDepth(&vrMatrixEye[1]);
 
-	// Compute combined stereo horizontal FOV for culling
-	float combinedAngleLeft = views[0].fov.angleLeft / vr.weapon_zoomLevel;
-	float combinedAngleRight = views[1].fov.angleRight / vr.weapon_zoomLevel;
-	float combinedFovX = (fabsf(combinedAngleLeft) + fabsf(combinedAngleRight)) * 180.0f / M_PI;
-	// Canted displays: each eye's FOV is centered on its own yawed axis
-	combinedFovX += (fabsf(vr.eyeCantYaw[0]) + fabsf(vr.eyeCantYaw[1])) * 180.0f / M_PI;
-	// Up and down may differ, so each vertical plane gets its own angle
-	float fovUp = fov.angleUp / vr.weapon_zoomLevel * 180.0f / M_PI;
-	float fovDown = fabsf(fov.angleDown) / vr.weapon_zoomLevel * 180.0f / M_PI;
-	if (vr.weapon_zoomed)
-	{
-		// Cull to whichever is wider, the eyes or the scope's fixed frustum
-		float scopeFovX = 2.0f * projectionFov.angleRight * 180.0f / M_PI;
-		float scopeFovV = projectionFov.angleUp * 180.0f / M_PI;
-		if (scopeFovX > combinedFovX)
-			combinedFovX = scopeFovX;
-		if (scopeFovV > fovUp)
-			fovUp = scopeFovV;
-		if (scopeFovV > fovDown)
-			fovDown = scopeFovV;
-	}
-
-	// Calculate half-IPD in meters for frustum plane offset
-	float halfIpdMeters = 0.0f;
-	if (viewCount >= 2) {
-		float dx = views[1].pose.position.x - views[0].pose.position.x;
-		float dy = views[1].pose.position.y - views[0].pose.position.y;
-		float dz = views[1].pose.position.z - views[0].pose.position.z;
-		halfIpdMeters = sqrtf(dx*dx + dy*dy + dz*dz) * 0.5f;
-	}
-
-	re.SetVRHeadsetParms(vrMatrixProjection.m, vrMatrixMono.m, 0, // renderBuffer not used for VK
-						 vrMatrixEye[0].m, vrMatrixEye[1].m, combinedFovX, fovUp, fovDown, halfIpdMeters);
+	re.SetVRHeadsetParms(vrMatrixProjection.m, vrMatrixMono.m,
+						 vrMatrixEye[0].m, vrMatrixEye[1].m, (const float (*)[4])eyeFovs);
 }
 
 

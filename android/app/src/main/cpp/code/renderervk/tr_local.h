@@ -673,8 +673,9 @@ typedef struct {
 	int			scissorX, scissorY, scissorWidth, scissorHeight;
 	float		fovX, fovY;
 	float		projectionMatrix[16];
-	qboolean	cullTangentsSet;	// portal views cull to where the eyes see the surface
-	float		cullTangents[4];	// right, left, up, down view-space tangents
+	qboolean	xrMultiview;	// a stereo world view: culling and PVS cover both eyes
+	qboolean	xrCullFov;		// portal views cull with cullFov, the part of each eye's field that sees the surface
+	float		cullFov[2][4];
 	cplane_t	frustum[5];
 	vec3_t		visBounds[2];
 	float		zFar;
@@ -1210,18 +1211,9 @@ typedef struct {
 	qboolean	valid;
 	float		projection[16];
 	float		projectionEye[2][16];      // Per-eye projection matrices from OpenXR
-	float		mirrorProjection[16];
 	float		mirrorProjectionEye[2][16];// Per-eye mirror projection matrices
 	float		monoVRProjection[16];      // Symmetric projection for virtual screen
-	int			renderBuffer;
-	int			renderBufferOriginal;
-	int			mainSceneReadBuffer;       // Framebuffer to read main scene from (layer 0) for mono blit
-	int			mainSceneWidth;
-	int			mainSceneHeight;
-	float		combinedFovX;              // Combined stereo horizontal FOV for culling
-	float		fovUp;                     // Degrees above forward, top cull plane
-	float		fovDown;                   // Degrees below forward, bottom cull plane
-	float		halfIpdMeters;             // Half IPD in meters for frustum plane offset
+	float		eyeFov[2][4];              // Per-eye OpenXR field in radians: left, right, up, down
 } vrParms_t;
 
 typedef struct drawSurfsCommand_s drawSurfsCommand_t;
@@ -1298,6 +1290,12 @@ typedef struct {
 	trRefdef_t				refdef;
 
 	int						viewCluster;
+	struct {
+		const world_t *world;
+		int center, eye[2], novis;
+		qboolean valid, multiview;
+		byte areamask[MAX_MAP_AREA_BYTES];
+	} pvsCache;
 #ifdef USE_PMLIGHT
 	dlight_t				*light;				// current light during R_RecursiveLightNode
 #endif
@@ -1781,6 +1779,7 @@ void R_AddBrushModelSurfaces( trRefEntity_t *e );
 void R_AddWorldSurfaces( void );
 qboolean R_inPVS( const vec3_t p1, const vec3_t p2 );
 mnode_t *R_PointInLeaf( const vec3_t p );
+void R_EyeOrientation( const viewParms_t *parms, int eye, vec3_t origin, vec3_t axis[3] );
 
 
 /*
@@ -2152,16 +2151,13 @@ void RE_VertexLighting( qboolean allowed );
 // VR Functions
 void RE_HUDBufferStart( qboolean clear );
 void RE_HUDBufferEnd( void );
+extern qboolean tr_hudDrawing;
 void RE_SceneComplete( void );
 void RE_SetVRHeadsetParms( const float projectionMatrix[16],
 						   const float nonVRProjectionMatrix[16],
-						   int renderBuffer,
 						   const float projectionEye0[16],
 						   const float projectionEye1[16],
-						   float combinedFovX,
-						   float fovUp,
-						   float fovDown,
-						   float halfIpdMeters );
+						   const float eyeFov[2][4] );
 void RE_ClearVRFramebuffer( int width, int height, qboolean isThirdPersonSpectator );
 void RE_WaitForRenderComplete( void );
 qboolean RE_InitXRResources( void );

@@ -2086,13 +2086,9 @@ VR FUNCTIONS
 
 void RE_SetVRHeadsetParms( const float projectionMatrix[16],
 						   const float nonVRProjectionMatrix[16],
-						   int renderBuffer,
 						   const float projectionEye0[16],
 						   const float projectionEye1[16],
-						   float combinedFovX,
-						   float fovUp,
-						   float fovDown,
-						   float halfIpdMeters ) {
+						   const float eyeFov[2][4] ) {
 	// Mark VR parameters as valid
 	tr.vrParms.valid = qtrue;
 
@@ -2105,16 +2101,7 @@ void RE_SetVRHeadsetParms( const float projectionMatrix[16],
 	// This matches renderergl2's pattern where monoVRProjection comes from nonVRProjectionMatrix
 	Com_Memcpy( tr.vrParms.monoVRProjection, nonVRProjectionMatrix, sizeof(float) * 16 );
 
-	// Store frustum parameters
-	tr.vrParms.combinedFovX = combinedFovX;
-	tr.vrParms.fovUp = fovUp;
-	tr.vrParms.fovDown = fovDown;
-	tr.vrParms.halfIpdMeters = halfIpdMeters;
-	tr.vrParms.renderBuffer = renderBuffer;
-
-	// Also keep vk_world.projectionEye for backward compatibility
-	Com_Memcpy( vk_world.projectionEye[0], projectionEye0, sizeof(float) * 16 );
-	Com_Memcpy( vk_world.projectionEye[1], projectionEye1, sizeof(float) * 16 );
+	Com_Memcpy( tr.vrParms.eyeFov, eyeFov, sizeof( tr.vrParms.eyeFov ) );
 }
 
 void RE_ClearVRFramebuffer( int width, int height, qboolean isThirdPersonSpectator ) {

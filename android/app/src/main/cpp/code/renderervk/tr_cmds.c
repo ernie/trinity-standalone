@@ -21,6 +21,8 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 */
 #include "tr_local.h"
 
+qboolean tr_hudDrawing;
+
 /*
 =====================
 R_PerformanceCounters
@@ -501,6 +503,7 @@ void RE_HUDBufferStart( qboolean clear )
 	cmd->commandId = RC_HUD_BUFFER;
 	cmd->start = qtrue;
 	cmd->clear = clear;
+	tr_hudDrawing = qtrue;
 }
 
 
@@ -518,6 +521,7 @@ void RE_HUDBufferEnd( void )
 	cmd->commandId = RC_HUD_BUFFER;
 	cmd->start = qfalse;
 	cmd->clear = qfalse;
+	tr_hudDrawing = qfalse;
 }
 
 

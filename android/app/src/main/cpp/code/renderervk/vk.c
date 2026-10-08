@@ -5,7 +5,7 @@
 #include "vk.h"
 #include "../vrvk/vr_vk.h"  // For VR_VulkanDeviceInfo (pull model)
 #include "../vrcommon/vr_clientinfo.h"
-#include "../vrcommon/vr_gameplay.h"  // For VR_ShouldDisableStereo
+#include "../vrcommon/vr_gameplay.h"
 #include "../vrcommon/vr_virtual_screen.h"
 #include "../vrcommon/vr_controller_models.h"
 #include "../vrcommon/vr_ktx2.h"
@@ -7323,10 +7323,8 @@ void vk_set_view_eyeproj( void )
 {
 	int e;
 
-	if ( tr.vrParms.valid && !backEnd.projection2D &&
-		!( backEnd.isDrawingHUD || backEnd.refdef.isHUD ) &&
-		!( vr.virtual_screen || vr.weapon_zoomed ) ) {
-		// Stereo (normal or portal): eyeProj = E'_e then P_e, where
+	if ( backEnd.viewParms.xrMultiview && !backEnd.projection2D ) {
+		// Stereo (normal, portal or scope): eyeProj = E'_e then P_e, where
 		// E'_e = inverse(world monoView) * world eyeView_e. Exact because,
 		// for any entity's local-to-world transform L, L * E'_e equals what
 		// L folded against world.eyeViewMatrix[e] would produce (both share
@@ -7350,45 +7348,9 @@ void vk_set_view_eyeproj( void )
 		return;
 	}
 
-	// All cyclopean/mono flavors: both slots get the same projection the old
-	// code multiplied per draw. Guards mirror vk_update_mvp's ladder exactly.
-	{
-		float proj[16];
-
-		if ( tr.vrParms.valid && ( backEnd.isDrawingHUD || backEnd.refdef.isHUD ) ) {
-			Com_Memcpy( proj, tr.vrParms.monoVRProjection, sizeof( proj ) );
-		} else if ( tr.vrParms.valid && backEnd.viewParms.portalView != PV_NONE &&
-				( vr.virtual_screen || vr.weapon_zoomed ) ) {
-			// Portal cyclopean: no refdef-FOV override. The scope projection already matches the buffer.
-			Com_Memcpy( proj, backEnd.viewParms.projectionMatrix, sizeof( proj ) );
-			if ( !vr.weapon_zoomed ) {
-				// Square pixels across the crop, matching the main view below
-				proj[5] = copysignf( proj[0] * (float)glConfig.vidWidth / (float)glConfig.vidHeight, proj[5] );
-			}
-			proj[8] = 0.0f;
-			proj[9] = 0.0f;
-		} else if ( tr.vrParms.valid && ( vr.virtual_screen || vr.weapon_zoomed ) ) {
-			Com_Memcpy( proj, tr.vrParms.projection, sizeof( proj ) );
-			if ( backEnd.refdef.rdflags & RDF_NOWORLDMODEL ) {
-				// UI model scenes: refdef FOV scaled by the 4:3 crop factor
-				float cropHeight = (float)( glConfig.vidWidth * 3 ) / 4.0f;
-				float cropFactor = (float)glConfig.vidHeight / cropHeight;
-				proj[0] = ( 1.0f / tan( DEG2RAD( backEnd.viewParms.fovX ) * 0.5f ) ) / cropFactor;
-				proj[5] = ( -1.0f / tan( DEG2RAD( backEnd.viewParms.fovY ) * 0.5f ) ) / cropFactor;
-			} else if ( !vr.weapon_zoomed ) {
-				// Virtual screen: the refdef's FOV across the crop with square pixels, never the runtime's
-				proj[0] = 1.0f / tan( DEG2RAD( backEnd.viewParms.fovX ) * 0.5f );
-				proj[5] = copysignf( proj[0] * (float)glConfig.vidWidth / (float)glConfig.vidHeight, proj[5] );
-			}
-			proj[8] = 0.0f;
-			proj[9] = 0.0f;
-		} else {
-			Com_Memcpy( proj, backEnd.viewParms.projectionMatrix, sizeof( proj ) );
-		}
-
-		Com_Memcpy( vk_view_eyeproj[0], proj, sizeof( proj ) );
-		Com_Memcpy( vk_view_eyeproj[1], proj, sizeof( proj ) );
-	}
+	// Cyclopean: both slots get the view's frontend projection
+	Com_Memcpy( vk_view_eyeproj[0], backEnd.viewParms.projectionMatrix, sizeof( vk_view_eyeproj[0] ) );
+	Com_Memcpy( vk_view_eyeproj[1], backEnd.viewParms.projectionMatrix, sizeof( vk_view_eyeproj[1] ) );
 }
 
 

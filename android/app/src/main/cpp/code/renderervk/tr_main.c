@@ -25,6 +25,67 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 #include "vk.h"
 #include "../vrcommon/vr_clientinfo.h"
 #include "../vrcommon/vr_gameplay.h"
+#include <math.h>
+
+/* Halfspaces enclosing both eyes' frusta in center-camera space; a ray past the horizon disables culling. */
+static void VK_MultiviewPlanes( const float center[3][3], const float origins[2][3],
+								const float axes[2][3][3], const float fov[2][4], float planes[5][4] ) {
+	float lo[2] = {1e30f, 1e30f}, hi[2] = {-1e30f, -1e30f};
+	int e, x, y, k, j, p, wide = 0;
+	for ( e = 0; e < 2; e++ )
+		for ( x = 0; x < 2; x++ )
+			for ( y = 0; y < 2; y++ ) {
+				float ray[3], v[3] = {0, 0, 0};
+				for ( k = 0; k < 3; k++ )
+					ray[k] = axes[e][0][k] - tanf( fov[e][x] ) * axes[e][1][k] +
+							 tanf( fov[e][y ? 2 : 3] ) * axes[e][2][k];
+				for ( j = 0; j < 3; j++ )
+					for ( k = 0; k < 3; k++ )
+						v[j] += ray[k] * center[j][k];
+				if ( v[0] <= .00001f ) {
+					wide = 1;
+					continue;
+				}
+				for ( j = 0; j < 2; j++ ) {
+					float slope = v[j + 1] / v[0];
+					if ( slope < lo[j] )
+						lo[j] = slope;
+					if ( slope > hi[j] )
+						hi[j] = slope;
+				}
+			}
+	for ( p = 0; p < 5; p++ ) {
+		float n[3] = {0, 0, 0}, len = 0, dist[2] = {0, 0};
+		if ( wide ) {
+			for ( k = 0; k < 3; k++ )
+				planes[p][k] = 0;
+			planes[p][3] = -1;
+			continue;
+		}
+		if ( p == 4 )
+			n[0] = 1;
+		else {
+			j = p / 2 + 1;
+			n[0] = (p & 1) ? hi[j - 1] : -lo[j - 1];
+			n[j] = (p & 1) ? -1 : 1;
+		}
+		for ( k = 0; k < 3; k++ ) {
+			planes[p][k] = 0;
+			for ( j = 0; j < 3; j++ )
+				planes[p][k] += n[j] * center[j][k];
+			len += planes[p][k] * planes[p][k];
+		}
+		len = sqrtf( len );
+		for ( k = 0; k < 3; k++ ) {
+			planes[p][k] /= len;
+			for ( e = 0; e < 2; e++ )
+				dist[e] += planes[p][k] * origins[e][k];
+		}
+		/* Near culling at the nearest origin is intentionally loose: cant means a
+		   center-space zNear plane need not enclose either eye's near rectangle. */
+		planes[p][3] = (dist[0] < dist[1] ? dist[0] : dist[1]) - .001f;
+	}
+}
 
 #include <string.h> // memcpy
 
@@ -50,6 +111,12 @@ refimport_t	ri;
 // point at this for their sorting surface
 static surfaceType_t entitySurface = SF_ENTITY;
 
+// portal views also cull to the portal plane, their oblique near plane
+static const cplane_t *R_CullPlane( int i ) {
+	return i < 4 ? &tr.viewParms.frustum[i] : &tr.viewParms.portalPlane;
+}
+
+
 /*
 =================
 R_CullLocalBox
@@ -62,9 +129,10 @@ int R_CullLocalBox( const vec3_t bounds[2] ) {
 	vec3_t	transformed[8];
 	float	dists[8];
 	vec3_t	v;
-	cplane_t	*frust;
+	const cplane_t	*frust;
 	int			anyBack;
 	int			front, back;
+	const int	numPlanes = tr.viewParms.portalView != PV_NONE ? 5 : 4;
 
 	if ( r_nocull->integer ) {
 		return CULL_CLIP;
@@ -84,8 +152,8 @@ int R_CullLocalBox( const vec3_t bounds[2] ) {
 
 	// check against frustum planes
 	anyBack = 0;
-	for (i = 0 ; i < 4 ; i++) {
-		frust = &tr.viewParms.frustum[i];
+	for (i = 0 ; i < numPlanes ; i++) {
+		frust = R_CullPlane( i );
 
 		front = back = 0;
 		for (j = 0 ; j < 8 ; j++) {
@@ -152,15 +220,16 @@ int R_CullPointAndRadius( const vec3_t pt, float radius )
 	float	dist;
 	const cplane_t	*frust;
 	qboolean mightBeClipped = qfalse;
+	const int	numPlanes = tr.viewParms.portalView != PV_NONE ? 5 : 4;
 
 	if ( r_nocull->integer ) {
 		return CULL_CLIP;
 	}
 
 	// check against frustum planes
-	for (i = 0 ; i < 4 ; i++) 
+	for (i = 0 ; i < numPlanes ; i++)
 	{
-		frust = &tr.viewParms.frustum[i];
+		frust = R_CullPlane( i );
 
 		dist = DotProduct( pt, frust->normal) - frust->dist;
 		if ( dist < -radius )
@@ -469,7 +538,7 @@ The view's origin and axes with the eye's offset and, on canted displays, its
 rotation applied. Shared by the eye view matrices and the portal plane, which must agree.
 =================
 */
-static void R_EyeOrientation( const viewParms_t *parms, int eye, vec3_t origin, vec3_t axis[3] )
+void R_EyeOrientation( const viewParms_t *parms, int eye, vec3_t origin, vec3_t axis[3] )
 {
 	VectorCopy( parms->or.origin, origin );
 	VectorCopy( parms->or.axis[0], axis[0] );
@@ -606,13 +675,34 @@ static void R_SetFarClip( void )
 }
 
 
+/* Frustum sides from view-plane extents at zProj: right, left (negated), top, bottom (negated). */
+static void R_SetupFrustumExtents( viewParms_t *dest, const float extent[4], float zProj )
+{
+	int plane;
+	for ( plane = 0; plane < 4; plane++ ) {
+		VectorScale( dest->or.axis[0], extent[plane], dest->frustum[plane].normal );
+		VectorMA( dest->frustum[plane].normal, ((plane == 1 || plane == 2) ? -zProj : zProj),
+				  dest->or.axis[plane < 2 ? 1 : 2], dest->frustum[plane].normal );
+		VectorNormalize( dest->frustum[plane].normal );
+	}
+	VectorCopy( dest->or.axis[0], dest->frustum[4].normal );
+	for ( plane = 0; plane < 5; plane++ ) {
+		dest->frustum[plane].type = PLANE_NON_AXIAL;
+		dest->frustum[plane].dist = DotProduct( dest->or.origin, dest->frustum[plane].normal );
+		if ( plane == 4 ) {
+			dest->frustum[plane].dist += r_znear->value;
+		}
+		SetPlaneSignbits( &dest->frustum[plane] );
+	}
+}
+
+
 /*
 =================
 R_SetupFrustum
 
 Set up the culling frustum planes for the current view.
-Uses combined stereo FOV to ensure geometry visible to either eye isn't culled.
-Top and bottom are set separately, since the up and down angles may differ.
+Stereo world views enclose both eyes' frusta; other VR views cull to the projection they draw with.
 =================
 */
 static void R_SetupFrustum( void )
@@ -621,66 +711,63 @@ static void R_SetupFrustum( void )
 	float xs, xc;
 	float ang;
 	float fovX, fovUp, fovDown;
-	float halfIpdWorldUnits = 0.0f;
 
-	// Use combined stereo horizontal FOV for culling (encompasses both eyes)
-	// The screen shows the refdef's FOV, which may be wider than the runtime's
-	if (tr.vrParms.combinedFovX > 0 && !(vr.virtual_screen && !vr.weapon_zoomed)) {
-		fovX = tr.vrParms.combinedFovX;
-		fovUp = tr.vrParms.fovUp;
-		fovDown = tr.vrParms.fovDown;
-
-		// Convert half-IPD from meters to Quake world units
-		float worldscale = vr_worldscale ? vr_worldscale->value : 32.0f;
-		float scaler = vr_worldscaleScaler ? vr_worldscaleScaler->value : 1.0f;
-		halfIpdWorldUnits = tr.vrParms.halfIpdMeters * worldscale * scaler;
-	} else {
-		fovX = tr.viewParms.fovX;
-		fovUp = fovDown = tr.viewParms.fovY * 0.5f;
-	}
-
-	if ( tr.viewParms.cullTangentsSet ) {
-		const float *t = tr.viewParms.cullTangents;
-
-		// right, left, bottom, top, leaning as the full planes below do
-		VectorScale( tr.viewParms.or.axis[0], t[0], tr.viewParms.frustum[0].normal );
-		VectorAdd( tr.viewParms.frustum[0].normal, tr.viewParms.or.axis[1], tr.viewParms.frustum[0].normal );
-		VectorScale( tr.viewParms.or.axis[0], -t[1], tr.viewParms.frustum[1].normal );
-		VectorSubtract( tr.viewParms.frustum[1].normal, tr.viewParms.or.axis[1], tr.viewParms.frustum[1].normal );
-		VectorScale( tr.viewParms.or.axis[0], -t[3], tr.viewParms.frustum[2].normal );
-		VectorAdd( tr.viewParms.frustum[2].normal, tr.viewParms.or.axis[2], tr.viewParms.frustum[2].normal );
-		VectorScale( tr.viewParms.or.axis[0], t[2], tr.viewParms.frustum[3].normal );
-		VectorSubtract( tr.viewParms.frustum[3].normal, tr.viewParms.or.axis[2], tr.viewParms.frustum[3].normal );
-		for ( i = 0; i < 4; i++ ) {
-			VectorNormalize( tr.viewParms.frustum[i].normal );
+	if ( tr.viewParms.xrMultiview ) {
+		float origins[2][3], axes[2][3][3], planes[5][4];
+		int e, plane;
+		for ( e = 0; e < 2; e++ ) {
+			R_EyeOrientation( &tr.viewParms, e, origins[e], axes[e] );
 		}
-	} else {
-		ang = fovX / 180 * M_PI * 0.5f;
-		xs = sinf( ang );
-		xc = cosf( ang );
-
-		VectorScale( tr.viewParms.or.axis[0], xs, tr.viewParms.frustum[0].normal );
-		VectorMA( tr.viewParms.frustum[0].normal, xc, tr.viewParms.or.axis[1], tr.viewParms.frustum[0].normal );
-
-		VectorScale( tr.viewParms.or.axis[0], xs, tr.viewParms.frustum[1].normal );
-		VectorMA( tr.viewParms.frustum[1].normal, -xc, tr.viewParms.or.axis[1], tr.viewParms.frustum[1].normal );
-
-		// Bottom plane (normal leans up)
-		ang = fovDown / 180 * M_PI;
-		xs = sinf( ang );
-		xc = cosf( ang );
-
-		VectorScale( tr.viewParms.or.axis[0], xs, tr.viewParms.frustum[2].normal );
-		VectorMA( tr.viewParms.frustum[2].normal, xc, tr.viewParms.or.axis[2], tr.viewParms.frustum[2].normal );
-
-		// Top plane (normal leans down)
-		ang = fovUp / 180 * M_PI;
-		xs = sinf( ang );
-		xc = cosf( ang );
-
-		VectorScale( tr.viewParms.or.axis[0], xs, tr.viewParms.frustum[3].normal );
-		VectorMA( tr.viewParms.frustum[3].normal, -xc, tr.viewParms.or.axis[2], tr.viewParms.frustum[3].normal );
+		VK_MultiviewPlanes( (const float (*)[3])tr.viewParms.or.axis, (const float (*)[3])origins,
+							(const float (*)[3][3])axes,
+							(const float (*)[4])( tr.viewParms.xrCullFov ? tr.viewParms.cullFov : tr.vrParms.eyeFov ),
+							planes );
+		for ( plane = 0; plane < 5; plane++ ) {
+			VectorCopy( planes[plane], tr.viewParms.frustum[plane].normal );
+			tr.viewParms.frustum[plane].dist = planes[plane][3];
+			tr.viewParms.frustum[plane].type = PLANE_NON_AXIAL;
+			SetPlaneSignbits( &tr.viewParms.frustum[plane] );
+		}
+		return;
 	}
+
+	if ( tr.vrParms.valid ) {
+		// extents of the projection this view draws with
+		const float *p = tr.viewParms.projectionMatrix;
+		const float extent[4] = { ( 1.0f + p[8] ) / p[0], ( 1.0f - p[8] ) / p[0],
+								  ( p[9] - 1.0f ) / p[5], -( p[9] + 1.0f ) / p[5] };
+		R_SetupFrustumExtents( &tr.viewParms, extent, 1.0f );
+		return;
+	}
+
+	fovX = tr.viewParms.fovX;
+	fovUp = fovDown = tr.viewParms.fovY * 0.5f;
+
+	ang = fovX / 180 * M_PI * 0.5f;
+	xs = sinf( ang );
+	xc = cosf( ang );
+
+	VectorScale( tr.viewParms.or.axis[0], xs, tr.viewParms.frustum[0].normal );
+	VectorMA( tr.viewParms.frustum[0].normal, xc, tr.viewParms.or.axis[1], tr.viewParms.frustum[0].normal );
+
+	VectorScale( tr.viewParms.or.axis[0], xs, tr.viewParms.frustum[1].normal );
+	VectorMA( tr.viewParms.frustum[1].normal, -xc, tr.viewParms.or.axis[1], tr.viewParms.frustum[1].normal );
+
+	// Bottom plane (normal leans up)
+	ang = fovDown / 180 * M_PI;
+	xs = sinf( ang );
+	xc = cosf( ang );
+
+	VectorScale( tr.viewParms.or.axis[0], xs, tr.viewParms.frustum[2].normal );
+	VectorMA( tr.viewParms.frustum[2].normal, xc, tr.viewParms.or.axis[2], tr.viewParms.frustum[2].normal );
+
+	// Top plane (normal leans down)
+	ang = fovUp / 180 * M_PI;
+	xs = sinf( ang );
+	xc = cosf( ang );
+
+	VectorScale( tr.viewParms.or.axis[0], xs, tr.viewParms.frustum[3].normal );
+	VectorMA( tr.viewParms.frustum[3].normal, -xc, tr.viewParms.or.axis[2], tr.viewParms.frustum[3].normal );
 
 	for ( i = 0; i < 4; i++ ) {
 		tr.viewParms.frustum[i].type = PLANE_NON_AXIAL;
@@ -688,12 +775,11 @@ static void R_SetupFrustum( void )
 		SetPlaneSignbits( &tr.viewParms.frustum[i] );
 	}
 
-	// Push left and right frustum planes outward by half-IPD
-	// This ensures geometry visible to either eye isn't culled
-	if (halfIpdWorldUnits > 0.0f) {
-		tr.viewParms.frustum[0].dist -= halfIpdWorldUnits;  // Right plane
-		tr.viewParms.frustum[1].dist -= halfIpdWorldUnits;  // Left plane
-	}
+	// near clipping plane
+	VectorCopy( tr.viewParms.or.axis[0], tr.viewParms.frustum[4].normal );
+	tr.viewParms.frustum[4].type = PLANE_NON_AXIAL;
+	tr.viewParms.frustum[4].dist = DotProduct( tr.viewParms.or.origin, tr.viewParms.frustum[4].normal ) + r_znear->value;
+	SetPlaneSignbits( &tr.viewParms.frustum[4] );
 }
 
 
@@ -702,10 +788,42 @@ static void R_SetupFrustum( void )
 R_SetupProjection
 ===============
 */
+/* The projection a cyclopean view draws with; culling and the portal clip plane use it too. */
+static void R_SetupMonoProjection( viewParms_t *dest )
+{
+	float *proj = dest->projectionMatrix;
+
+	if ( tr_hudDrawing || tr.refdef.isHUD ) {
+		Com_Memcpy( proj, tr.vrParms.monoVRProjection, sizeof( dest->projectionMatrix ) );
+		return;
+	}
+	if ( !( vr.virtual_screen || vr.weapon_zoomed ) ) {
+		return;
+	}
+	// portal views take their parent's override so the reflection lines up
+	if ( tr.refdef.rdflags & RDF_NOWORLDMODEL ) {
+		// UI model scenes: refdef FOV scaled by the 4:3 crop factor
+		float cropHeight = (float)( glConfig.vidWidth * 3 ) / 4.0f;
+		float cropFactor = (float)glConfig.vidHeight / cropHeight;
+		proj[0] = ( 1.0f / tan( DEG2RAD( dest->fovX ) * 0.5f ) ) / cropFactor;
+		proj[5] = ( -1.0f / tan( DEG2RAD( dest->fovY ) * 0.5f ) ) / cropFactor;
+	} else if ( !vr.weapon_zoomed ) {
+		// Virtual screen: the refdef's FOV across the crop with square pixels, never the runtime's
+		proj[0] = 1.0f / tan( DEG2RAD( dest->fovX ) * 0.5f );
+		proj[5] = copysignf( proj[0] * (float)glConfig.vidWidth / (float)glConfig.vidHeight, proj[5] );
+	}
+	proj[8] = 0.0f;
+	proj[9] = 0.0f;
+}
+
+
 void R_SetupProjection( viewParms_t *dest, float zProj, qboolean computeFrustum )
 {
 	// VR projection matrix comes from OpenXR
 	memcpy( &dest->projectionMatrix, &tr.vrParms.projection, sizeof(dest->projectionMatrix) );
+	if ( tr.vrParms.valid && !dest->xrMultiview ) {
+		R_SetupMonoProjection( dest );
+	}
 
 	if ( computeFrustum )
 		R_SetupFrustum();
@@ -1133,9 +1251,10 @@ static qboolean IsMirror( const drawSurf_t *drawSurf, int entityNum )
 ** Determines if a surface is completely offscreen.
 */
 static qboolean SurfIsOffscreen( const drawSurf_t *drawSurf, qboolean *isMirror ) {
-	float shortest = 100000000;
+	float shortest[2] = {100000000, 100000000};
 	int entityNum;
-	int numTriangles;
+	int numTriangles[2] = {0, 0};
+	int eyeIndex, numEyes;
 	shader_t *shader;
 	int		fogNum;
 	int dlighted;
@@ -1144,7 +1263,6 @@ static qboolean SurfIsOffscreen( const drawSurf_t *drawSurf, qboolean *isMirror 
 	unsigned int pointAnd = (unsigned int)~0;
 	// the eyes see past the mono frustum, by the cant on canted displays: reject only when both miss
 	unsigned int pointAndEye[2] = { (unsigned int)~0, (unsigned int)~0 };
-	const qboolean stereo = tr.vrParms.valid && !VR_ShouldDisableStereo();
 
 	*isMirror = qfalse;
 
@@ -1180,7 +1298,7 @@ static qboolean SurfIsOffscreen( const drawSurf_t *drawSurf, qboolean *isMirror 
 		}
 		pointAnd &= pointFlags;
 
-		if ( stereo )
+		if ( tr.viewParms.xrMultiview )
 		{
 			int e;
 
@@ -1206,7 +1324,7 @@ static qboolean SurfIsOffscreen( const drawSurf_t *drawSurf, qboolean *isMirror 
 	}
 
 	// trivially reject
-	if ( stereo ? ( pointAndEye[0] && pointAndEye[1] ) : pointAnd )
+	if ( tr.viewParms.xrMultiview ? ( pointAndEye[0] && pointAndEye[1] ) : pointAnd )
 	{
 		tess.numIndexes = 0;
 		return qtrue;
@@ -1217,29 +1335,31 @@ static qboolean SurfIsOffscreen( const drawSurf_t *drawSurf, qboolean *isMirror 
 	// based on vertex distance isn't 100% correct (we should be checking for
 	// range to the surface), but it's good enough for the types of portals
 	// we have in the game right now.
-	numTriangles = tess.numIndexes / 3;
-
-	for ( i = 0; i < tess.numIndexes; i += 3 )
-	{
-		vec3_t normal;
-		float len;
-
-		VectorSubtract( tess.xyz[tess.indexes[i]], tr.viewParms.or.origin, normal );
-
-		len = VectorLengthSquared( normal );			// lose the sqrt
-		if ( len < shortest )
-		{
-			shortest = len;
+	numEyes = tr.viewParms.xrMultiview ? 2 : 1;
+	for ( eyeIndex = 0; eyeIndex < numEyes; eyeIndex++ ) {
+		vec3_t origin, eyeAxis[3];
+		if ( tr.viewParms.xrMultiview ) {
+			R_EyeOrientation( &tr.viewParms, eyeIndex, origin, eyeAxis );
+		} else {
+			VectorCopy( tr.viewParms.or.origin, origin );
 		}
+		numTriangles[eyeIndex] = tess.numIndexes / 3;
+		for ( i = 0; i < tess.numIndexes; i += 3 ) {
+			vec3_t normal;
+			float len;
 
-		if ( DotProduct( normal, tess.normal[tess.indexes[i]] ) >= 0 )
-		{
-			numTriangles--;
+			VectorSubtract( tess.xyz[tess.indexes[i]], origin, normal );
+			len = VectorLengthSquared( normal );
+			if ( len < shortest[eyeIndex] ) {
+				shortest[eyeIndex] = len;
+			}
+			if ( DotProduct( normal, tess.normal[tess.indexes[i]] ) >= 0 ) {
+				numTriangles[eyeIndex]--;
+			}
 		}
 	}
 	tess.numIndexes = 0;
-	if ( !numTriangles )
-	{
+	if ( !numTriangles[0] && !numTriangles[1] ) {
 		return qtrue;
 	}
 
@@ -1251,12 +1371,15 @@ static qboolean SurfIsOffscreen( const drawSurf_t *drawSurf, qboolean *isMirror 
 		return qfalse;
 	}
 
-	if ( shortest > (tess.shader->portalRange*tess.shader->portalRange) )
-	{
-		return qtrue;
+	// keep a portal either eye sees from the front in range; a close back-facing eye doesn't count
+	for ( eyeIndex = 0; eyeIndex < numEyes; eyeIndex++ ) {
+		if ( numTriangles[eyeIndex] &&
+			shortest[eyeIndex] <= (tess.shader->portalRange * tess.shader->portalRange) ) {
+			return qfalse;
+		}
 	}
 
-	return qfalse;
+	return qtrue;
 }
 
 
@@ -1329,28 +1452,48 @@ static void R_GetModelViewBounds( int *mins, int *maxs )
 
 
 /* Multiview shares one scissor, so take the union of the surface's pixel bounds in both eyes;
- * a vertex behind either eye widens to the whole viewport. */
-static void R_GetEyeModelViewBounds( int *mins, int *maxs )
+ * cullFov gets each eye's field narrowed to the surface, for culling the view drawn through it. */
+static void R_GetEyeModelViewBounds( int *mins, int *maxs, float cullFov[2][4] )
 {
+	const float margin = 0.02f; // of the eye's tangent range, so rounding never culls the surface's own edge
 	float minn[2] = { 1.0f, 1.0f };
 	float maxn[2] = { -1.0f, -1.0f };
 	vec4_t eye, clip;
 	int e, i, j;
 
 	for ( e = 0; e < 2; e++ ) {
+		float emin[2] = { 1.0f, 1.0f }, emax[2] = { -1.0f, -1.0f };
+		const float *fov = tr.vrParms.eyeFov[e];
+		qboolean behind = qfalse;
 		for ( i = 0; i < tess.numVertexes; i++ ) {
 			R_TransformModelToClip( tess.xyz[i], tr.or.eyeViewMatrix[e], tr.vrParms.projectionEye[e], eye, clip );
 			if ( clip[3] <= 0.0f ) {
-				minn[0] = minn[1] = -1.0f;
-				maxn[0] = maxn[1] = 1.0f;
+				behind = qtrue;
 				break;
 			}
 			for ( j = 0; j < 2; j++ ) {
 				float n = clip[j] / clip[3];
 				if ( n < -1.0f ) n = -1.0f; else if ( n > 1.0f ) n = 1.0f;
-				if ( n < minn[j] ) minn[j] = n;
-				if ( n > maxn[j] ) maxn[j] = n;
+				if ( n < emin[j] ) emin[j] = n;
+				if ( n > emax[j] ) emax[j] = n;
 			}
+		}
+		if ( behind ) {
+			emin[0] = emin[1] = -1.0f;
+			emax[0] = emax[1] = 1.0f;
+		}
+		for ( j = 0; j < 2; j++ ) {
+			if ( emin[j] < minn[j] ) minn[j] = emin[j];
+			if ( emax[j] > maxn[j] ) maxn[j] = emax[j];
+		}
+		/* NDC is linear in the view-plane tangent: x spans left..right, y spans up..down. */
+		{
+			const float tl = tanf( fov[0] ), tr_ = tanf( fov[1] ), tu = tanf( fov[2] ), td = tanf( fov[3] );
+			const float mx = margin * ( tr_ - tl ), my = margin * ( tu - td );
+			cullFov[e][0] = atanf( MAX( tl, tl + 0.5f * ( emin[0] + 1.0f ) * ( tr_ - tl ) - mx ) );
+			cullFov[e][1] = atanf( MIN( tr_, tl + 0.5f * ( emax[0] + 1.0f ) * ( tr_ - tl ) + mx ) );
+			cullFov[e][2] = atanf( MIN( tu, td + 0.5f * ( 1.0f - emin[1] ) * ( tu - td ) + my ) );
+			cullFov[e][3] = atanf( MAX( td, td + 0.5f * ( 1.0f - emax[1] ) * ( tu - td ) - my ) );
 		}
 	}
 
@@ -1359,50 +1502,6 @@ static void R_GetEyeModelViewBounds( int *mins, int *maxs )
 	mins[1] = (int)(-0.5 + 0.5 * ( 1.0 - maxn[1] ) * tr.viewParms.viewportHeight);
 	maxs[0] = (int)(0.5 + 0.5 * ( 1.0 + maxn[0] ) * tr.viewParms.viewportWidth);
 	maxs[1] = (int)(0.5 + 0.5 * ( 1.0 - minn[1] ) * tr.viewParms.viewportHeight);
-}
-
-
-/* The surface's tangent bounds from both eyes, in the view's axes, for culling the view
- * drawn through it; qfalse when a vertex is near or behind an eye. The frustum's half-IPD
- * push covers the eyes sitting off its origin. */
-static qboolean R_GetPortalCullTangents( float t[4] )
-{
-	const float margin = 0.02f; // of the tangent range, so rounding never culls the surface's own edge
-	const float xFull = tanf( DEG2RAD( tr.vrParms.combinedFovX * 0.5f ) );
-	const float upFull = tanf( DEG2RAD( tr.vrParms.fovUp ) );
-	const float downFull = tanf( DEG2RAD( tr.vrParms.fovDown ) );
-	vec3_t *axis = tr.viewParms.or.axis;
-	float right = -1e9f, left = 1e9f, up = -1e9f, down = 1e9f;
-	float mx, my;
-	int e, i;
-
-	for ( e = 0; e < 2; e++ ) {
-		vec3_t origin, eyeAxis[3];
-		R_EyeOrientation( &tr.viewParms, e, origin, eyeAxis );
-		for ( i = 0; i < tess.numVertexes; i++ ) {
-			vec3_t d;
-			float f, tx, ty;
-			VectorSubtract( tess.xyz[i], origin, d );
-			f = DotProduct( d, axis[0] );
-			if ( f < 1.0f ) {
-				return qfalse;
-			}
-			tx = -DotProduct( d, axis[1] ) / f;
-			ty = DotProduct( d, axis[2] ) / f;
-			if ( tx > right ) right = tx;
-			if ( tx < left ) left = tx;
-			if ( ty > up ) up = ty;
-			if ( ty < down ) down = ty;
-		}
-	}
-
-	mx = margin * ( right - left );
-	my = margin * ( up - down );
-	t[0] = MIN( xFull, right + mx );
-	t[1] = MAX( -xFull, left - mx );
-	t[2] = MIN( upFull, up + my );
-	t[3] = MAX( -downFull, down - my );
-	return qtrue;
 }
 
 
@@ -1419,7 +1518,6 @@ static qboolean R_MirrorViewBySurface( const drawSurf_t *drawSurf, int entityNum
 	viewParms_t		oldParms;
 	orientation_t	surface, camera;
 	qboolean		isMirror;
-	qboolean		stereo;
 
 	// don't recursively mirror
 	if ( tr.viewParms.portalView != PV_NONE ) {
@@ -1452,20 +1550,17 @@ static qboolean R_MirrorViewBySurface( const drawSurf_t *drawSurf, int entityNum
 	}
 
 	// the reflected view renders only where either eye can see the surface
-	stereo = tr.vrParms.valid && !VR_ShouldDisableStereo();
-	if ( stereo && tess.numVertexes > 2 ) {
+	if ( newParms.xrMultiview && tess.numVertexes > 2 ) {
 		int mins[2], maxs[2];
-		R_GetEyeModelViewBounds( mins, maxs );
+		R_GetEyeModelViewBounds( mins, maxs, newParms.cullFov );
 		if ( maxs[0] <= mins[0] || maxs[1] <= mins[1] ) {
 			return qfalse;
 		}
+		newParms.xrCullFov = qtrue;
 		newParms.scissorX = newParms.viewportX + mins[0];
 		newParms.scissorY = newParms.viewportY + mins[1];
 		newParms.scissorWidth = maxs[0] - mins[0];
 		newParms.scissorHeight = maxs[1] - mins[1];
-		if ( tr.vrParms.combinedFovX > 0 ) {
-			newParms.cullTangentsSet = R_GetPortalCullTangents( newParms.cullTangents );
-		}
 	}
 
 #ifdef USE_PMLIGHT
@@ -1481,9 +1576,9 @@ static qboolean R_MirrorViewBySurface( const drawSurf_t *drawSurf, int entityNum
 #endif
 
 #if defined (USE_VULKAN) && !defined (USE_BUFFER_CLEAR)
-	if ( !stereo && tess.numVertexes > 2 && r_fastsky->integer && vk.clearAttachment ) {
+	if ( !tr.viewParms.xrMultiview && tess.numVertexes > 2 && r_fastsky->integer && vk.clearAttachment ) {
 #else
-	if ( !stereo && tess.numVertexes > 2 && r_fastsky->integer ) {
+	if ( !tr.viewParms.xrMultiview && tess.numVertexes > 2 && r_fastsky->integer ) {
 #endif
 		int mins[2], maxs[2];
 		R_GetModelViewBounds( mins, maxs );
@@ -1497,6 +1592,8 @@ static qboolean R_MirrorViewBySurface( const drawSurf_t *drawSurf, int entityNum
 
 	VectorSubtract( vec3_origin, camera.axis[0], newParms.portalPlane.normal );
 	newParms.portalPlane.dist = DotProduct( camera.origin, newParms.portalPlane.normal );
+	newParms.portalPlane.type = PLANE_NON_AXIAL;
+	SetPlaneSignbits( &newParms.portalPlane );
 
 	R_MirrorVector (oldParms.or.axis[0], &surface, &camera, newParms.or.axis[0]);
 	R_MirrorVector (oldParms.or.axis[1], &surface, &camera, newParms.or.axis[1]);
@@ -2038,6 +2135,9 @@ void R_RenderView( const viewParms_t *parms ) {
 	tr.viewParms = *parms;
 	tr.viewParms.frameSceneNum = tr.frameSceneNum;
 	tr.viewParms.frameCount = tr.frameCount;
+	// the scope stays multiview: both eyes at the center with the scope frustum
+	tr.viewParms.xrMultiview = tr.vrParms.valid && !VR_Gameplay_ShouldRenderInVirtualScreen() &&
+		!tr_hudDrawing && !tr.refdef.isHUD && !( tr.refdef.rdflags & RDF_NOWORLDMODEL );
 
 	R_SetupSpriteAxis( &tr.viewParms );
 
