@@ -48,6 +48,9 @@ jobs:
           curl -fL -o android/app/src/main/assets/pak8t.pk3 $BASE/pak8t.pk3
           curl -fL -o android/app/src/main/assets/pak3t.pk3 $BASE/pak3t.pk3
           curl -fL -o android/app/src/main/assets/zzz-trinity-announcer.pk3 $BASE/zzz-trinity-announcer.pk3
+          # Outside assets/, so the checksum list is not bundled into the APK
+          curl -fL -o "$RUNNER_TEMP/sha256sums.txt" $BASE/sha256sums.txt
+          (cd android/app/src/main/assets && sha256sum --check --strict "$RUNNER_TEMP/sha256sums.txt")
 
       - name: CMake configure
         run: |
