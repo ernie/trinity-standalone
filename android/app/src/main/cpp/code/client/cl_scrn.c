@@ -1020,6 +1020,9 @@ void CL_LoadingPump( qboolean redraw ) {
 	int start;
 	if ( scr_recursive || clc.state < CA_CONNECTING || clc.state > CA_PRIMED )
 		return;
+	// a redraw would re-enter the module and clobber its syscall arguments
+	if ( VM_InCall( cgvm ) || VM_InCall( uivm ) )
+		redraw = qfalse;
 	if ( redraw && ( clc.state == CA_LOADING || clc.state == CA_PRIMED ) && Sys_Milliseconds() - scr_lastUpdate >= SCR_LOADING_PUMP_MS ) {
 		SCR_UpdateScreen();
 		return;
