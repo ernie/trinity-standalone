@@ -19,7 +19,7 @@ if(FULL_BUILD)
     # Include project identity (name, version, etc.)
     include(identity)
 
-    project(${PROJECT_NAME} VERSION ${PROJECT_VERSION} LANGUAGES C CXX)
+    project(${PROJECT_NAME} LANGUAGES C CXX)
 
     #############################################################################
     # Build Options
@@ -70,30 +70,6 @@ if(FULL_BUILD)
     include(platforms/android)
 
     #############################################################################
-    # Version Information
-    #############################################################################
-
-    if(NOT PRODUCT_VERSION)
-        set(PRODUCT_VERSION "${CMAKE_PROJECT_VERSION}")
-
-        if(EXISTS "${CMAKE_SOURCE_DIR}/../../../../../.git")
-            execute_process(
-                COMMAND git show -s --pretty=format:%h
-                WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}/../../../../.."
-                OUTPUT_VARIABLE GIT_REV
-                OUTPUT_STRIP_TRAILING_WHITESPACE
-                ERROR_QUIET)
-
-            if(GIT_REV)
-                set(PRODUCT_VERSION "${PRODUCT_VERSION}_g${GIT_REV}")
-            endif()
-        endif()
-    endif()
-
-    add_definitions(-DPRODUCT_VERSION="${PRODUCT_VERSION}")
-    message(STATUS "Building ${PROJECT_NAME} version ${PRODUCT_VERSION}")
-
-    #############################################################################
     # Libraries
     #############################################################################
 
@@ -112,7 +88,12 @@ if(FULL_BUILD)
 
         # Client definitions
         list(APPEND CLIENT_DEFINITIONS BOTLIB)
-        list(APPEND CLIENT_DEFINITIONS TRINITY_STANDALONE_VERSION="${TRINITY_STANDALONE_VERSION_STRING}")
+
+        # Re-read every build; force-included so q_shared.h's Q3_VERSION sees it
+        add_custom_target(trinity_version
+            COMMAND ${CMAKE_COMMAND} -DREPO_ROOT=${CMAKE_SOURCE_DIR}/../../../../..
+                -DOUT=${CMAKE_BINARY_DIR}/trinity_version.h -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/write_version.cmake
+            BYPRODUCTS ${CMAKE_BINARY_DIR}/trinity_version.h)
 
         if(USE_VOIP)
             list(APPEND CLIENT_DEFINITIONS USE_VOIP)
@@ -150,6 +131,7 @@ if(FULL_BUILD)
         #############################################################################
 
         add_library(${ENGINE_BINARY} SHARED ${ENGINE_SOURCES})
+        add_dependencies(${ENGINE_BINARY} trinity_version)
 
         target_include_directories(${ENGINE_BINARY} PRIVATE
             ${SOURCE_DIR}
@@ -165,6 +147,7 @@ if(FULL_BUILD)
         target_compile_options(${ENGINE_BINARY} PRIVATE
             ${COMMON_COMPILE_OPTIONS}
             ${CLIENT_COMPILE_OPTIONS}
+            -include ${CMAKE_BINARY_DIR}/trinity_version.h
         )
 
         target_link_libraries(${ENGINE_BINARY} PRIVATE

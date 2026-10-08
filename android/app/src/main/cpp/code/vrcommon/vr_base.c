@@ -364,7 +364,7 @@ VR_Engine* VR_Init( void )
 	}
 
 	// Create the OpenXR instance.
-	const char* appName = "Quake 3 Arena";
+	const char* appName = "Trinity";
 	XR_CHECK(
 		VR_CreateInstanceForModels(appName, &vr_engine.appState.Instance),
 		"Failed to create OpenXR instance");

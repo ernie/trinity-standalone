@@ -55,7 +55,6 @@ Release/
 .project
 local.properties
 drbeef-release-key.keystore
-android/app/src/main/cpp/code/vrcommon/vr_version.h
 android/app/src/main/assets/pak8t.pk3
 android/app/src/main/assets/pak3t.pk3
 android/app/src/main/assets/zzz-trinity-announcer.pk3

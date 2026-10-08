@@ -13,7 +13,8 @@ fi
 SCRIPTDIR=$(readlink -f $(dirname $0))
 
 APP_NAME=$(cat $SCRIPTDIR/app/src/main/res/values/strings.xml | grep "app_name" | cut -d">" -f2 | cut -d"<" -f1 )
-APP_VERSION=$(cat $SCRIPTDIR/app/src/main/AndroidManifest.xml | grep "versionName" | cut -d\" -f2 | cut -d\" -f1 )
+APP_VERSION=$(git -C "$SCRIPTDIR" describe --tags --always --dirty 2>/dev/null || echo unknown)
+APP_VERSION=${APP_VERSION#v}
 APP_PACKAGE=$(cat $SCRIPTDIR/app/src/main/AndroidManifest.xml | grep "package" | cut -d\" -f2 | cut -d\" -f1 )
 
 # NDK paths
@@ -52,17 +53,6 @@ if [ ! -f "build/CMakeCache.txt" ]; then
     echo "CMakeCache.txt not found, will configure..."
 fi
 
-# Check if git tag changed since last configure
-if [ "$NEED_CONFIGURE" -eq 0 ]; then
-    CURRENT_TAG="$(git describe --tags --abbrev=0 2>/dev/null)"
-    CACHED_TAG="$(cat build/.version_tag 2>/dev/null)"
-    if [ "$CURRENT_TAG" != "$CACHED_TAG" ]; then
-        NEED_CONFIGURE=1
-        echo "Version tag changed, will reconfigure..."
-        rm -f build/CMakeCache.txt
-    fi
-fi
-
 if [ "$NEED_CONFIGURE" -eq 1 ]; then
     echo "Configuring CMake build..."
     cmake -B build -S android/app/src/main/cpp \
@@ -77,9 +67,6 @@ if [ "$NEED_CONFIGURE" -eq 1 ]; then
         echo "Failed to configure CMake"
         exit 1
     fi
-
-    # Save current tag for next build
-    git describe --tags --abbrev=0 2>/dev/null > build/.version_tag
 fi
 
 # CMake build

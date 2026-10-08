@@ -74,7 +74,7 @@ XrResult VR_CreateInstance(const char* app_name, XrVersion api_version, uint32_t
 	memset(&appInfo, 0, sizeof(appInfo));
 	Q_strncpyz(appInfo.applicationName, app_name, sizeof(appInfo.applicationName));
 	appInfo.applicationVersion = 1;
-	Q_strncpyz(appInfo.engineName, app_name, sizeof(appInfo.engineName));
+	Q_strncpyz(appInfo.engineName, "Trinity Standalone", sizeof(appInfo.engineName));
 	appInfo.engineVersion = 1;
 	appInfo.apiVersion = api_version;
 

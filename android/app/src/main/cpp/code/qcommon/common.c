@@ -2851,10 +2851,7 @@ void Com_Init( char *commandLine ) {
 
 	s = va("%s %s %s", Q3_VERSION, PLATFORM_STRING, PRODUCT_DATE );
 	com_version = Cvar_Get ("version", s, CVAR_ROM | CVAR_SERVERINFO );
-#ifndef TRINITY_STANDALONE_VERSION
-#define TRINITY_STANDALONE_VERSION "unknown"
-#endif
-	Cvar_Get( "com_engine", va( "trinity-standalone/%s", TRINITY_STANDALONE_VERSION ), CVAR_ROM );
+	Cvar_Get( "com_engine", va( "trinity-standalone/%s", PRODUCT_VERSION ), CVAR_ROM );
 
 	// single entry point of the extension system: VMs read this to learn the
 	// trap_GetValue syscall number, then discover extensions by name

@@ -289,9 +289,9 @@ XrResult VR_Vulkan_CreateInstance(XrInstance xrInstance, XrSystemId systemId)
     VkApplicationInfo appInfo = {
         .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
         .pNext = NULL,
-        .pApplicationName = "Quake 3 VR",
+        .pApplicationName = "Trinity",
         .applicationVersion = VK_MAKE_VERSION(1, 0, 0),
-        .pEngineName = "ioquake3",
+        .pEngineName = "Trinity Standalone",
         .engineVersion = VK_MAKE_VERSION(1, 0, 0),
         .apiVersion = VK_API_VERSION_1_1,
     };
